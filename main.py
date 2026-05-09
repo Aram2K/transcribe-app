@@ -110,6 +110,7 @@ class AudioRecorder:
         self._chunk_lock      = threading.Lock()
         self._samples_in_chunk= 0
         self._session_lang    = None   # cached detected language for this recording
+        self._chunk_threads   = []     # active background chunk threads
 
     def load_model(self, name=None):
         name = name or cfg["whisper_model"]
@@ -126,7 +127,8 @@ class AudioRecorder:
             self._chunk_results    = {}
             self._chunk_idx        = 0
             self._samples_in_chunk = 0
-        self._session_lang = None   # reset on each new recording
+        self._session_lang  = None   # reset on each new recording
+        self._chunk_threads = []     # reset thread list each session
         self.stream = self.audio.open(
             format=pyaudio.paFloat32, channels=1,
             rate=cfg["sample_rate"], input=True,
@@ -159,8 +161,10 @@ class AudioRecorder:
                         self._chunk_idx    += 1
                         self._chunk_frames  = []
                         self._samples_in_chunk = 0
-                    threading.Thread(target=self._transcribe_chunk,
-                                     args=(chunk_audio, idx), daemon=True).start()
+                    t = threading.Thread(target=self._transcribe_chunk,
+                                         args=(chunk_audio, idx), daemon=True)
+                    self._chunk_threads.append(t)
+                    t.start()
             except Exception:
                 pass  # stream read errors (overflow, device disconnect) — keep going
 
@@ -204,11 +208,23 @@ class AudioRecorder:
         return buf.getvalue()
 
     def transcribe(self):
+        # Wait for all background chunk threads to finish before reading results.
+        # Critical for Google backend: a 4-second chunk fires a ~1s network call.
+        # If the user stops right at a chunk boundary, the thread won't have returned
+        # yet and _chunk_results would be empty, causing the overlay to disappear.
+        deadline = time.time() + 18   # generous timeout — Google can be slow
+        for t in list(self._chunk_threads):
+            wait = max(0.0, deadline - time.time())
+            if wait > 0:
+                t.join(timeout=wait)
+
         # Transcribe remaining (last partial chunk) then merge
         remaining = np.frombuffer(b"".join(self._chunk_frames), dtype=np.float32).copy()
         last_text, detected = "", ""
 
-        if len(remaining) >= cfg["sample_rate"] // 2:
+        # Google minimum is 0.25s; local model needs 0.5s — use appropriate threshold
+        min_samples = cfg["sample_rate"] // 4 if (cfg["backend"] == "google" and cfg["google_api_key"]) else cfg["sample_rate"] // 2
+        if len(remaining) >= min_samples:
             if cfg["backend"] == "google" and cfg["google_api_key"]:
                 last_text, detected = self._run_google(remaining)
             else:
