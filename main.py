@@ -172,7 +172,7 @@ class AudioRecorder:
                 )
             if self.on_partial and partial:
                 self.on_partial(partial)
-            if lang and self.on_lang_detected:
+            if lang and not lang.startswith("!") and self.on_lang_detected:
                 self.on_lang_detected(lang, LANG_NAMES.get(lang, lang.upper()))
         except:
             pass
@@ -198,13 +198,17 @@ class AudioRecorder:
     def transcribe(self):
         # Transcribe remaining (last partial chunk) then merge
         remaining = np.frombuffer(b"".join(self._chunk_frames), dtype=np.float32).copy()
-        last_text, detected = "", "en"
+        last_text, detected = "", ""
 
         if len(remaining) >= cfg["sample_rate"] // 2:
             if cfg["backend"] == "google" and cfg["google_api_key"]:
                 last_text, detected = self._run_google(remaining)
             else:
                 last_text, detected = self._run_local(remaining)
+
+        # Propagate error signal immediately without merging
+        if detected and detected.startswith("!google:"):
+            return "", detected
 
         with self._chunk_lock:
             if last_text:
@@ -218,7 +222,7 @@ class AudioRecorder:
 
         if detected and self.on_lang_detected:
             self.on_lang_detected(detected, LANG_NAMES.get(detected, detected.upper()))
-        return full_text.strip(), detected
+        return full_text.strip(), detected or "en"
 
     def _run_local(self, audio):
         self.load_model()
@@ -246,23 +250,29 @@ class AudioRecorder:
         return " ".join(s.text.strip() for s in segs).strip(), lang_arg
 
     def _run_google(self, audio):
-        wav    = self._float_to_wav(audio)
-        b64    = base64.b64encode(wav).decode()
+        if len(audio) < cfg["sample_rate"] // 4:   # < 0.25s — skip
+            return "", ""
+        wav = self._float_to_wav(audio)
+        b64 = base64.b64encode(wav).decode()
+
         if cfg["language"] == "auto":
             primary, alts = "hy-AM", ["en-US", "ru-RU"]
         else:
             bcp = {"hy":"hy-AM","en":"en-US","ru":"ru-RU",
                    "fr":"fr-FR","de":"de-DE","es":"es-ES","ar":"ar-AE"}
-            primary, alts = bcp.get(cfg["language"], "hy-AM"), []
+            primary = bcp.get(cfg["language"], "hy-AM")
+            alts    = []
+
         gcfg = {
             "encoding":        "LINEAR16",
             "sampleRateHertz": cfg["sample_rate"],
             "languageCode":    primary,
-            "alternativeLanguageCodes": alts,
         }
-        # enableAutomaticPunctuation only works reliably on a subset of languages
+        if alts:                                     # never send an empty list
+            gcfg["alternativeLanguageCodes"] = alts
         if primary in ("en-US", "fr-FR", "de-DE", "es-ES"):
             gcfg["enableAutomaticPunctuation"] = True
+
         payload = {"config": gcfg, "audio": {"content": b64}}
         try:
             resp = requests.post(
@@ -272,16 +282,16 @@ class AudioRecorder:
             if resp.status_code != 200:
                 err = data.get("error", {}).get("message", str(resp.status_code))
                 print(f"[Google] Error {resp.status_code}: {err}")
-                return "", "?"
+                return "", f"!google:{resp.status_code}: {err[:60]}"
             if "results" not in data:
-                return "", "?"
+                return "", ""    # silence / no speech — not an error
             text = " ".join(r["alternatives"][0]["transcript"]
                             for r in data["results"] if r.get("alternatives"))
             lang = data["results"][0].get("languageCode", "hy-AM").split("-")[0]
             return text.strip(), lang
         except Exception as e:
             print(f"[Google] Exception: {e}")
-            return "", "?"
+            return "", f"!google:{e}"
 
     def __del__(self):
         try:
@@ -319,6 +329,7 @@ class Overlay:
         self._partial     = ""
         self._done_msg    = ""
         self._done_pasted = False
+        self._done_error  = False
         self._hide_at     = None
 
         self.root.withdraw()
@@ -355,10 +366,19 @@ class Overlay:
 
     def show_done(self, pasted: bool):
         self._done_pasted = pasted
+        self._done_error  = False
         self._done_msg    = "Pasted to cursor" if pasted else "Copied to clipboard"
         self.state        = DONE
         self._visible     = True
         self._hide_at     = time.time() + 2.2
+
+    def show_error(self, msg: str):
+        self._done_error  = True
+        self._done_pasted = False
+        self._done_msg    = msg
+        self.state        = DONE
+        self._visible     = True
+        self._hide_at     = time.time() + 4.0
 
     def _loop(self):
         if self._hide_at and time.time() >= self._hide_at:
@@ -457,19 +477,29 @@ class Overlay:
                           fill="#aaaaaa", font=("Segoe UI", 9))
 
     def _draw_done(self, c, W, H):
-        # green circle with checkmark
         cx, cy, r = 22, H//2, 13
-        c.create_oval(cx-r, cy-r, cx+r, cy+r, fill="#1a3a24", outline="#22c55e", width=1)
-        # checkmark lines
-        c.create_line(cx-6, cy,   cx-1, cy+5, fill="#22c55e", width=2, capstyle=tk.ROUND)
-        c.create_line(cx-1, cy+5, cx+7, cy-4, fill="#22c55e", width=2, capstyle=tk.ROUND)
-
-        c.create_text(42, H//2-9, anchor="w", text=self._done_msg,
-                      fill="#ffffff", font=("Segoe UI Semibold", 11))
-        icon = "⌨" if self._done_pasted else "📋"
-        c.create_text(42, H//2+9, anchor="w",
-                      text=f"{icon}  Ready",
-                      fill="#444444", font=("Segoe UI", 8))
+        if self._done_error:
+            # red circle with X
+            c.create_oval(cx-r, cy-r, cx+r, cy+r, fill="#3a1a1a", outline="#ef4444", width=1)
+            c.create_line(cx-5, cy-5, cx+5, cy+5, fill="#ef4444", width=2, capstyle=tk.ROUND)
+            c.create_line(cx+5, cy-5, cx-5, cy+5, fill="#ef4444", width=2, capstyle=tk.ROUND)
+            msg = self._done_msg if len(self._done_msg) <= 36 else self._done_msg[:34] + "…"
+            c.create_text(42, H//2-9, anchor="w", text=msg,
+                          fill="#ef4444", font=("Segoe UI Semibold", 10))
+            c.create_text(42, H//2+9, anchor="w",
+                          text="Check Settings → Test Key",
+                          fill="#555555", font=("Segoe UI", 8))
+        else:
+            # green circle with checkmark
+            c.create_oval(cx-r, cy-r, cx+r, cy+r, fill="#1a3a24", outline="#22c55e", width=1)
+            c.create_line(cx-6, cy,   cx-1, cy+5, fill="#22c55e", width=2, capstyle=tk.ROUND)
+            c.create_line(cx-1, cy+5, cx+7, cy-4, fill="#22c55e", width=2, capstyle=tk.ROUND)
+            c.create_text(42, H//2-9, anchor="w", text=self._done_msg,
+                          fill="#ffffff", font=("Segoe UI Semibold", 11))
+            icon = "⌨" if self._done_pasted else "📋"
+            c.create_text(42, H//2+9, anchor="w",
+                          text=f"{icon}  Ready",
+                          fill="#444444", font=("Segoe UI", 8))
 
     def _rrect(self, c, x1, y1, x2, y2, r, fill):
         c.create_rectangle(x1+r, y1,   x2-r, y2,   fill=fill, outline="")
@@ -1086,7 +1116,11 @@ class App:
         self.is_rec = False
 
         if not text:
-            self.overlay.root.after(0, self.overlay.hide)
+            if lang and lang.startswith("!google:"):
+                err_msg = lang[8:]          # strip "!google:" prefix
+                self.overlay.root.after(0, lambda m=err_msg: self.overlay.show_error(m))
+            else:
+                self.overlay.root.after(0, self.overlay.hide)
             return
 
         hist.save_entry(text, lang, cfg["backend"])
