@@ -283,38 +283,34 @@ class AudioRecorder:
             if lang_setting == "auto":
                 self._session_lang = lang_arg  # cache only in single-lang auto mode
 
-        # ── Build prompt ─────────────────────────────────────────────────────
-        prompt = cfg.get("initial_prompt", "").strip()
-        if not prompt and lang_arg == "hy":
-            # Rich native-script seed: Whisper uses this as context to anchor
-            # its vocabulary toward Armenian characters vs Latin transliteration.
-            prompt = (
-                "Բարև, ինչպե՞ս ես: Հայաստան, Երևան, Արամ: "
-                "Ես ուզում եմ ասել: Շնորհակալություն:"
-            )
-
         is_hy = (lang_arg == "hy")
 
+        # ── Build prompt ─────────────────────────────────────────────────────
+        # Use the user's custom prompt if set. For Armenian, do NOT add an
+        # automatic seed prompt — Whisper echoes it in a repetition loop
+        # ("Ես ուզում ասել ասել ասել..."). When language="hy" is forced,
+        # Whisper already outputs native script without any prompt.
+        prompt = cfg.get("initial_prompt", "").strip() or None
+
         # ── Transcription ────────────────────────────────────────────────────
-        # vad_filter=False for Armenian: Silero VAD (the pre-filter) is not
-        # trained on Armenian and treats many Armenian phonemes as silence,
-        # leaving only 1-2 words. Disable it so Whisper sees the full audio.
+        # vad_filter=False for Armenian: Silero VAD is not trained on Armenian
+        # and treats Armenian phonemes as silence → only 1-2 words survive.
         #
-        # no_speech_threshold: default 0.6 means Whisper suppresses output
-        # when it's >60% confident there's no speech. Armenian confidence
-        # scores are naturally lower (low-resource language), so lower to 0.35
-        # to let speech through.
+        # temperature as a list: Whisper falls back to higher temperatures when
+        # compression_ratio_threshold is exceeded (too much repetition detected),
+        # which breaks hallucination loops instead of getting stuck at 0.0.
         #
-        # beam_size=5 for Armenian — needs more search breadth than high-resource
-        # languages to find the correct Armenian token sequences.
+        # compression_ratio_threshold=1.8 for Armenian: default 2.4 allows
+        # heavy repetition before retrying. Lower threshold catches loops early.
         segs, _ = model.transcribe(
             audio,
             language=lang_arg,
             beam_size=5 if is_hy else 3,
             vad_filter=not is_hy,
-            no_speech_threshold=0.35 if is_hy else 0.6,
-            temperature=0.0,
-            initial_prompt=prompt or None,
+            no_speech_threshold=0.6,
+            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+            compression_ratio_threshold=1.8 if is_hy else 2.4,
+            initial_prompt=prompt,
             condition_on_previous_text=False,
         )
         return " ".join(s.text.strip() for s in segs).strip(), lang_arg
@@ -492,7 +488,6 @@ class Overlay:
     def _draw_rec(self, c, W, H, accent):
         t      = time.time()
         smooth = list(self._smooth)
-        avg    = sum(smooth) / max(len(smooth), 1)
         ar, ag, ab = int(accent[1:3],16), int(accent[3:5],16), int(accent[5:7],16)
 
         # ── Recording indicator: pulsing ring + solid dot ────────────────
@@ -508,36 +503,26 @@ class Overlay:
                       text=f"Enter or {cfg['hotkey']} to finish  ·  Esc to cancel",
                       fill="#333333", font=("Segoe UI", 8))
 
-        # ── Three-layer flowing wave ──────────────────────────────────────
-        PAD = 14
-        cy  = H - 22          # vertical centre of wave area
-        N   = W - PAD * 2     # number of x pixels
+        # ── Symmetric bar waveform (up + down from centre) ───────────────
+        PAD   = 14
+        num   = 44
+        avail = W - PAD * 2
+        step  = avail / num
+        bar_w = max(int(step * 0.55), 2)
+        cy    = H - 20
+        max_h = 16
 
-        def make_wave(freq, speed, base_amp, phase_off):
-            pts = []
-            for i in range(N + 1):
-                x     = PAD + i
-                ratio = i / max(N, 1) * (len(smooth) - 1)
-                lo    = int(ratio); hi = min(lo + 1, len(smooth) - 1)
-                lv    = smooth[lo] * (1 - (ratio - lo)) + smooth[hi] * (ratio - lo)
-                amp   = base_amp * (0.28 + 2.2 * lv)
-                y     = cy + amp * math.sin(i * freq + t * speed + phase_off)
-                pts  += [x, y]
-            return pts
-
-        # Layer 0 — slowest, dimmest, widest wave (background depth)
-        # Layer 1 — mid speed and brightness
-        # Layer 2 — fastest, brightest, sharpest (foreground)
-        layers = [
-            (0.038, 36, 7,  0.0,           0.18, 1),
-            (0.054, 56, 9,  math.pi * 0.6, 0.42, 1),
-            (0.071, 78, 11, math.pi * 1.2, 1.00, 2),
-        ]
-        for freq, speed, base_amp, phase, bright, lw in layers:
-            pts = make_wave(freq, speed, base_amp, phase)
-            col = f"#{int(ar*bright):02x}{int(ag*bright):02x}{int(ab*bright):02x}"
-            if len(pts) >= 4:
-                c.create_line(pts, fill=col, width=lw, smooth=True)
+        for i in range(num):
+            idx_f = i / max(num - 1, 1) * (len(smooth) - 1)
+            lo    = int(idx_f); hi = min(lo + 1, len(smooth) - 1)
+            lv    = smooth[lo] * (1 - (idx_f - lo)) + smooth[hi] * (idx_f - lo)
+            # gentle idle ripple so bars are never fully flat
+            lv    = max(lv, 0.06 * abs(math.sin(t * 1.8 + i * 0.38)))
+            bh    = max(int(lv * max_h), 2)
+            x     = int(PAD + i * step)
+            fac   = 0.3 + 0.7 * min(lv * 2, 1.0)
+            col   = f"#{int(ar*fac):02x}{int(ag*fac):02x}{int(ab*fac):02x}"
+            c.create_rectangle(x, cy - bh, x + bar_w, cy + bh, fill=col, outline="")
 
     def _draw_loading(self, c, W, H, accent):
         angle = -(time.time()*300) % 360
