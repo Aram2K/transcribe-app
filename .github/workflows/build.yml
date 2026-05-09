@@ -1,0 +1,109 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+jobs:
+  # ── Windows .exe ─────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install faster-whisper pyaudio numpy keyboard pyperclip pynput pystray Pillow psutil requests pyinstaller
+
+      - name: Build .exe
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --onefile --windowed `
+            --name TranscribeApp `
+            --add-data "config.example.json;." `
+            --add-data "history.py;." `
+            --hidden-import faster_whisper `
+            --hidden-import ctranslate2 `
+            --hidden-import huggingface_hub `
+            --hidden-import tokenizers `
+            --collect-all faster_whisper `
+            --collect-all ctranslate2 `
+            --collect-all pystray `
+            --collect-all pynput `
+            main.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/TranscribeApp.exe
+
+  # ── macOS .dmg ───────────────────────────────────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          brew install portaudio python-tk@3.11
+
+      - name: Install Python dependencies
+        run: |
+          /opt/homebrew/bin/python3.11 -m pip install --upgrade pip
+          /opt/homebrew/bin/python3.11 -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          /opt/homebrew/bin/python3.11 -m pip install faster-whisper pyaudio numpy keyboard pyperclip pynput pystray Pillow psutil requests pyinstaller
+
+      - name: Build .app
+        run: |
+          /opt/homebrew/bin/python3.11 -m PyInstaller \
+            --onedir --windowed \
+            --name TranscribeApp \
+            --add-data "config.example.json:." \
+            --add-data "history.py:." \
+            --hidden-import faster_whisper \
+            --hidden-import ctranslate2 \
+            --hidden-import huggingface_hub \
+            --hidden-import tokenizers \
+            --collect-all faster_whisper \
+            --collect-all ctranslate2 \
+            --collect-all pystray \
+            --collect-all pynput \
+            main.py
+
+      - name: Package as DMG
+        run: |
+          hdiutil create \
+            -volname "TranscribeApp" \
+            -srcfolder dist/TranscribeApp.app \
+            -ov -format UDZO \
+            TranscribeApp-Mac.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: TranscribeApp-Mac.dmg
+
+  # ── GitHub Release ────────────────────────────────────────────────────────────
+  release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            windows-exe/TranscribeApp.exe
+            macos-dmg/TranscribeApp-Mac.dmg
