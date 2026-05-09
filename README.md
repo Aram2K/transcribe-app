@@ -15,8 +15,8 @@
 <p>A lightweight, always-on speech-to-text tool that lives in your system tray.<br/>
 Works completely offline using Whisper AI, or connects to Google Cloud for best Armenian accuracy.</p>
 
-**[⬇ Download for Windows](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp.exe)** &nbsp;·&nbsp;
-**[⬇ Download for macOS](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Mac.dmg)** &nbsp;·&nbsp;
+**[⬇ Download for Windows (.zip)](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Windows.zip)** &nbsp;·&nbsp;
+**[⬇ Download for macOS (.dmg)](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Mac.dmg)** &nbsp;·&nbsp;
 [View all releases](https://github.com/Aram2K/transcribe-app/releases)
 
 </div>
@@ -53,9 +53,10 @@ It was built especially for **Armenian speakers** who need accurate, native-scri
 
 ### Windows
 
-1. Download **[TranscribeApp.exe](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp.exe)**
-2. Double-click to run — no installation needed
-3. A microphone icon appears in your system tray
+1. Download **[TranscribeApp-Windows.zip](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Windows.zip)**
+2. Extract the zip anywhere (e.g. `C:\TranscribeApp\`)
+3. Double-click `TranscribeApp.exe` inside the extracted folder
+4. A microphone icon appears in your system tray
 
 > **Note:** Windows may show a "Windows protected your PC" warning the first time because the app isn't code-signed. Click **More info → Run anyway**. The app is open-source and safe.
 
@@ -175,7 +176,7 @@ Copy `config.example.json` → `config.json` and edit. The file is git-ignored (
 ### Windows `.exe`
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1
-# Output: dist/TranscribeApp.exe
+# Output: dist\TranscribeApp\TranscribeApp.exe  (folder, not single file)
 ```
 
 ### Automated CI (GitHub Actions)
@@ -184,7 +185,7 @@ Push a version tag to trigger automatic builds for both platforms:
 git tag v1.0.0
 git push --tags
 ```
-GitHub Actions builds `TranscribeApp.exe` and `TranscribeApp-Mac.dmg` and creates a public release automatically.
+GitHub Actions builds `TranscribeApp-Windows.zip` and `TranscribeApp-Mac.dmg` and creates a public release automatically.
 
 ---
 
