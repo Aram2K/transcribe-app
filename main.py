@@ -286,20 +286,36 @@ class AudioRecorder:
         # ── Build prompt ─────────────────────────────────────────────────────
         prompt = cfg.get("initial_prompt", "").strip()
         if not prompt and lang_arg == "hy":
-            # Native-script seed prevents Whisper from falling back to Latin
-            # transliteration for Armenian (its default for low-confidence output).
-            prompt = "Բարև, ինչպե՞ս ես: Հայաստան, Երևան, Արամ:"
+            # Rich native-script seed: Whisper uses this as context to anchor
+            # its vocabulary toward Armenian characters vs Latin transliteration.
+            prompt = (
+                "Բարև, ինչպե՞ս ես: Հայաստան, Երևան, Արամ: "
+                "Ես ուզում եմ ասել: Շնորհակալություն:"
+            )
+
+        is_hy = (lang_arg == "hy")
 
         # ── Transcription ────────────────────────────────────────────────────
-        # Higher beam_size for Armenian — low-resource language needs more search
-        beam = 5 if lang_arg == "hy" else 3
+        # vad_filter=False for Armenian: Silero VAD (the pre-filter) is not
+        # trained on Armenian and treats many Armenian phonemes as silence,
+        # leaving only 1-2 words. Disable it so Whisper sees the full audio.
+        #
+        # no_speech_threshold: default 0.6 means Whisper suppresses output
+        # when it's >60% confident there's no speech. Armenian confidence
+        # scores are naturally lower (low-resource language), so lower to 0.35
+        # to let speech through.
+        #
+        # beam_size=5 for Armenian — needs more search breadth than high-resource
+        # languages to find the correct Armenian token sequences.
         segs, _ = model.transcribe(
             audio,
             language=lang_arg,
-            beam_size=beam,
-            vad_filter=True,
+            beam_size=5 if is_hy else 3,
+            vad_filter=not is_hy,
+            no_speech_threshold=0.35 if is_hy else 0.6,
+            temperature=0.0,
             initial_prompt=prompt or None,
-            condition_on_previous_text=False,  # chunks are independent — no bleed-over
+            condition_on_previous_text=False,
         )
         return " ".join(s.text.strip() for s in segs).strip(), lang_arg
 
@@ -474,39 +490,54 @@ class Overlay:
             self._draw_done(c, W, H)
 
     def _draw_rec(self, c, W, H, accent):
-        t  = time.time()
-        p  = 0.5 + 0.5*math.sin(t*4)
-        r  = 4 + p*2
-        cy = H//2 - 14
-        c.create_oval(18-r, cy-r, 18+r, cy+r, fill="#ff3b3b", outline="")
-        c.create_text(32, cy, anchor="w", text="Recording",
-                      fill="#ffffff", font=("Segoe UI Semibold", 11))
-        c.create_text(32, cy+15, anchor="w",
-                      text=f"Enter or {cfg['hotkey']} to stop  ·  Esc to cancel",
-                      fill="#454545", font=("Segoe UI", 8))
-
-        # waveform — fills full width, tall bars
-        pad_x   = 14
-        num     = 36
-        avail   = W - pad_x*2
-        step    = avail / num
-        bar_w   = max(int(step * 0.55), 1)
-        cy_wave = H - 14
-        max_h   = 14
+        t      = time.time()
+        smooth = list(self._smooth)
+        avg    = sum(smooth) / max(len(smooth), 1)
         ar, ag, ab = int(accent[1:3],16), int(accent[3:5],16), int(accent[5:7],16)
 
-        smooth = list(self._smooth)  # snapshot — _smooth mutated by record thread
-        for i in range(num):
-            t_idx  = i / max(num-1,1) * (len(smooth)-1)
-            lo     = int(t_idx)
-            hi     = min(lo+1, len(smooth)-1)
-            lv     = smooth[lo]*(1-(t_idx-lo)) + smooth[hi]*(t_idx-lo)
-            bh     = max(int(lv * max_h), 2)
-            x      = int(pad_x + i*step)
-            fac    = 0.4 + 0.6*lv
-            col    = f"#{int(ar*fac):02x}{int(ag*fac):02x}{int(ab*fac):02x}"
-            c.create_rectangle(x, cy_wave-bh, x+bar_w, cy_wave+bh,
-                               fill=col, outline="")
+        # ── Recording indicator: pulsing ring + solid dot ────────────────
+        pulse  = 0.5 + 0.5 * math.sin(t * 3.5)
+        dx, dy = 18, 26
+        rr     = 7 + pulse * 3
+        c.create_oval(dx-rr, dy-rr, dx+rr, dy+rr, outline="#ff3b3b", width=1)
+        c.create_oval(dx-4,  dy-4,  dx+4,  dy+4,  fill="#ff3b3b", outline="")
+
+        c.create_text(32, dy-7, anchor="w", text="Recording",
+                      fill="#ffffff", font=("Segoe UI Semibold", 11))
+        c.create_text(32, dy+7, anchor="w",
+                      text=f"Enter or {cfg['hotkey']} to finish  ·  Esc to cancel",
+                      fill="#333333", font=("Segoe UI", 8))
+
+        # ── Three-layer flowing wave ──────────────────────────────────────
+        PAD = 14
+        cy  = H - 22          # vertical centre of wave area
+        N   = W - PAD * 2     # number of x pixels
+
+        def make_wave(freq, speed, base_amp, phase_off):
+            pts = []
+            for i in range(N + 1):
+                x     = PAD + i
+                ratio = i / max(N, 1) * (len(smooth) - 1)
+                lo    = int(ratio); hi = min(lo + 1, len(smooth) - 1)
+                lv    = smooth[lo] * (1 - (ratio - lo)) + smooth[hi] * (ratio - lo)
+                amp   = base_amp * (0.28 + 2.2 * lv)
+                y     = cy + amp * math.sin(i * freq + t * speed + phase_off)
+                pts  += [x, y]
+            return pts
+
+        # Layer 0 — slowest, dimmest, widest wave (background depth)
+        # Layer 1 — mid speed and brightness
+        # Layer 2 — fastest, brightest, sharpest (foreground)
+        layers = [
+            (0.038, 36, 7,  0.0,           0.18, 1),
+            (0.054, 56, 9,  math.pi * 0.6, 0.42, 1),
+            (0.071, 78, 11, math.pi * 1.2, 1.00, 2),
+        ]
+        for freq, speed, base_amp, phase, bright, lw in layers:
+            pts = make_wave(freq, speed, base_amp, phase)
+            col = f"#{int(ar*bright):02x}{int(ag*bright):02x}{int(ab*bright):02x}"
+            if len(pts) >= 4:
+                c.create_line(pts, fill=col, width=lw, smooth=True)
 
     def _draw_loading(self, c, W, H, accent):
         angle = -(time.time()*300) % 360
