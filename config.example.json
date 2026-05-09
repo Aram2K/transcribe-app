@@ -1,0 +1,10 @@
+{
+  "hotkey": "alt+r",
+  "whisper_model": "base",
+  "language": "auto",
+  "sample_rate": 16000,
+  "chunk_size": 1024,
+  "accent_color": "#3b82f6",
+  "backend": "local",
+  "google_api_key": ""
+}

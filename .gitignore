@@ -1,0 +1,16 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Whisper model cache (downloaded automatically, no need to commit)
+*.pt
+
+# User config — contains API keys
+config.json
+
+# PyInstaller builds
+dist/
+build/
+*.spec

@@ -1,0 +1,11 @@
+faster-whisper
+pyaudio
+numpy
+keyboard
+pyperclip
+pynput
+torch
+pystray
+Pillow
+psutil
+requests
