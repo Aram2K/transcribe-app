@@ -27,7 +27,7 @@ def load_config():
     try:
         with open(CONFIG_PATH) as f:
             return {**DEFAULT, **json.load(f)}
-    except:
+    except (FileNotFoundError, json.JSONDecodeError, PermissionError):
         return DEFAULT.copy()
 
 def save_config(c):
@@ -98,10 +98,12 @@ class AudioRecorder:
         self.audio            = pyaudio.PyAudio()
         self._model           = None
         self._model_name      = None
-        self.on_levels        = None
-        self.on_lang_detected = None
-        self.on_partial       = None   # callback(partial_text)
-        # chunked streaming state
+        self._model_lock      = threading.Lock()
+        # use no-op defaults so callers never need to null-check
+        self.on_levels        = lambda lvls: None
+        self.on_lang_detected = lambda code, name: None
+        self.on_partial       = lambda text: None
+        # chunked streaming state — mutations always under _chunk_lock
         self._chunk_frames    = []
         self._chunk_results   = {}
         self._chunk_idx       = 0
@@ -110,17 +112,19 @@ class AudioRecorder:
 
     def load_model(self, name=None):
         name = name or cfg["whisper_model"]
-        if self._model is None or self._model_name != name:
-            self._model      = WhisperModel(name, device="cpu", compute_type="int8")
-            self._model_name = name
+        with self._model_lock:
+            if self._model is None or self._model_name != name:
+                self._model      = WhisperModel(name, device="cpu", compute_type="int8")
+                self._model_name = name
 
     def start_recording(self):
-        self.recording         = True
-        self.frames            = []
-        self._chunk_frames     = []
-        self._chunk_results    = {}
-        self._chunk_idx        = 0
-        self._samples_in_chunk = 0
+        self.recording = True
+        self.frames    = []
+        with self._chunk_lock:
+            self._chunk_frames     = []
+            self._chunk_results    = {}
+            self._chunk_idx        = 0
+            self._samples_in_chunk = 0
         self.stream = self.audio.open(
             format=pyaudio.paFloat32, channels=1,
             rate=cfg["sample_rate"], input=True,
@@ -146,15 +150,17 @@ class AudioRecorder:
 
                 # every CHUNK_SEC, dispatch a background transcription
                 if self._samples_in_chunk >= samples_per_chunk:
-                    chunk_audio  = np.frombuffer(b"".join(self._chunk_frames), dtype=np.float32).copy()
-                    idx          = self._chunk_idx
-                    self._chunk_idx    += 1
-                    self._chunk_frames  = []
-                    self._samples_in_chunk = 0
+                    with self._chunk_lock:
+                        chunk_audio = np.frombuffer(
+                            b"".join(self._chunk_frames), dtype=np.float32).copy()
+                        idx = self._chunk_idx
+                        self._chunk_idx    += 1
+                        self._chunk_frames  = []
+                        self._samples_in_chunk = 0
                     threading.Thread(target=self._transcribe_chunk,
                                      args=(chunk_audio, idx), daemon=True).start()
-            except:
-                pass
+            except Exception:
+                pass  # stream read errors (overflow, device disconnect) — keep going
 
     def _transcribe_chunk(self, audio, idx):
         try:
@@ -174,8 +180,8 @@ class AudioRecorder:
                 self.on_partial(partial)
             if lang and not lang.startswith("!") and self.on_lang_detected:
                 self.on_lang_detected(lang, LANG_NAMES.get(lang, lang.upper()))
-        except:
-            pass
+        except Exception as e:
+            print(f"[Chunk {idx}] Transcription error: {e}")
 
     def stop_recording(self):
         self.recording = False
@@ -183,8 +189,8 @@ class AudioRecorder:
         try:
             self.stream.stop_stream()
             self.stream.close()
-        except:
-            pass
+        except Exception as e:
+            print(f"[Stop] Stream cleanup: {e}")
 
     def _float_to_wav(self, audio_float):
         int_data = (audio_float * 32767).astype(np.int16)
@@ -229,6 +235,10 @@ class AudioRecorder:
         if len(audio) < cfg["sample_rate"] // 2:
             return "", "en"
 
+        # Capture a stable local reference — safe if model reloads in parallel
+        with self._model_lock:
+            model = self._model
+
         lang_arg = cfg["language"] if cfg["language"] != "auto" else None
 
         # Two-pass: detect language first, then transcribe with explicit lang.
@@ -236,14 +246,14 @@ class AudioRecorder:
         # not Latin transliteration).
         if lang_arg is None:
             sample = audio[:cfg["sample_rate"] * 8]
-            _, detect_info = self._model.transcribe(
+            _, detect_info = model.transcribe(
                 sample, language=None, beam_size=1,
                 vad_filter=False, without_timestamps=True
             )
             lang_arg = detect_info.language
 
         prompt = cfg.get("initial_prompt", "").strip() or None
-        segs, info = self._model.transcribe(
+        segs, _ = model.transcribe(
             audio, language=lang_arg, beam_size=3, vad_filter=True,
             initial_prompt=prompt
         )
@@ -293,11 +303,11 @@ class AudioRecorder:
             print(f"[Google] Exception: {e}")
             return "", f"!google:{e}"
 
-    def __del__(self):
+    def shutdown(self):
         try:
             self.audio.terminate()
-        except:
-            pass
+        except Exception as e:
+            print(f"[Audio] Terminate error: {e}")
 
 # ── Overlay ───────────────────────────────────────────────────────────────────
 
@@ -437,7 +447,7 @@ class Overlay:
         max_h   = 14
         ar, ag, ab = int(accent[1:3],16), int(accent[3:5],16), int(accent[5:7],16)
 
-        smooth = self._smooth
+        smooth = list(self._smooth)  # snapshot — _smooth mutated by record thread
         for i in range(num):
             t_idx  = i / max(num-1,1) * (len(smooth)-1)
             lo     = int(t_idx)
@@ -467,10 +477,10 @@ class Overlay:
                       text=f"via {backend_label}  ·  pasting when ready",
                       fill="#444444", font=("Segoe UI", 8))
 
-        if self._partial:
-            # show last ~55 chars of partial so it fits in the bar
-            preview = self._partial[-55:].lstrip()
-            if len(self._partial) > 55:
+        partial = self._partial  # local snapshot — avoids cross-thread mutation
+        if partial:
+            preview = partial[-55:].lstrip()
+            if len(partial) > 55:
                 preview = "…" + preview
             c.create_rectangle(10, 50, W-10, H-8, fill="#1a1a1a", outline="#2a2a2a")
             c.create_text(16, (50+H-8)//2, anchor="w", text=preview,
@@ -1012,7 +1022,7 @@ class Settings:
         cfg["hotkey"]         = self._captured_hotkey or cfg["hotkey"]
         cfg["whisper_model"]  = self.model_var.get()
         cfg["language"]       = self.lang_var.get()
-        cfg["accent_color"]   = PALETTE[self.color_var.get()]
+        cfg["accent_color"]   = PALETTE.get(self.color_var.get(), PALETTE["Blue"])
         cfg["backend"]        = self.backend_var.get()
         cfg["google_api_key"] = self.api_key_var.get().strip()
         cfg["initial_prompt"] = self.prompt_text.get("1.0", tk.END).strip()
@@ -1134,8 +1144,8 @@ class App:
             self.kbd.press(mod); self.kbd.press("v")
             self.kbd.release("v"); self.kbd.release(mod)
             pasted = True
-        except:
-            pass
+        except Exception as e:
+            print(f"[Paste] Error: {e}")
 
         self.overlay.root.after(0, lambda: self.overlay.show_done(pasted))
 
@@ -1144,6 +1154,12 @@ class App:
 
     def open_history(self):
         self.overlay.root.after(0, self.history.open)
+
+    def shutdown(self):
+        if self._mouse_listener:
+            try: self._mouse_listener.stop()
+            except Exception: pass
+        self.recorder.shutdown()
 
 # ── Tray ──────────────────────────────────────────────────────────────────────
 
@@ -1163,6 +1179,7 @@ def run_tray(app: App):
     def on_history(icon, _):  app.open_history()
     def on_quit(icon, _):
         icon.stop()
+        app.shutdown()
         app.overlay.root.after(0, app.overlay.root.quit)
 
     pystray.Icon("transcribe", make_icon(cfg["accent_color"]),
