@@ -4,7 +4,6 @@ numpy
 keyboard
 pyperclip
 pynput
-torch
 pystray
 Pillow
 psutil
