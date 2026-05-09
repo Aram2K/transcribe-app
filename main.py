@@ -109,6 +109,7 @@ class AudioRecorder:
         self._chunk_idx       = 0
         self._chunk_lock      = threading.Lock()
         self._samples_in_chunk= 0
+        self._session_lang    = None   # cached detected language for this recording
 
     def load_model(self, name=None):
         name = name or cfg["whisper_model"]
@@ -125,6 +126,7 @@ class AudioRecorder:
             self._chunk_results    = {}
             self._chunk_idx        = 0
             self._samples_in_chunk = 0
+        self._session_lang = None   # reset on each new recording
         self.stream = self.audio.open(
             format=pyaudio.paFloat32, channels=1,
             rate=cfg["sample_rate"], input=True,
@@ -232,30 +234,50 @@ class AudioRecorder:
 
     def _run_local(self, audio):
         self.load_model()
-        if len(audio) < cfg["sample_rate"] // 2:
+        sr = cfg["sample_rate"]
+        if len(audio) < sr // 2:
             return "", "en"
 
-        # Capture a stable local reference — safe if model reloads in parallel
         with self._model_lock:
             model = self._model
 
-        lang_arg = cfg["language"] if cfg["language"] != "auto" else None
-
-        # Two-pass: detect language first, then transcribe with explicit lang.
-        # This forces Whisper to output native script (e.g. Armenian letters,
-        # not Latin transliteration).
-        if lang_arg is None:
-            sample = audio[:cfg["sample_rate"] * 8]
-            _, detect_info = model.transcribe(
+        # ── Language resolution ──────────────────────────────────────────────
+        if cfg["language"] != "auto":
+            lang_arg = cfg["language"]
+        elif self._session_lang is not None:
+            # Reuse language detected on the first chunk — avoids re-running
+            # detection on every background chunk and gives consistent results.
+            lang_arg = self._session_lang
+        else:
+            # First-pass detection: consume the generator fully before the
+            # second pass, otherwise faster-whisper's internal CTranslate2
+            # state may not be released and the second call can misbehave.
+            sample = audio[:sr * 8]
+            segs_detect, detect_info = model.transcribe(
                 sample, language=None, beam_size=1,
                 vad_filter=False, without_timestamps=True
             )
+            list(segs_detect)          # must consume — generator is lazy
             lang_arg = detect_info.language
+            self._session_lang = lang_arg
 
-        prompt = cfg.get("initial_prompt", "").strip() or None
+        # ── Build prompt ─────────────────────────────────────────────────────
+        prompt = cfg.get("initial_prompt", "").strip()
+        if not prompt and lang_arg == "hy":
+            # Native-script seed prevents Whisper from falling back to Latin
+            # transliteration for Armenian (its default for low-confidence output).
+            prompt = "Բարև, ինչպե՞ս ես: Հայաստան, Երևան, Արամ:"
+
+        # ── Transcription ────────────────────────────────────────────────────
+        # Higher beam_size for Armenian — low-resource language needs more search
+        beam = 5 if lang_arg == "hy" else 3
         segs, _ = model.transcribe(
-            audio, language=lang_arg, beam_size=3, vad_filter=True,
-            initial_prompt=prompt
+            audio,
+            language=lang_arg,
+            beam_size=beam,
+            vad_filter=True,
+            initial_prompt=prompt or None,
+            condition_on_previous_text=False,  # chunks are independent — no bleed-over
         )
         return " ".join(s.text.strip() for s in segs).strip(), lang_arg
 
