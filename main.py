@@ -49,14 +49,15 @@ MODELS = {
 }
 
 LANG_NAMES = {
-    "auto": "Auto-detect",
-    "hy":   "Armenian",
-    "en":   "English",
-    "ru":   "Russian",
-    "fr":   "French",
-    "de":   "German",
-    "es":   "Spanish",
-    "ar":   "Arabic",
+    "auto":  "Auto-detect",
+    "multi": "Multilingual",
+    "hy":    "Armenian",
+    "en":    "English",
+    "ru":    "Russian",
+    "fr":    "French",
+    "de":    "German",
+    "es":    "Spanish",
+    "ar":    "Arabic",
 }
 
 def model_ok(name):
@@ -258,24 +259,29 @@ class AudioRecorder:
             model = self._model
 
         # ── Language resolution ──────────────────────────────────────────────
-        if cfg["language"] != "auto":
-            lang_arg = cfg["language"]
-        elif self._session_lang is not None:
-            # Reuse language detected on the first chunk — avoids re-running
-            # detection on every background chunk and gives consistent results.
+        lang_setting = cfg["language"]
+
+        if lang_setting not in ("auto", "multi"):
+            # Explicit language — use directly, no detection needed
+            lang_arg = lang_setting
+        elif lang_setting == "auto" and self._session_lang is not None:
+            # Auto: cache the language detected on the first chunk so
+            # subsequent chunks don't each pay for a detection pass.
             lang_arg = self._session_lang
         else:
-            # First-pass detection: consume the generator fully before the
-            # second pass, otherwise faster-whisper's internal CTranslate2
-            # state may not be released and the second call can misbehave.
+            # "auto" (first chunk) or "multi" (every chunk independently).
+            # Consume the detection generator fully before the second pass —
+            # faster-whisper is lazy; not consuming it leaves CTranslate2
+            # state unreleased, which corrupts the transcription pass.
             sample = audio[:sr * 8]
             segs_detect, detect_info = model.transcribe(
                 sample, language=None, beam_size=1,
                 vad_filter=False, without_timestamps=True
             )
-            list(segs_detect)          # must consume — generator is lazy
+            list(segs_detect)
             lang_arg = detect_info.language
-            self._session_lang = lang_arg
+            if lang_setting == "auto":
+                self._session_lang = lang_arg  # cache only in single-lang auto mode
 
         # ── Build prompt ─────────────────────────────────────────────────────
         prompt = cfg.get("initial_prompt", "").strip()
@@ -303,12 +309,16 @@ class AudioRecorder:
         wav = self._float_to_wav(audio)
         b64 = base64.b64encode(wav).decode()
 
-        if cfg["language"] == "auto":
+        BCP = {"hy":"hy-AM","en":"en-US","ru":"ru-RU",
+               "fr":"fr-FR","de":"de-DE","es":"es-ES","ar":"ar-AE"}
+        lang_setting = cfg["language"]
+        if lang_setting == "multi":
+            # Multilingual: Google detects among all common languages per utterance
+            primary, alts = "hy-AM", ["en-US", "ru-RU", "fr-FR"]
+        elif lang_setting == "auto":
             primary, alts = "hy-AM", ["en-US", "ru-RU"]
         else:
-            bcp = {"hy":"hy-AM","en":"en-US","ru":"ru-RU",
-                   "fr":"fr-FR","de":"de-DE","es":"es-ES","ar":"ar-AE"}
-            primary = bcp.get(cfg["language"], "hy-AM")
+            primary = BCP.get(lang_setting, "hy-AM")
             alts    = []
 
         gcfg = {
@@ -507,7 +517,7 @@ class Overlay:
                      style=tk.ARC, outline=accent, width=2)
 
         dots  = "." * (int(time.time()*2) % 4)
-        label = f"Transcribing in {self._lang}{dots}" if self._lang else f"Finalising{dots}"
+        label = f"Transcribing · {self._lang}{dots}" if self._lang else f"Finalising{dots}"
         c.create_text(42, 22, anchor="w", text=label,
                       fill="#ffffff", font=("Segoe UI Semibold", 11))
         backend_label = "Google Cloud" if cfg["backend"]=="google" else "Local"
