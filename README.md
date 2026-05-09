@@ -1,6 +1,6 @@
 # Transcribe App
 
-A lightweight offline speech-to-text tool for Windows. Press a hotkey anywhere on your computer, speak, and the transcription is pasted directly where your cursor is.
+A lightweight offline speech-to-text tool for Windows and macOS. Press a hotkey anywhere on your computer, speak, and the transcription is pasted directly where your cursor is.
 
 ## Features
 
@@ -10,15 +10,17 @@ A lightweight offline speech-to-text tool for Windows. Press a hotkey anywhere o
 - **Smart paste** — pastes at cursor, falls back to clipboard
 - **Streaming transcription** — background chunking so results feel instant
 - **System tray** — lives in the background, zero UI until you need it
-- **Settings panel** — hotkey, model, color, language, all configurable
+- **Settings panel** — hotkey, model, color, language, custom vocabulary, all configurable
+- **History log** — scrollable list of all transcriptions with copy button
+- **Custom vocabulary** — seed Whisper with names/terms for better accuracy
 
 ## Quick Start
 
 ### Requirements
 - Python 3.9+
-- Windows 10/11 (Mac support coming)
+- Windows 10/11 or macOS 12+
 
-### Install
+### Install (Windows)
 
 ```bash
 git clone https://github.com/Aram2k/transcribe-app.git
@@ -26,15 +28,33 @@ cd transcribe-app
 powershell -ExecutionPolicy Bypass -File setup.ps1
 ```
 
+### Install (macOS)
+
+```bash
+git clone https://github.com/Aram2k/transcribe-app.git
+cd transcribe-app
+bash setup_mac.sh
+```
+
 ### Run
 
-Double-click `run.bat` — a mic icon appears in your system tray.
+**Windows:** Double-click `run.bat` — a mic icon appears in your system tray.
 
-### Auto-start on boot
+**macOS:** `bash run.sh`
+
+### Auto-start on boot (Windows)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File setup_autostart.ps1
 ```
+
+### Build standalone .exe (Windows)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build.ps1
+```
+
+The `.exe` will appear in `dist\TranscribeApp.exe`.
 
 ## Usage
 
@@ -75,10 +95,12 @@ Copy `config.example.json` → `config.json` and edit. Never commit `config.json
 
 ## Roadmap
 
-- [ ] macOS support
-- [ ] One-click installer (.exe for Windows, .dmg for Mac)
-- [ ] Custom vocabulary / prompt support
-- [ ] History log of transcriptions
+- [x] macOS support (`setup_mac.sh`, `run.sh`, cross-platform paste)
+- [x] Windows installer build script (`build.ps1` → `dist/TranscribeApp.exe`)
+- [x] Custom vocabulary / prompt support (Settings → Custom Vocabulary)
+- [x] History log of transcriptions
+- [ ] macOS `.dmg` installer / one-click installer
+- [ ] macOS auto-start on login
 
 ## Contributing
 
