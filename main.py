@@ -5,6 +5,7 @@ import psutil, pyaudio, numpy as np, keyboard, pyperclip, pystray, requests, bas
 from PIL import Image, ImageDraw
 from pynput.keyboard import Controller, Key
 from faster_whisper import WhisperModel
+import history as hist
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -474,6 +475,114 @@ class Overlay:
     def run(self):
         self.root.mainloop()
 
+# ── History Window ────────────────────────────────────────────────────────────
+
+class HistoryWindow:
+    BG   = "#0f0f0f"
+    CARD = "#161616"
+    SEP  = "#1e1e1e"
+    FG   = "#ffffff"
+    FG2  = "#555555"
+
+    def __init__(self, root):
+        self.root = root
+        self.win  = None
+
+    def open(self):
+        if self.win and self.win.winfo_exists():
+            self.win.lift(); return
+
+        self.win = tk.Toplevel(self.root)
+        self.win.title("History")
+        self.win.configure(bg=self.BG)
+        self.win.geometry("520x600")
+        self.win.resizable(False, True)
+        self.win.attributes("-topmost", True)
+        self.win.update_idletasks()
+        apply_glass(self.win.winfo_id(), "#0f0f0ff5")
+
+        self._build()
+
+    def _build(self):
+        w = self.win
+        entries = hist.load()
+
+        # Header
+        hdr = tk.Frame(w, bg=self.BG)
+        hdr.pack(fill="x", padx=20, pady=(18, 6))
+        tk.Label(hdr, text="History", bg=self.BG, fg=self.FG,
+                 font=("Segoe UI Semibold", 16)).pack(side="left")
+        tk.Label(hdr, text=f"  {len(entries)} entries",
+                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 9)).pack(side="left", pady=4)
+
+        if entries:
+            tk.Button(hdr, text="Clear all", command=self._clear,
+                      bg=self.BG, fg="#555555", activebackground=self.BG,
+                      font=("Segoe UI", 9), relief="flat", cursor="hand2").pack(side="right")
+
+        tk.Frame(w, bg=self.SEP, height=1).pack(fill="x")
+
+        if not entries:
+            tk.Label(w, text="No transcriptions yet.\nPress your hotkey to start.",
+                     bg=self.BG, fg=self.FG2,
+                     font=("Segoe UI", 11)).pack(expand=True)
+            return
+
+        # Scrollable list
+        outer = tk.Frame(w, bg=self.BG)
+        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(outer, bg=self.BG, highlightthickness=0)
+        sb = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        frame = tk.Frame(canvas, bg=self.BG)
+        fw = canvas.create_window((0, 0), window=frame, anchor="nw")
+
+        def _resize(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig(fw, width=canvas.winfo_width())
+        frame.bind("<Configure>", _resize)
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(fw, width=e.width))
+        w.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+
+        for i, entry in enumerate(entries):
+            self._entry_card(frame, entry, i)
+
+    def _entry_card(self, parent, entry, idx):
+        card = tk.Frame(parent, bg=self.CARD, padx=16, pady=12)
+        card.pack(fill="x", padx=12, pady=(8 if idx == 0 else 0, 0))
+
+        # Top row: timestamp + language + backend
+        top = tk.Frame(card, bg=self.CARD)
+        top.pack(fill="x")
+        tk.Label(top, text=entry["timestamp"], bg=self.CARD, fg=self.FG2,
+                 font=("Segoe UI", 8)).pack(side="left")
+
+        lang = LANG_NAMES.get(entry.get("language",""), entry.get("language",""))
+        backend = "☁" if entry.get("backend") == "google" else "⬡"
+        tk.Label(top, text=f"  {backend} {lang}", bg=self.CARD, fg=self.FG2,
+                 font=("Segoe UI", 8)).pack(side="left")
+
+        # Copy button
+        copy_btn = tk.Button(top, text="Copy", command=lambda t=entry["text"]: pyperclip.copy(t),
+                             bg="#1e1e1e", fg="#888888", activebackground="#2a2a2a",
+                             font=("Segoe UI", 8), relief="flat", padx=8, pady=2,
+                             cursor="hand2")
+        copy_btn.pack(side="right")
+
+        # Text
+        tk.Label(card, text=entry["text"], bg=self.CARD, fg=self.FG,
+                 font=("Segoe UI", 10), wraplength=450, justify="left",
+                 anchor="w").pack(fill="x", pady=(6, 0))
+
+        tk.Frame(parent, bg=self.SEP, height=1).pack(fill="x", padx=12)
+
+    def _clear(self):
+        hist.clear()
+        self.win.destroy()
+        self.win = None
+
 # ── Settings Window ───────────────────────────────────────────────────────────
 
 PALETTE = {
@@ -815,6 +924,7 @@ class App:
         self.kbd      = Controller()
         self.is_rec   = False
         self.settings = Settings(overlay.root, self)
+        self.history  = HistoryWindow(overlay.root)
 
         keyboard.add_hotkey(cfg["hotkey"], self._on_hotkey)
         keyboard.add_hotkey("enter",       self._on_enter)
@@ -865,10 +975,11 @@ class App:
             self.overlay.root.after(0, self.overlay.hide)
             return
 
+        hist.save_entry(text, lang, cfg["backend"])
+
         time.sleep(0.35)
         pyperclip.copy(text)
 
-        # Try to paste; detect if it actually landed somewhere
         pasted = False
         try:
             self.kbd.press(Key.ctrl); self.kbd.press("v")
@@ -881,6 +992,9 @@ class App:
 
     def open_settings(self):
         self.overlay.root.after(0, self.settings.open)
+
+    def open_history(self):
+        self.overlay.root.after(0, self.history.open)
 
 # ── Tray ──────────────────────────────────────────────────────────────────────
 
@@ -897,6 +1011,7 @@ def make_icon(color="#3b82f6"):
 
 def run_tray(app: App):
     def on_settings(icon, _): app.open_settings()
+    def on_history(icon, _):  app.open_history()
     def on_quit(icon, _):
         icon.stop()
         app.overlay.root.after(0, app.overlay.root.quit)
@@ -906,7 +1021,9 @@ def run_tray(app: App):
         menu=pystray.Menu(
             pystray.MenuItem("Transcribe", None, enabled=False),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("History",  on_history),
             pystray.MenuItem("Settings", on_settings),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit",     on_quit),
         )).run()
 
