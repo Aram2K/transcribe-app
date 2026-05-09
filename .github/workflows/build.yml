@@ -18,14 +18,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install faster-whisper pyaudio numpy keyboard pyperclip pynput pystray Pillow psutil requests pyinstaller
+          pip install -r requirements.txt pyinstaller
 
       - name: Build .exe
         shell: pwsh
         run: |
           pyinstaller `
-            --onefile --windowed `
+            --onedir --windowed `
             --name TranscribeApp `
             --add-data "config.example.json;." `
             --add-data "history.py;." `
@@ -37,12 +36,22 @@ jobs:
             --collect-all ctranslate2 `
             --collect-all pystray `
             --collect-all pynput `
+            --exclude-module torch `
+            --exclude-module openai `
+            --exclude-module numba `
+            --exclude-module llvmlite `
+            --exclude-module matplotlib `
+            --exclude-module IPython `
             main.py
+
+      - name: Zip output folder
+        shell: pwsh
+        run: Compress-Archive -Path dist\TranscribeApp\* -DestinationPath TranscribeApp-Windows.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-exe
-          path: dist/TranscribeApp.exe
+          name: windows-zip
+          path: TranscribeApp-Windows.zip
 
   # ── macOS .dmg ───────────────────────────────────────────────────────────────
   build-macos:
@@ -51,14 +60,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install system deps
-        run: |
-          brew install portaudio python-tk@3.11
+        run: brew install portaudio python-tk@3.11
 
       - name: Install Python dependencies
         run: |
           /opt/homebrew/bin/python3.11 -m pip install --upgrade pip
-          /opt/homebrew/bin/python3.11 -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          /opt/homebrew/bin/python3.11 -m pip install faster-whisper pyaudio numpy keyboard pyperclip pynput pystray Pillow psutil requests pyinstaller
+          /opt/homebrew/bin/python3.11 -m pip install -r requirements.txt pyinstaller
 
       - name: Build .app
         run: |
@@ -75,6 +82,12 @@ jobs:
             --collect-all ctranslate2 \
             --collect-all pystray \
             --collect-all pynput \
+            --exclude-module torch \
+            --exclude-module openai \
+            --exclude-module numba \
+            --exclude-module llvmlite \
+            --exclude-module matplotlib \
+            --exclude-module IPython \
             main.py
 
       - name: Package as DMG
@@ -105,5 +118,5 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            windows-exe/TranscribeApp.exe
+            windows-zip/TranscribeApp-Windows.zip
             macos-dmg/TranscribeApp-Mac.dmg

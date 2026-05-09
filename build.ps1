@@ -11,7 +11,7 @@ pip install pyinstaller --quiet
 
 Write-Host "Building .exe..." -ForegroundColor Cyan
 pyinstaller `
-    --onefile `
+    --onedir `
     --windowed `
     --name "TranscribeApp" `
     --add-data "config.example.json;." `
@@ -25,6 +25,12 @@ pyinstaller `
     --collect-all "pystray" `
     --collect-all "pynput" `
     --collect-all "pyaudio" `
+    --exclude-module "torch" `
+    --exclude-module "openai" `
+    --exclude-module "numba" `
+    --exclude-module "llvmlite" `
+    --exclude-module "matplotlib" `
+    --exclude-module "IPython" `
     main.py
 
 if ($LASTEXITCODE -eq 0) {

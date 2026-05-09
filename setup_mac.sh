@@ -6,11 +6,8 @@ echo "Creating virtual environment..."
 python3 -m venv venv
 source venv/bin/activate
 
-echo "Installing PyTorch (CPU)..."
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-
 echo "Installing dependencies..."
-pip install faster-whisper pyaudio numpy keyboard pyperclip pynput pystray Pillow psutil requests
+pip install -r requirements.txt
 
 echo ""
 echo "Setup complete!"
