@@ -21,7 +21,7 @@ A lightweight offline speech-to-text tool for Windows. Press a hotkey anywhere o
 ### Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/transcribe-app.git
+git clone https://github.com/Aram2k/transcribe-app.git
 cd transcribe-app
 powershell -ExecutionPolicy Bypass -File setup.ps1
 ```
