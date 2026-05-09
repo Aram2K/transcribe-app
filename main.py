@@ -4,6 +4,7 @@ from tkinter import ttk
 import psutil, pyaudio, numpy as np, keyboard, pyperclip, pystray, requests, base64, ctypes
 from PIL import Image, ImageDraw
 from pynput.keyboard import Controller, Key
+from pynput import mouse as pynput_mouse
 from faster_whisper import WhisperModel
 import history as hist
 
@@ -253,25 +254,34 @@ class AudioRecorder:
             bcp = {"hy":"hy-AM","en":"en-US","ru":"ru-RU",
                    "fr":"fr-FR","de":"de-DE","es":"es-ES","ar":"ar-AE"}
             primary, alts = bcp.get(cfg["language"], "hy-AM"), []
-        payload = {
-            "config": {"encoding":"LINEAR16","sampleRateHertz":cfg["sample_rate"],
-                       "languageCode":primary,"alternativeLanguageCodes":alts,
-                       "enableAutomaticPunctuation":True,"model":"latest_long"},
-            "audio":  {"content": b64}
+        gcfg = {
+            "encoding":        "LINEAR16",
+            "sampleRateHertz": cfg["sample_rate"],
+            "languageCode":    primary,
+            "alternativeLanguageCodes": alts,
         }
+        # enableAutomaticPunctuation only works reliably on a subset of languages
+        if primary in ("en-US", "fr-FR", "de-DE", "es-ES"):
+            gcfg["enableAutomaticPunctuation"] = True
+        payload = {"config": gcfg, "audio": {"content": b64}}
         try:
             resp = requests.post(
                 f"https://speech.googleapis.com/v1/speech:recognize?key={cfg['google_api_key']}",
                 json=payload, timeout=15)
             data = resp.json()
+            if resp.status_code != 200:
+                err = data.get("error", {}).get("message", str(resp.status_code))
+                print(f"[Google] Error {resp.status_code}: {err}")
+                return "", "?"
             if "results" not in data:
                 return "", "?"
             text = " ".join(r["alternatives"][0]["transcript"]
                             for r in data["results"] if r.get("alternatives"))
-            lang = data["results"][0].get("languageCode","hy-AM").split("-")[0]
+            lang = data["results"][0].get("languageCode", "hy-AM").split("-")[0]
             return text.strip(), lang
         except Exception as e:
-            return f"[error: {e}]", "?"
+            print(f"[Google] Exception: {e}")
+            return "", "?"
 
     def __del__(self):
         try:
@@ -714,12 +724,20 @@ class Settings:
 
         # ── Hotkey ───────────────────────────────────────────────────────────
         self._label(f, "HOTKEY")
-        self.hotkey_var = tk.StringVar(value=cfg["hotkey"])
+        tk.Label(f, text="Click the badge, then press any key combo or mouse button  ·  Esc cancels",
+                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 8)).pack(anchor="w", padx=24, pady=(2,4))
+        self._captured_hotkey  = cfg["hotkey"]
+        self._capturing_hotkey = False
         hf = tk.Frame(f, bg=self.CARD, highlightthickness=1, highlightbackground=self.SEP)
-        hf.pack(fill="x", padx=24, pady=(4,0))
-        tk.Entry(hf, textvariable=self.hotkey_var, bg=self.CARD,
-                 fg=self.FG, insertbackground=self.FG,
-                 font=("Segoe UI", 11), relief="flat", bd=8).pack(fill="x")
+        hf.pack(fill="x", padx=24, pady=(0,4))
+        self.hotkey_badge = tk.Label(hf, text=self._fmt_hotkey(cfg["hotkey"]),
+                                     bg=self.CARD, fg=self.FG,
+                                     font=("Segoe UI Semibold", 11),
+                                     padx=16, pady=10, anchor="w", cursor="hand2")
+        self.hotkey_badge.pack(fill="x")
+        self.hotkey_badge.bind("<Button-1>", lambda e: self._start_capture())
+        self.win.bind("<KeyPress>", self._hk_keypress, add="+")
+        self.win.bind("<Button-2>", self._hk_mouse,   add="+")
         self._sep(f)
 
         # ── Language ─────────────────────────────────────────────────────────
@@ -861,6 +879,57 @@ class Settings:
         w.pack(fill="x", pady=(10,0))
         return w
 
+    # ── Hotkey capture ────────────────────────────────────────────────────────
+
+    def _fmt_hotkey(self, hk):
+        if hk.startswith("mouse:"):
+            names = {
+                "middle": "Mouse Middle Button",
+                "left":   "Mouse Left Button",
+                "right":  "Mouse Right Button",
+                "x1":     "Mouse Back Button",
+                "x2":     "Mouse Forward Button",
+            }
+            return f"🖱  {names.get(hk.split(':')[1], hk)}"
+        caps = {"ctrl":"Ctrl","alt":"Alt","shift":"Shift","win":"Win","super":"Super"}
+        parts = hk.split("+")
+        return " + ".join(caps.get(p, p.upper() if len(p) == 1 else p.capitalize()) for p in parts)
+
+    def _start_capture(self):
+        self._capturing_hotkey = True
+        self.hotkey_badge.configure(
+            text="⌨  Press any key combo or mouse button…", fg="#888888")
+        self.win.focus_set()
+
+    def _hk_keypress(self, event):
+        if not self._capturing_hotkey:
+            return
+        key = event.keysym.lower()
+        if key in ("control_l","control_r","alt_l","alt_r","shift_l","shift_r",
+                   "super_l","super_r","meta_l","meta_r","caps_lock","num_lock"):
+            return
+        if key == "escape":
+            self._capturing_hotkey = False
+            self.hotkey_badge.configure(
+                text=self._fmt_hotkey(self._captured_hotkey), fg=self.FG)
+            return
+        mods = []
+        if keyboard.is_pressed("ctrl"):  mods.append("ctrl")
+        if keyboard.is_pressed("alt"):   mods.append("alt")
+        if keyboard.is_pressed("shift"): mods.append("shift")
+        combo = "+".join(mods + [key])
+        self._hk_set(combo)
+
+    def _hk_mouse(self, event):
+        if not self._capturing_hotkey:
+            return
+        self._hk_set("mouse:middle")
+
+    def _hk_set(self, combo):
+        self._captured_hotkey  = combo
+        self._capturing_hotkey = False
+        self.hotkey_badge.configure(text=self._fmt_hotkey(combo), fg=self.FG)
+
     def _test_google(self):
         key = self.api_key_var.get().strip()
         if not key:
@@ -910,7 +979,7 @@ class Settings:
 
     def _save(self):
         old_hk = cfg["hotkey"]
-        cfg["hotkey"]         = self.hotkey_var.get().strip() or cfg["hotkey"]
+        cfg["hotkey"]         = self._captured_hotkey or cfg["hotkey"]
         cfg["whisper_model"]  = self.model_var.get()
         cfg["language"]       = self.lang_var.get()
         cfg["accent_color"]   = PALETTE[self.color_var.get()]
@@ -920,9 +989,7 @@ class Settings:
         save_config(cfg)
 
         if old_hk != cfg["hotkey"]:
-            try: keyboard.remove_hotkey(old_hk)
-            except: pass
-            keyboard.add_hotkey(cfg["hotkey"], self.app._on_hotkey)
+            self.app._setup_hotkey(cfg["hotkey"], remove_old=old_hk)
 
         threading.Thread(
             target=lambda: self.app.recorder.load_model(cfg["whisper_model"]),
@@ -939,15 +1006,44 @@ class App:
         self.recorder.on_levels        = self._on_levels
         self.recorder.on_lang_detected = self._on_lang
         self.recorder.on_partial       = self._on_partial
-        self.kbd      = Controller()
-        self.is_rec   = False
+        self.kbd            = Controller()
+        self.is_rec         = False
+        self._mouse_listener = None
         self.settings = Settings(overlay.root, self)
         self.history  = HistoryWindow(overlay.root)
 
-        keyboard.add_hotkey(cfg["hotkey"], self._on_hotkey)
-        keyboard.add_hotkey("enter",       self._on_enter)
-        keyboard.add_hotkey("esc",         self._on_escape)
+        self._setup_hotkey(cfg["hotkey"])
+        keyboard.add_hotkey("enter", self._on_enter)
+        keyboard.add_hotkey("esc",   self._on_escape)
         threading.Thread(target=self.recorder.load_model, daemon=True).start()
+
+    def _setup_hotkey(self, hotkey, remove_old=None):
+        if remove_old:
+            if remove_old.startswith("mouse:"):
+                if self._mouse_listener:
+                    self._mouse_listener.stop()
+                    self._mouse_listener = None
+            else:
+                try: keyboard.remove_hotkey(remove_old)
+                except: pass
+
+        if hotkey.startswith("mouse:"):
+            btn_map = {
+                "middle": pynput_mouse.Button.middle,
+                "left":   pynput_mouse.Button.left,
+                "right":  pynput_mouse.Button.right,
+                "x1":     pynput_mouse.Button.x1,
+                "x2":     pynput_mouse.Button.x2,
+            }
+            target = btn_map.get(hotkey.split(":")[1], pynput_mouse.Button.middle)
+            def _on_click(x, y, btn, pressed):
+                if pressed and btn == target:
+                    self._on_hotkey()
+            self._mouse_listener = pynput_mouse.Listener(on_click=_on_click)
+            self._mouse_listener.daemon = True
+            self._mouse_listener.start()
+        else:
+            keyboard.add_hotkey(hotkey, self._on_hotkey)
 
     def _on_levels(self, levels):
         self.overlay.root.after(0, lambda: self.overlay.update_levels(levels))
