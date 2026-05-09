@@ -19,6 +19,7 @@ DEFAULT = {
     "accent_color":  "#3b82f6",
     "backend":       "local",
     "google_api_key": "",
+    "initial_prompt": "",
 }
 
 def load_config():
@@ -236,8 +237,10 @@ class AudioRecorder:
             )
             lang_arg = detect_info.language
 
+        prompt = cfg.get("initial_prompt", "").strip() or None
         segs, info = self._model.transcribe(
-            audio, language=lang_arg, beam_size=3, vad_filter=True
+            audio, language=lang_arg, beam_size=3, vad_filter=True,
+            initial_prompt=prompt
         )
         return " ".join(s.text.strip() for s in segs).strip(), lang_arg
 
@@ -602,9 +605,10 @@ class Settings:
     FG2  = "#555555"
 
     def __init__(self, root, app):
-        self.root = root
-        self.app  = app
-        self.win  = None
+        self.root         = root
+        self.app          = app
+        self.win          = None
+        self._backend_sep = None
 
     def open(self):
         if self.win and self.win.winfo_exists():
@@ -670,7 +674,7 @@ class Settings:
             tk.Label(inn, text=desc, bg=bg, fg=self.FG2,
                      font=("Segoe UI", 8)).pack(anchor="w")
 
-        self._sep(f)
+        self._backend_sep = self._sep(f)
 
         # ── Google section (hidden when local) ───────────────────────────────
         self.google_frame = tk.Frame(f, bg=self.BG)
@@ -739,6 +743,20 @@ class Settings:
         for name, hex_v in PALETTE.items():
             self._color_swatch(cf, name, hex_v)
 
+        # ── Custom Vocabulary / Prompt ────────────────────────────────────────
+        self._sep(f)
+        self._label(f, "CUSTOM VOCABULARY / PROMPT")
+        tk.Label(f, text="Seed words or phrases to improve recognition accuracy\n(e.g. names, technical terms, Armenian proper nouns)",
+                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 8),
+                 justify="left").pack(anchor="w", padx=24, pady=(2,4))
+        pf = tk.Frame(f, bg=self.CARD, highlightthickness=1, highlightbackground=self.SEP)
+        pf.pack(fill="x", padx=24, pady=(0,4))
+        self.prompt_text = tk.Text(pf, height=3, bg=self.CARD, fg=self.FG,
+                                   insertbackground=self.FG, font=("Segoe UI", 9),
+                                   relief="flat", padx=8, pady=6, wrap="word")
+        self.prompt_text.pack(fill="x")
+        self.prompt_text.insert("1.0", cfg.get("initial_prompt", ""))
+
         # ── Save ──────────────────────────────────────────────────────────────
         tk.Button(f, text="Save & Apply", command=self._save,
                   bg=cfg["accent_color"], fg="#ffffff",
@@ -749,13 +767,10 @@ class Settings:
     def _on_backend_change(self):
         if self.backend_var.get() == "google":
             self.local_frame.pack_forget()
-            self.google_frame.pack(fill="x", after=self._sep_ref() or self.google_frame)
+            self.google_frame.pack(fill="x", after=self._backend_sep)
         else:
             self.google_frame.pack_forget()
-            self.local_frame.pack(fill="x", after=self._sep_ref() or self.local_frame)
-
-    def _sep_ref(self):
-        return None
+            self.local_frame.pack(fill="x", after=self._backend_sep)
 
     def _radio_card(self, parent, var, val, title, desc):
         sel  = var.get() == val
@@ -842,7 +857,9 @@ class Settings:
                  font=("Segoe UI", 8)).pack(anchor="w", padx=24, pady=(14,0))
 
     def _sep(self, parent):
-        tk.Frame(parent, bg=self.SEP, height=1).pack(fill="x", pady=(10,0))
+        w = tk.Frame(parent, bg=self.SEP, height=1)
+        w.pack(fill="x", pady=(10,0))
+        return w
 
     def _test_google(self):
         key = self.api_key_var.get().strip()
@@ -899,6 +916,7 @@ class Settings:
         cfg["accent_color"]   = PALETTE[self.color_var.get()]
         cfg["backend"]        = self.backend_var.get()
         cfg["google_api_key"] = self.api_key_var.get().strip()
+        cfg["initial_prompt"] = self.prompt_text.get("1.0", tk.END).strip()
         save_config(cfg)
 
         if old_hk != cfg["hotkey"]:
@@ -968,7 +986,7 @@ class App:
     def _stop(self):
         self.recorder.stop_recording()
         self.overlay.root.after(0, lambda: self.overlay.set_state(TRANSCRIBING))
-        text, _ = self.recorder.transcribe()
+        text, lang = self.recorder.transcribe()
         self.is_rec = False
 
         if not text:
@@ -982,8 +1000,9 @@ class App:
 
         pasted = False
         try:
-            self.kbd.press(Key.ctrl); self.kbd.press("v")
-            self.kbd.release("v");    self.kbd.release(Key.ctrl)
+            mod = Key.cmd if sys.platform == "darwin" else Key.ctrl
+            self.kbd.press(mod); self.kbd.press("v")
+            self.kbd.release("v"); self.kbd.release(mod)
             pasted = True
         except:
             pass
