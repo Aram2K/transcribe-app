@@ -41,11 +41,12 @@ cfg = load_config()
 RAM_GB = psutil.virtual_memory().total / (1024 ** 3)
 
 MODELS = {
-    "tiny":     {"min_ram": 2,  "speed": "~0.5s",  "quality": "Good",      "size": "75 MB"},
-    "base":     {"min_ram": 4,  "speed": "~1s",    "quality": "Better",    "size": "140 MB"},
-    "small":    {"min_ram": 6,  "speed": "~3s",    "quality": "Great",     "size": "460 MB"},
-    "medium":   {"min_ram": 10, "speed": "~8s",    "quality": "Excellent", "size": "1.4 GB"},
-    "large-v3": {"min_ram": 16, "speed": "~15s",   "quality": "Best",      "size": "3 GB"},
+    "tiny":           {"min_ram": 2,  "speed": "~0.5s", "quality": "Good",        "size": "75 MB"},
+    "base":           {"min_ram": 4,  "speed": "~1s",   "quality": "Better",      "size": "140 MB"},
+    "small":          {"min_ram": 6,  "speed": "~3s",   "quality": "Great",       "size": "460 MB"},
+    "medium":         {"min_ram": 10, "speed": "~8s",   "quality": "Excellent",   "size": "1.4 GB"},
+    "large-v3":       {"min_ram": 16, "speed": "~15s",  "quality": "Best",        "size": "3 GB"},
+    "large-v3-turbo": {"min_ram": 8,  "speed": "~5s",   "quality": "Best (fast)", "size": "1.6 GB"},
 }
 
 LANG_NAMES = {
@@ -62,6 +63,14 @@ LANG_NAMES = {
 
 def model_ok(name):
     return RAM_GB >= MODELS[name]["min_ram"]
+
+# Detect CUDA GPU via ctranslate2 (already a dependency of faster-whisper)
+HAS_GPU = False
+try:
+    import ctranslate2 as _ct2
+    HAS_GPU = _ct2.get_cuda_device_count() > 0
+except Exception:
+    pass
 
 # ── Glass effect ──────────────────────────────────────────────────────────────
 
@@ -90,7 +99,10 @@ def apply_glass(hwnd, tint="#111111e0"):
 
 # ── Audio Recorder ────────────────────────────────────────────────────────────
 
-CHUNK_SEC = 4  # transcribe every N seconds in background
+# VAD-triggered chunking constants (replaces fixed CHUNK_SEC timer)
+SILENCE_TRIGGER_SEC = 0.8   # silence duration that triggers a transcription chunk
+MIN_SPEECH_SEC      = 1.5   # minimum speech before a chunk is considered complete
+MAX_SPEECH_SEC      = 25    # force-flush chunk after this duration regardless
 
 class AudioRecorder:
     def __init__(self):
@@ -138,36 +150,70 @@ class AudioRecorder:
         threading.Thread(target=self._record, daemon=True).start()
 
     def _record(self):
-        samples_per_chunk = cfg["sample_rate"] * CHUNK_SEC
+        sr          = cfg["sample_rate"]
+        frame_dur   = cfg["chunk_size"] / sr   # seconds per audio frame
+
+        vad_buf      = []    # frames for the current utterance
+        speech_sec   = 0.0
+        silence_sec  = 0.0
+        noise_hist   = []    # sliding window for adaptive noise floor
+
         while self.recording:
             try:
                 data = self.stream.read(cfg["chunk_size"], exception_on_overflow=False)
                 self.frames.append(data)
-                self._chunk_frames.append(data)
 
                 arr = np.frombuffer(data, dtype=np.float32)
-                self._samples_in_chunk += len(arr)
+                rms = float(np.sqrt(np.mean(arr ** 2))) if len(arr) > 0 else 0.0
 
+                # Adaptive noise floor: 10th-percentile of recent RMS history
+                noise_hist.append(rms)
+                if len(noise_hist) > 200:
+                    noise_hist.pop(0)
+                n10        = sorted(noise_hist)[max(0, len(noise_hist) // 10)]
+                threshold  = max(n10 * 4.0, 0.006)
+                is_speech  = rms > threshold
+
+                # Audio level callback for overlay waveform
                 if self.on_levels:
-                    n, sz  = 20, max(len(arr)//20, 1)
-                    levels = [min(float(np.abs(arr[i*sz:(i+1)*sz]).mean())*20, 1.0) for i in range(n)]
+                    n, sz  = 20, max(len(arr) // 20, 1)
+                    levels = [min(float(np.abs(arr[i*sz:(i+1)*sz]).mean()) * 20, 1.0)
+                              for i in range(n)]
                     self.on_levels(levels)
 
-                # every CHUNK_SEC, dispatch a background transcription
-                if self._samples_in_chunk >= samples_per_chunk:
+                vad_buf.append(data)
+                with self._chunk_lock:
+                    self._chunk_frames.append(data)
+
+                if is_speech:
+                    speech_sec  += frame_dur
+                    silence_sec  = 0.0
+                elif speech_sec > 0:
+                    silence_sec += frame_dur
+
+                total_sec    = speech_sec + silence_sec
+                should_chunk = (
+                    (silence_sec >= SILENCE_TRIGGER_SEC and speech_sec >= MIN_SPEECH_SEC)
+                    or total_sec >= MAX_SPEECH_SEC
+                )
+
+                if should_chunk and speech_sec >= MIN_SPEECH_SEC:
                     with self._chunk_lock:
                         chunk_audio = np.frombuffer(
-                            b"".join(self._chunk_frames), dtype=np.float32).copy()
+                            b"".join(vad_buf), dtype=np.float32).copy()
                         idx = self._chunk_idx
-                        self._chunk_idx    += 1
-                        self._chunk_frames  = []
-                        self._samples_in_chunk = 0
+                        self._chunk_idx   += 1
+                        self._chunk_frames = []
+                    vad_buf     = []
+                    speech_sec  = 0.0
+                    silence_sec = 0.0
                     t = threading.Thread(target=self._transcribe_chunk,
                                          args=(chunk_audio, idx), daemon=True)
                     self._chunk_threads.append(t)
                     t.start()
+
             except Exception:
-                pass  # stream read errors (overflow, device disconnect) — keep going
+                pass
 
     def _transcribe_chunk(self, audio, idx):
         try:
@@ -286,30 +332,51 @@ class AudioRecorder:
         is_hy = (lang_arg == "hy")
 
         # ── Build prompt ─────────────────────────────────────────────────────
-        # Use the user's custom prompt if set. For Armenian, do NOT add an
-        # automatic seed prompt — Whisper echoes it in a repetition loop
-        # ("Ես ուզում ասել ասել ասել..."). When language="hy" is forced,
-        # Whisper already outputs native script without any prompt.
+        # Only use the user's custom vocabulary prompt. No automatic Armenian
+        # seed — Whisper echoes the prompt in a repetition loop.
+        # language="hy" is sufficient to force native Armenian script output.
         prompt = cfg.get("initial_prompt", "").strip() or None
 
         # ── Transcription ────────────────────────────────────────────────────
-        # vad_filter=False for Armenian: Silero VAD is not trained on Armenian
-        # and treats Armenian phonemes as silence → only 1-2 words survive.
+        # Key Armenian fixes (from benchmark research):
         #
-        # temperature as a list: Whisper falls back to higher temperatures when
-        # compression_ratio_threshold is exceeded (too much repetition detected),
-        # which breaks hallucination loops instead of getting stuck at 0.0.
+        # vad_filter=False  — Silero VAD is not trained on Armenian; it treats
+        #   Armenian fricatives/aspirates as silence, stripping most of the audio.
+        #   Disable it for Armenian; the VAD-triggered chunking in _record() already
+        #   handles silence detection before audio reaches this function.
         #
-        # compression_ratio_threshold=1.8 for Armenian: default 2.4 allows
-        # heavy repetition before retrying. Lower threshold catches loops early.
+        # compression_ratio_threshold=None, log_prob_threshold=None — disable
+        #   Whisper's post-hoc silence/repetition filters; they fire too aggressively
+        #   on Armenian due to low confidence scores (low-resource language). Let
+        #   the pre-chunk VAD handle silence instead.
+        #
+        # repetition_penalty=1.3, no_repeat_ngram_size=5 — prevent token loops
+        #   without relying on compression_ratio_threshold.
+        #
+        # temperature list — Whisper falls back to higher temperatures automatically
+        #   when the output still looks repetitive, breaking hallucination cycles.
+        #
+        # condition_on_previous_text=False — do not feed previous segment output
+        #   back as context; each chunk is independent, and feeding prior text
+        #   is the primary cause of the repetition loop.
         segs, _ = model.transcribe(
             audio,
             language=lang_arg,
             beam_size=5 if is_hy else 3,
+            best_of=5,
             vad_filter=not is_hy,
+            vad_parameters=None if is_hy else {
+                "threshold": 0.3,
+                "min_speech_duration_ms": 250,
+                "min_silence_duration_ms": 300,
+                "speech_pad_ms": 400,
+            },
             no_speech_threshold=0.6,
             temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
-            compression_ratio_threshold=1.8 if is_hy else 2.4,
+            compression_ratio_threshold=None if is_hy else 2.4,
+            log_prob_threshold=None if is_hy else -1.0,
+            repetition_penalty=1.3 if is_hy else 1.0,
+            no_repeat_ngram_size=5 if is_hy else 0,
             initial_prompt=prompt,
             condition_on_previous_text=False,
         )
@@ -821,6 +888,15 @@ class Settings:
         mf.pack(fill="x", padx=24, pady=(6,4))
         for name, info in MODELS.items():
             self._model_row(mf, name, info)
+
+        # ── GPU / NeMo section ───────────────────────────────────────────
+        tk.Label(self.local_frame, text="GPU-ACCELERATED  (BEST ARMENIAN QUALITY)",
+                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 8)
+                 ).pack(anchor="w", padx=24, pady=(12, 0))
+        gf = tk.Frame(self.local_frame, bg=self.BG)
+        gf.pack(fill="x", padx=24, pady=(4, 4))
+        self._nemo_row(gf)
+
         tk.Frame(self.local_frame, bg=self.SEP, height=1).pack(fill="x", pady=(8,0))
 
         # Show correct section
@@ -950,6 +1026,45 @@ class Settings:
         if not ok:
             tk.Label(right, text=f"Need {info['min_ram']}GB RAM",
                      bg=bg, fg="#2a1a1a", font=("Segoe UI", 7)).pack()
+
+    def _nemo_row(self, parent):
+        gpu_ok = HAS_GPU
+        bg     = "#111111"
+        bord   = "#1a1a1a"
+        fg     = "#333333" if not gpu_ok else self.FG
+        fg2    = "#222222" if not gpu_ok else "#888888"
+
+        f = tk.Frame(parent, bg=bord, padx=1, pady=1)
+        f.pack(fill="x", pady=(0, 6))
+        inner = tk.Frame(f, bg=bg, padx=14, pady=8)
+        inner.pack(fill="x")
+
+        left  = tk.Frame(inner, bg=bg); left.pack(side="left", fill="x", expand=True)
+        right = tk.Frame(inner, bg=bg); right.pack(side="right")
+
+        top = tk.Frame(left, bg=bg); top.pack(anchor="w")
+        tk.Label(top, text="NeMo FastConformer", bg=bg, fg=fg,
+                 font=("Segoe UI Semibold", 11)).pack(side="left")
+        badge_col  = "#1a3a1a" if gpu_ok else "#1a1a1a"
+        badge_text = "GPU ready" if gpu_ok else "No GPU detected"
+        badge_fg   = "#22c55e" if gpu_ok else "#333333"
+        tk.Label(top, text=f"  {badge_text}", bg=bg, fg=badge_fg,
+                 font=("Segoe UI", 9)).pack(side="left")
+
+        tk.Label(left, text="Armenian best · 9.9% WER · Requires NeMo framework",
+                 bg=bg, fg=fg2, font=("Segoe UI", 8)).pack(anchor="w")
+
+        tk.Label(right, text="~2s", bg=bg, fg=fg,
+                 font=("Segoe UI Semibold", 12)).pack()
+        tk.Label(right, text="per clip", bg=bg, fg=fg2,
+                 font=("Segoe UI", 7)).pack()
+
+        if not gpu_ok:
+            tk.Label(right, text="GPU required", bg=bg, fg="#2a1a1a",
+                     font=("Segoe UI", 7)).pack()
+        else:
+            tk.Label(right, text="Coming soon", bg=bg, fg=fg2,
+                     font=("Segoe UI", 7)).pack()
 
     def _pick_model(self, name):
         self.model_var.set(name)
