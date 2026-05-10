@@ -10,7 +10,13 @@ __pycache__/
 # User config — contains API keys
 config.json
 
+# User transcription history — personal data
+history.json
+
 # PyInstaller builds
 dist/
 build/
 *.spec
+
+# CI-generated icon
+assets/icon.ico

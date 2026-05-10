@@ -15,9 +15,11 @@
 <p>A lightweight, always-on speech-to-text tool that lives in your system tray.<br/>
 Works completely offline using Whisper AI, or connects to Google Cloud for best Armenian accuracy.</p>
 
-**[⬇ Download for Windows (.zip)](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Windows.zip)** &nbsp;·&nbsp;
+**[⬇ Download for Windows (Installer)](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Windows-Setup.exe)** &nbsp;·&nbsp;
 **[⬇ Download for macOS (.dmg)](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Mac.dmg)** &nbsp;·&nbsp;
 [View all releases](https://github.com/Aram2K/transcribe-app/releases)
+
+<sub>Prefer a portable build? Grab the [Windows .zip](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Windows.zip) instead.</sub>
 
 </div>
 
@@ -53,12 +55,15 @@ It was built especially for **Armenian speakers** who need accurate, native-scri
 
 ### Windows
 
-1. Download **[TranscribeApp-Windows.zip](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Windows.zip)**
-2. Extract the zip anywhere (e.g. `C:\TranscribeApp\`)
-3. Double-click `TranscribeApp.exe` inside the extracted folder
-4. A microphone icon appears in your system tray
+1. Download **[TranscribeApp-Windows-Setup.exe](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Windows-Setup.exe)**
+2. Run it — the installer wizard handles everything (Start Menu shortcut, optional autostart, optional desktop icon)
+3. Click **Finish** — Transcribe launches automatically and a microphone icon appears in your system tray
+4. The first-run welcome window walks you through setting your hotkey, language, and backend
+5. To uninstall later: **Settings → Apps → Transcribe → Uninstall**
 
 > **Note:** Windows may show a "Windows protected your PC" warning the first time because the app isn't code-signed. Click **More info → Run anyway**. The app is open-source and safe.
+
+**Updates** are automatic — when a new version is published, Transcribe shows a notification and adds an "Install update" item to the tray menu. One click downloads and installs the update without re-downloading the full app manually.
 
 ### macOS
 

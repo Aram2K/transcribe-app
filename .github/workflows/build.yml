@@ -40,12 +40,19 @@ jobs:
         run: |
           pip install -r requirements.txt pyinstaller
 
+      - name: Generate app icon
+        shell: pwsh
+        run: |
+          pip install pillow --quiet
+          python installer/make_icon.py
+
       - name: Build .exe
         shell: pwsh
         run: |
           pyinstaller `
             --onedir --windowed `
             --name TranscribeApp `
+            --icon assets/icon.ico `
             --add-data "config.example.json;." `
             --add-data "history.py;." `
             --hidden-import faster_whisper `
@@ -64,9 +71,36 @@ jobs:
             --exclude-module IPython `
             main.py
 
-      - name: Zip output folder
+      - name: Zip output folder (portable build)
         shell: pwsh
         run: Compress-Archive -Path dist\TranscribeApp\* -DestinationPath TranscribeApp-Windows.zip
+
+      - name: Resolve version from tag
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -match '^refs/tags/v(.+)$') {
+            $v = $Matches[1]
+          } else {
+            $v = '0.0.0-dev'
+          }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Version: $v"
+
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc /DMyAppVersion="${{ steps.version.outputs.version }}" installer\installer.iss
+          Move-Item installer\TranscribeApp-Setup.exe TranscribeApp-Windows-Setup.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: TranscribeApp-Windows-Setup.exe
 
       - uses: actions/upload-artifact@v4
         with:
@@ -139,5 +173,6 @@ jobs:
         with:
           generate_release_notes: true
           files: |
+            windows-installer/TranscribeApp-Windows-Setup.exe
             windows-zip/TranscribeApp-Windows.zip
             macos-dmg/TranscribeApp-Mac.dmg
