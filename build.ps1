@@ -36,7 +36,7 @@ pyinstaller `
 if ($LASTEXITCODE -eq 0) {
     Write-Host ""
     Write-Host "Build complete! Find your exe at:" -ForegroundColor Green
-    Write-Host "  dist\TranscribeApp.exe" -ForegroundColor Green
+    Write-Host "  dist\TranscribeApp\TranscribeApp.exe" -ForegroundColor Green
     Write-Host ""
     Write-Host "Note: The first run will download the Whisper model (~140 MB for 'base')." -ForegroundColor Yellow
     Write-Host "      Ship config.example.json alongside the exe (rename to config.json)." -ForegroundColor Yellow

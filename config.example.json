@@ -7,5 +7,9 @@
   "accent_color": "#3b82f6",
   "backend": "local",
   "google_api_key": "",
-  "initial_prompt": ""
+  "initial_prompt": "",
+  "input_device_index": null,
+  "silence_trigger_sec": 0.8,
+  "min_speech_sec": 1.5,
+  "max_speech_sec": 25.0
 }

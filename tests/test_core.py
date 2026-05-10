@@ -2,8 +2,13 @@
 Unit tests for Transcribe App core logic.
 Run: python -m pytest tests/ -v
 """
-import sys, os, types, unittest
+import sys, os, types, unittest, tempfile, shutil
 from unittest.mock import patch, MagicMock
+
+_TEST_APP_DATA = tempfile.mkdtemp(prefix="transcribe-test-data-")
+os.environ["TRANSCRIBE_APP_DATA_DIR"] = _TEST_APP_DATA
+os.environ["TRANSCRIBE_DISABLE_KEYRING"] = "1"
+os.environ["TRANSCRIBE_SKIP_MIGRATION"] = "1"
 
 # ── Stub heavy imports so tests run without GPU / audio hardware ──────────────
 
@@ -51,7 +56,9 @@ _tk_ttk = _stub("tkinter.ttk", {"Scrollbar": MagicMock})
 _tk.ttk = _tk_ttk  # needed for Python ≤ 3.11
 
 _stub("history",       {"add": MagicMock, "all": MagicMock(return_value=[]),
-                         "clear": MagicMock, "search": MagicMock(return_value=[])})
+                         "clear": MagicMock, "search": MagicMock(return_value=[]),
+                         "delete": MagicMock, "export_csv": MagicMock,
+                         "export_txt": MagicMock})
 _stub("requests",      {"get": MagicMock, "post": MagicMock})
 # ctypes is NOT stubbed — it is stdlib and works cross-platform.
 # ctypes.windll only appears inside apply_glass() which is never called by tests.
@@ -72,7 +79,16 @@ from main import (
     model_ok,
     LANG_NAMES,
     APP_VERSION,
+    _trusted_update_url,
+    _sha256_from_checksum_text,
+    _update_info_from_manifest,
+    _update_info_from_release,
 )
+import storage
+
+
+def tearDownModule():
+    shutil.rmtree(_TEST_APP_DATA, ignore_errors=True)
 
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
@@ -102,11 +118,11 @@ class TestParseVersion(unittest.TestCase):
 
 class TestConfig(unittest.TestCase):
     def setUp(self):
-        self._cfg_path = "test_config_tmp.json"
+        self._tmp = tempfile.TemporaryDirectory()
+        self._cfg_path = os.path.join(self._tmp.name, "config.json")
 
     def tearDown(self):
-        if os.path.exists(self._cfg_path):
-            os.remove(self._cfg_path)
+        self._tmp.cleanup()
 
     def test_defaults_present(self):
         c = load_config()
@@ -147,6 +163,87 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(c["language"], DEFAULT["language"])
         finally:
             m.CONFIG_PATH = orig
+
+    def test_api_key_is_sanitized_when_keyring_accepts_it(self):
+        import json
+        import main as m
+        orig = m.CONFIG_PATH
+        m.CONFIG_PATH = self._cfg_path
+        try:
+            with patch.object(m.storage, "write_secret", return_value=True), \
+                 patch.object(m.storage, "read_secret", return_value="secret-key"):
+                save_config({**DEFAULT, "google_api_key": "secret-key"})
+                with open(self._cfg_path, encoding="utf-8") as f:
+                    raw = json.load(f)
+                self.assertEqual(raw["google_api_key"], "")
+                self.assertEqual(load_config()["google_api_key"], "secret-key")
+        finally:
+            m.CONFIG_PATH = orig
+
+
+class TestStorage(unittest.TestCase):
+    def test_atomic_json_creates_backup_and_recovers(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "data.json")
+            storage.atomic_write_json(path, {"value": 1})
+            storage.atomic_write_json(path, {"value": 2})
+            self.assertTrue(os.path.exists(path + ".bak"))
+            self.assertEqual(storage.read_json(path, {}), {"value": 2})
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("{broken")
+            self.assertEqual(storage.read_json(path, {}), {"value": 1})
+
+    def test_migrate_legacy_file_copies_without_deleting_source(self):
+        with tempfile.TemporaryDirectory() as d:
+            legacy = os.path.join(d, "legacy.json")
+            target = os.path.join(d, "nested", "target.json")
+            with open(legacy, "w", encoding="utf-8") as f:
+                f.write('{"ok": true}')
+            with patch.dict(os.environ, {"TRANSCRIBE_SKIP_MIGRATION": ""}, clear=False):
+                self.assertTrue(storage.migrate_legacy_file(legacy, target))
+            self.assertTrue(os.path.exists(legacy))
+            self.assertEqual(storage.read_json(target, {}), {"ok": True})
+
+
+class TestUpdaterHelpers(unittest.TestCase):
+    def test_trusted_update_url_only_allows_github_https(self):
+        self.assertTrue(_trusted_update_url("https://github.com/Aram2K/transcribe-app/releases/download/v1/app.exe"))
+        self.assertFalse(_trusted_update_url("http://github.com/Aram2K/transcribe-app/releases/download/v1/app.exe"))
+        self.assertFalse(_trusted_update_url("https://example.com/app.exe"))
+
+    def test_sha256_parser(self):
+        digest = "a" * 64
+        self.assertEqual(_sha256_from_checksum_text(f"{digest}  TranscribeApp-Windows-Setup.exe"), digest)
+        self.assertEqual(_sha256_from_checksum_text("not a checksum"), "")
+
+    def test_manifest_update_info(self):
+        digest = "b" * 64
+        info = _update_info_from_manifest({
+            "version": "9.0.0",
+            "tag": "v9.0.0",
+            "windows": {
+                "installer": {
+                    "url": "https://github.com/Aram2K/transcribe-app/releases/download/v9.0.0/TranscribeApp-Windows-Setup.exe",
+                    "sha256": digest,
+                    "sha256_url": "https://github.com/Aram2K/transcribe-app/releases/download/v9.0.0/TranscribeApp-Windows-Setup.exe.sha256",
+                }
+            },
+        })
+        self.assertEqual(info["tag"], "v9.0.0")
+        self.assertEqual(info["checksum"], digest)
+
+    def test_release_update_info_prefers_stable_installer_name(self):
+        info = _update_info_from_release({
+            "tag_name": "v9.0.0",
+            "body": "notes",
+            "assets": [
+                {"name": "Something-Setup.exe", "browser_download_url": "https://example.com/wrong.exe"},
+                {"name": "TranscribeApp-Windows-Setup.exe", "browser_download_url": "https://github.com/Aram2K/transcribe-app/releases/download/v9.0.0/TranscribeApp-Windows-Setup.exe"},
+                {"name": "TranscribeApp-Windows-Setup.exe.sha256", "browser_download_url": "https://github.com/Aram2K/transcribe-app/releases/download/v9.0.0/TranscribeApp-Windows-Setup.exe.sha256"},
+            ],
+        })
+        self.assertTrue(info["installer_url"].endswith("TranscribeApp-Windows-Setup.exe"))
+        self.assertTrue(info["checksum_url"].endswith(".sha256"))
 
 
 class TestModelOk(unittest.TestCase):
