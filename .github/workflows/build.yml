@@ -3,11 +3,31 @@ name: Build & Release
 on:
   push:
     tags: ['v*.*.*']
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
+  # ── Tests ─────────────────────────────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: pip install pytest requests psutil pillow numpy pyaudio --quiet || true
+
+      - name: Run unit tests
+        run: python -m pytest tests/ -v
+
   # ── Windows .exe ─────────────────────────────────────────────────────────────
   build-windows:
+    needs: test
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,6 +75,7 @@ jobs:
 
   # ── macOS .dmg ───────────────────────────────────────────────────────────────
   build-macos:
+    needs: test
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
