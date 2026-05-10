@@ -68,7 +68,14 @@ jobs:
           EOF
 
       - name: Run unit tests
-        run: python -m pytest tests/ -v --tb=long
+        run: python -m pytest tests/ -v --tb=long 2>&1 | tee /tmp/pytest_output.txt; exit ${PIPESTATUS[0]}
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-output
+          path: /tmp/pytest_output.txt
 
   # ── Windows .exe ─────────────────────────────────────────────────────────────
   build-windows:
