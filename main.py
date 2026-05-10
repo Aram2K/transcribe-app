@@ -47,12 +47,12 @@ cfg = load_config()
 RAM_GB = psutil.virtual_memory().total / (1024 ** 3)
 
 MODELS = {
-    "tiny":           {"min_ram": 2,  "speed": "~0.5s", "quality": "Good",        "size": "75 MB"},
-    "base":           {"min_ram": 4,  "speed": "~1s",   "quality": "Better",      "size": "140 MB"},
-    "small":          {"min_ram": 6,  "speed": "~3s",   "quality": "Great",       "size": "460 MB"},
-    "medium":         {"min_ram": 10, "speed": "~8s",   "quality": "Excellent",   "size": "1.4 GB"},
-    "large-v3":       {"min_ram": 16, "speed": "~15s",  "quality": "Best",        "size": "3 GB"},
-    "large-v3-turbo": {"min_ram": 8,  "speed": "~5s",   "quality": "Best (fast)", "size": "1.6 GB"},
+    "tiny":           {"min_ram": 2,  "speed": "~0.5s", "quality": "Good",        "size": "75 MB",   "armenian": None},
+    "base":           {"min_ram": 4,  "speed": "~1s",   "quality": "Better",      "size": "140 MB",  "armenian": None},
+    "small":          {"min_ram": 6,  "speed": "~3s",   "quality": "Great",       "size": "460 MB",  "armenian": "Minimum for Armenian"},
+    "medium":         {"min_ram": 10, "speed": "~8s",   "quality": "Excellent",   "size": "1.4 GB",  "armenian": "Good for Armenian"},
+    "large-v3-turbo": {"min_ram": 8,  "speed": "~5s",   "quality": "Best (fast)", "size": "1.6 GB",  "armenian": "Recommended for Armenian"},
+    "large-v3":       {"min_ram": 16, "speed": "~15s",  "quality": "Best",        "size": "3 GB",    "armenian": "Best Armenian accuracy"},
 }
 
 LANG_NAMES = {
@@ -1017,6 +1017,16 @@ class Settings:
     # ── Tab: Model ────────────────────────────────────────────────────────────
 
     def _build_model(self, f):
+        # Armenian tip banner
+        tip = tk.Frame(f, bg="#fffbeb", highlightthickness=1, highlightbackground="#fde68a")
+        tip.pack(fill="x", padx=20, pady=(12, 4))
+        tip_inner = tk.Frame(tip, bg="#fffbeb"); tip_inner.pack(fill="x", padx=12, pady=8)
+        tk.Label(tip_inner, text="🇦🇲  For Armenian:", bg="#fffbeb", fg="#92400e",
+                 font=("Segoe UI Semibold", 9)).pack(side="left")
+        tk.Label(tip_inner,
+                 text="  large-v3-turbo is the sweet spot (fast + accurate).  large-v3 for maximum quality.",
+                 bg="#fffbeb", fg="#78350f", font=("Segoe UI", 9)).pack(side="left")
+
         self._section(f, "Whisper Models")
         mf = tk.Frame(f, bg=self.BG); mf.pack(fill="x", padx=20, pady=(4, 0))
         for name, info in MODELS.items():
@@ -1052,8 +1062,18 @@ class Settings:
             tk.Label(name_row, text="  locked", bg=bg, fg="#c8c8d0",
                      font=("Segoe UI", 8)).pack(side="left")
 
-        tk.Label(left, text=f"{info['quality']}  ·  {info['size']}",
-                 bg=bg, fg=fg2, font=("Segoe UI", 8)).pack(anchor="w")
+        subtitle = f"{info['quality']}  ·  {info['size']}"
+        tk.Label(left, text=subtitle, bg=bg, fg=fg2, font=("Segoe UI", 8)).pack(anchor="w")
+
+        hy_label = info.get("armenian")
+        if hy_label and ok:
+            badge_bg = "#fef3c7" if hy_label != "Best Armenian accuracy" else "#dcfce7"
+            badge_fg = "#92400e" if hy_label != "Best Armenian accuracy" else "#166534"
+            if hy_label == "Recommended for Armenian":
+                badge_bg, badge_fg = "#dbeafe", "#1e40af"
+            tk.Label(left, text=f"🇦🇲  {hy_label}",
+                     bg=badge_bg, fg=badge_fg,
+                     font=("Segoe UI", 7), padx=6, pady=2).pack(anchor="w", pady=(3, 0))
 
         tk.Label(right, text=info["speed"], bg=bg, fg=fg,
                  font=("Segoe UI Semibold", 13)).pack()
