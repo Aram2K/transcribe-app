@@ -682,6 +682,7 @@ class HistoryWindow:
         self.win.geometry("520x600")
         self.win.resizable(False, True)
         self.win.attributes("-topmost", True)
+        self.win.transient(self.root)
         self.win.update_idletasks()
         apply_glass(self.win.winfo_id(), "#0f0f0ff5")
 
@@ -807,6 +808,7 @@ class Settings:
         win.configure(bg=self.BG)
         win.geometry("520x640")
         win.attributes("-topmost", True)
+        win.transient(self.root)
         win.update_idletasks()
 
         self._build(win)
