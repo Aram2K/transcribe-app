@@ -970,7 +970,7 @@ class Settings:
 
         def _select(e=None):
             self.backend_var.set(val)
-            self._build_general(self._scroll_frame)  # rebuild tab
+            self._switch_tab(self._active_tab)
         for w in [card, inner, row] + list(row.winfo_children()) + list(inner.winfo_children()):
             w.bind("<Button-1>", _select)
             if hasattr(w, 'configure'):
@@ -1058,7 +1058,7 @@ class Settings:
         if ok:
             def _pick(e=None, n=name):
                 self.model_var.set(n)
-                self._build_model(self._scroll_frame)
+                self._switch_tab(self._active_tab)
             for w in [card, inner, left, right, name_row] + \
                      list(left.winfo_children()) + list(name_row.winfo_children()) + \
                      list(right.winfo_children()):
@@ -1137,7 +1137,7 @@ class Settings:
 
         def _select(e=None, c=code):
             self.lang_var.set(c)
-            self._build_language(self._scroll_frame)
+            self._switch_tab(self._active_tab)
 
         pill.bind("<Button-1>", _select)
         if not sel:
@@ -1171,7 +1171,7 @@ class Settings:
 
         def _pick(e=None, n=name):
             self.color_var.set(n)
-            self._build_appearance(self._scroll_frame)
+            self._switch_tab(self._active_tab)
         dot.bind("<Button-1>", _pick)
 
     # ── Shared helpers ────────────────────────────────────────────────────────
