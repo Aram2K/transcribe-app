@@ -1470,8 +1470,19 @@ def run_tray(app: App):
             pystray.MenuItem("Quit",     on_quit),
         )).run()
 
+def _apply_taskbar_icon(root):
+    try:
+        import tempfile, os
+        ico_path = os.path.join(tempfile.gettempdir(), "transcribe_app.ico")
+        img = make_icon(cfg["accent_color"]).resize((256, 256), Image.LANCZOS)
+        img.save(ico_path, format="ICO", sizes=[(256,256),(64,64),(32,32),(16,16)])
+        root.iconbitmap(ico_path)
+    except Exception:
+        pass
+
 def main():
     overlay = Overlay()
+    _apply_taskbar_icon(overlay.root)
     app     = App(overlay)
     threading.Thread(target=run_tray, args=(app,), daemon=True).start()
     overlay.run()
