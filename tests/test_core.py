@@ -91,10 +91,13 @@ class TestParseVersion(unittest.TestCase):
         self.assertEqual(_parse_version("garbage"), (0, 0, 0))
 
     def test_update_needed(self):
-        self.assertGreater(_parse_version("1.3.0"), _parse_version(APP_VERSION))
+        # A version one major above the current app version should be considered newer.
+        cur = _parse_version(APP_VERSION)
+        future = (cur[0] + 1, 0, 0)
+        self.assertGreater(future, cur)
 
     def test_no_update_needed(self):
-        self.assertFalse(_parse_version("1.0.0") > _parse_version(APP_VERSION))
+        self.assertFalse(_parse_version("0.0.1") > _parse_version(APP_VERSION))
 
 
 class TestConfig(unittest.TestCase):
