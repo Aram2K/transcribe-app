@@ -1,4 +1,4 @@
-import sys, threading, time, json, math, wave, io, struct
+import sys, threading, time, json, math, wave, io, struct, webbrowser
 import tkinter as tk
 from tkinter import ttk
 import psutil, pyaudio, numpy as np, keyboard, pyperclip, pystray, requests, base64, ctypes
@@ -7,6 +7,12 @@ from pynput.keyboard import Controller, Key
 from pynput import mouse as pynput_mouse
 from faster_whisper import WhisperModel
 import history as hist
+
+# ── Version ───────────────────────────────────────────────────────────────────
+
+APP_VERSION = "1.2.0"
+RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
+RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -1440,6 +1446,30 @@ class App:
             except Exception: pass
         self.recorder.shutdown()
 
+# ── Update checker ────────────────────────────────────────────────────────────
+
+def _parse_version(v):
+    try:
+        parts = [int(x) for x in v.lstrip("v").split(".")[:3]]
+        return tuple((parts + [0, 0, 0])[:3])
+    except Exception:
+        return (0, 0, 0)
+
+def check_for_update(on_update_found):
+    def _run():
+        try:
+            resp = requests.get(RELEASES_API,
+                                headers={"Accept": "application/vnd.github+json"},
+                                timeout=8)
+            if resp.status_code != 200:
+                return
+            latest = resp.json().get("tag_name", "")
+            if _parse_version(latest) > _parse_version(APP_VERSION):
+                on_update_found(latest)
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
 # ── Tray ──────────────────────────────────────────────────────────────────────
 
 def make_icon(color="#3b82f6"):
@@ -1454,23 +1484,52 @@ def make_icon(color="#3b82f6"):
     return img
 
 def run_tray(app: App):
+    _update_tag = [None]  # mutable container so inner functions can write it
+
     def on_settings(icon, _): app.open_settings()
     def on_history(icon, _):  app.open_history()
     def on_quit(icon, _):
         icon.stop()
         app.shutdown()
         app.overlay.root.after(0, app.overlay.root.quit)
+    def on_download(icon, _):
+        webbrowser.open(RELEASES_URL)
 
-    pystray.Icon("transcribe", make_icon(cfg["accent_color"]),
-        f"Transcribe  ·  {cfg['hotkey']}",
-        menu=pystray.Menu(
-            pystray.MenuItem("Transcribe", None, enabled=False),
+    def _build_menu():
+        items = [
+            pystray.MenuItem(f"Transcribe  v{APP_VERSION}", None, enabled=False),
             pystray.Menu.SEPARATOR,
+        ]
+        if _update_tag[0]:
+            items += [
+                pystray.MenuItem(f"⬆  Update available: {_update_tag[0]}", on_download),
+                pystray.Menu.SEPARATOR,
+            ]
+        items += [
             pystray.MenuItem("History",  on_history),
             pystray.MenuItem("Settings", on_settings),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit",     on_quit),
-        )).run()
+            pystray.MenuItem("Quit", on_quit),
+        ]
+        return pystray.Menu(*items)
+
+    icon = pystray.Icon("transcribe", make_icon(cfg["accent_color"]),
+                        f"Transcribe  ·  {cfg['hotkey']}",
+                        menu=_build_menu())
+
+    def _on_update_found(tag):
+        _update_tag[0] = tag
+        icon.menu = _build_menu()
+        try:
+            icon.notify(
+                f"Transcribe {tag} is available — click here to download",
+                "Update available",
+            )
+        except Exception:
+            pass
+
+    check_for_update(_on_update_found)
+    icon.run()
 
 def _apply_taskbar_icon(root):
     try:
