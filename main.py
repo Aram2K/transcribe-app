@@ -27,6 +27,7 @@ DEFAULT = {
     "backend":       "local",
     "google_api_key": "",
     "initial_prompt": "",
+    "onboarding_done": False,
 }
 
 def load_config():
@@ -1342,6 +1343,252 @@ class Settings:
         ).start()
         self.win.destroy()
 
+# ── Onboarding (first-run welcome) ────────────────────────────────────────────
+
+class Onboarding:
+    BG     = "#f5f5f7"
+    CARD   = "#ffffff"
+    BORDER = "#e2e2e7"
+    FG     = "#1d1d1f"
+    FG2    = "#6e6e73"
+    SEL_BG = "#eaf1ff"
+
+    def __init__(self, root, app):
+        self.root = root
+        self.app  = app
+        self.win  = None
+
+    def show(self):
+        win = tk.Toplevel(self.root)
+        self.win = win
+        win.title("Welcome to Transcribe")
+        win.configure(bg=self.BG)
+        win.geometry("560x720")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        win.transient(self.root)
+        win.grab_set()
+        win.update_idletasks()
+        x = (win.winfo_screenwidth()  - 560) // 2
+        y = (win.winfo_screenheight() - 720) // 2
+        win.geometry(f"560x720+{x}+{y}")
+        win.protocol("WM_DELETE_WINDOW", self._finish)
+
+        self._hotkey   = cfg["hotkey"]
+        self._capturing = False
+        self._lang     = tk.StringVar(value="auto")
+        self._backend  = tk.StringVar(value="local")
+
+        self._build()
+
+        win.bind("<KeyPress>", self._on_key, add="+")
+        win.bind("<Button-2>", self._on_mouse, add="+")
+
+    # ── Build UI ──────────────────────────────────────────────────────────────
+
+    def _build(self):
+        # Hero with logo
+        hero = tk.Frame(self.win, bg=self.BG)
+        hero.pack(fill="x", pady=(28, 8))
+
+        logo = tk.Canvas(hero, width=72, height=72, bg=self.BG, highlightthickness=0)
+        logo.pack()
+        c = cfg["accent_color"]
+        logo.create_oval(4, 4, 68, 68, fill=c, outline="")
+        # Microphone glyph
+        logo.create_rectangle(28, 16, 44, 42, fill="white", outline="")
+        logo.create_oval(22, 36, 50, 54, fill="white", outline="")
+        logo.create_rectangle(34, 52, 38, 60, fill="white", outline="")
+        logo.create_rectangle(26, 60, 46, 64, fill="white", outline="")
+
+        tk.Label(self.win, text="Welcome to Transcribe", bg=self.BG, fg=self.FG,
+                 font=("Segoe UI Semibold", 20)).pack(pady=(8, 0))
+        tk.Label(self.win, text="Speech to text, anywhere on your PC",
+                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 11)).pack(pady=(2, 16))
+
+        # 3-step guide card
+        guide = tk.Frame(self.win, bg=self.CARD,
+                         highlightthickness=1, highlightbackground=self.BORDER)
+        guide.pack(fill="x", padx=32, pady=(0, 18))
+        for i, (icon, title, desc) in enumerate([
+            ("⌨", "Press your hotkey",  "Anywhere — in any app, browser, or editor"),
+            ("🎙", "Speak naturally",    "A small overlay shows you're recording"),
+            ("📋", "Press Enter",        "Your words paste right where the cursor is"),
+        ]):
+            row = tk.Frame(guide, bg=self.CARD); row.pack(fill="x", padx=16,
+                                                          pady=(12 if i == 0 else 6,
+                                                                12 if i == 2 else 0))
+            tk.Label(row, text=icon, bg=self.CARD, fg=cfg["accent_color"],
+                     font=("Segoe UI", 18), width=2).pack(side="left", padx=(0, 10))
+            txt = tk.Frame(row, bg=self.CARD); txt.pack(side="left", fill="x", expand=True)
+            tk.Label(txt, text=title, bg=self.CARD, fg=self.FG,
+                     font=("Segoe UI Semibold", 11)).pack(anchor="w")
+            tk.Label(txt, text=desc, bg=self.CARD, fg=self.FG2,
+                     font=("Segoe UI", 9)).pack(anchor="w")
+
+        # Hotkey
+        self._section("YOUR HOTKEY")
+        hf = tk.Frame(self.win, bg=self.CARD,
+                      highlightthickness=1, highlightbackground=self.BORDER)
+        hf.pack(fill="x", padx=32, pady=(4, 12))
+        self.hotkey_btn = tk.Label(hf, text=self._fmt_hotkey(self._hotkey),
+                                   bg=self.CARD, fg=self.FG,
+                                   font=("Segoe UI Semibold", 11),
+                                   padx=14, pady=10, anchor="w", cursor="hand2")
+        self.hotkey_btn.pack(fill="x")
+        self.hotkey_btn.bind("<Button-1>", lambda e: self._start_capture())
+        self.hotkey_btn.bind("<Enter>", lambda e: self.hotkey_btn.configure(bg="#f0f0f5"))
+        self.hotkey_btn.bind("<Leave>", lambda e: self.hotkey_btn.configure(
+            bg="#fff8e1" if self._capturing else self.CARD))
+
+        # Language
+        self._section("LANGUAGE")
+        lf = tk.Frame(self.win, bg=self.BG); lf.pack(fill="x", padx=32, pady=(4, 12))
+        self._lang_pills = {}
+        common = [("auto", "Auto-detect"), ("hy", "Armenian"),
+                  ("en", "English"),       ("ru", "Russian"),
+                  ("multi", "Multilingual")]
+        for i, (code, name) in enumerate(common):
+            self._pill(lf, code, name, i)
+
+        # Backend
+        self._section("BACKEND")
+        bf = tk.Frame(self.win, bg=self.BG); bf.pack(fill="x", padx=32, pady=(4, 16))
+        self._backend_card(bf, "local",  "💻  Local (Offline)",
+                           "Private, free, no internet needed")
+        self._backend_card(bf, "google", "☁  Google Cloud",
+                           "Best Armenian accuracy · 60 min/mo free")
+
+        # Get Started button
+        btn_row = tk.Frame(self.win, bg=self.BG); btn_row.pack(fill="x", padx=32,
+                                                                pady=(8, 0))
+        btn = tk.Label(btn_row, text="Get Started",
+                       bg=cfg["accent_color"], fg="#ffffff",
+                       font=("Segoe UI Semibold", 12),
+                       padx=32, pady=11, cursor="hand2")
+        btn.pack(fill="x")
+        btn.bind("<Button-1>", lambda e: self._finish())
+        btn.bind("<Enter>", lambda e: btn.configure(bg=self._dim(cfg["accent_color"], 0.85)))
+        btn.bind("<Leave>", lambda e: btn.configure(bg=cfg["accent_color"]))
+
+    def _section(self, text):
+        tk.Label(self.win, text=text, bg=self.BG, fg=self.FG2,
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=32, pady=(2, 0))
+
+    def _pill(self, parent, code, name, idx):
+        sel = self._lang.get() == code
+        bg  = cfg["accent_color"] if sel else self.CARD
+        fg  = "#ffffff" if sel else self.FG
+        brd = cfg["accent_color"] if sel else self.BORDER
+
+        col, row = idx % 5, idx // 5
+        cell = tk.Frame(parent, bg=self.BG)
+        cell.grid(row=row, column=col, padx=(0, 6), pady=(0, 6), sticky="w")
+
+        pill = tk.Label(cell, text=name, bg=bg, fg=fg,
+                        font=("Segoe UI", 9), padx=12, pady=6, cursor="hand2",
+                        highlightthickness=1, highlightbackground=brd)
+        pill.pack()
+        pill.bind("<Button-1>", lambda e, c=code: (self._lang.set(c), self._refresh()))
+        if not sel:
+            pill.bind("<Enter>", lambda e: pill.configure(bg="#f0f0f5"))
+            pill.bind("<Leave>", lambda e: pill.configure(bg=self.CARD))
+
+    def _backend_card(self, parent, val, title, desc):
+        sel  = self._backend.get() == val
+        bg   = self.SEL_BG if sel else self.CARD
+        bord = cfg["accent_color"] if sel else self.BORDER
+
+        card = tk.Frame(parent, bg=bord, padx=1, pady=1, cursor="hand2")
+        card.pack(fill="x", pady=(0, 6))
+        inner = tk.Frame(card, bg=bg, padx=14, pady=10); inner.pack(fill="x")
+
+        row = tk.Frame(inner, bg=bg); row.pack(fill="x")
+        dot = tk.Canvas(row, width=16, height=16, bg=bg, highlightthickness=0)
+        dot.pack(side="left", padx=(0, 8))
+        if sel:
+            dot.create_oval(2, 2, 14, 14, outline=cfg["accent_color"], width=2)
+            dot.create_oval(5, 5, 11, 11, fill=cfg["accent_color"], outline="")
+        else:
+            dot.create_oval(2, 2, 14, 14, outline="#b0b0ba", width=2)
+        tk.Label(row, text=title, bg=bg, fg=self.FG,
+                 font=("Segoe UI Semibold", 10)).pack(side="left")
+        tk.Label(inner, text=desc, bg=bg, fg=self.FG2,
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=24)
+
+        for w in [card, inner, row] + list(row.winfo_children()) + list(inner.winfo_children()):
+            w.bind("<Button-1>", lambda e, v=val: (self._backend.set(v), self._refresh()))
+            try: w.configure(cursor="hand2")
+            except: pass
+
+    def _refresh(self):
+        for w in self.win.winfo_children():
+            w.destroy()
+        self._build()
+
+    # ── Hotkey capture ────────────────────────────────────────────────────────
+
+    def _fmt_hotkey(self, hk):
+        if hk.startswith("mouse:"):
+            names = {"middle":"Mouse Middle", "left":"Mouse Left", "right":"Mouse Right",
+                     "x1":"Mouse Back", "x2":"Mouse Forward"}
+            return f"🖱  {names.get(hk.split(':')[1], hk)}"
+        caps = {"ctrl":"Ctrl","alt":"Alt","shift":"Shift","win":"Win","super":"Super"}
+        return " + ".join(caps.get(p, p.upper() if len(p)==1 else p.capitalize())
+                          for p in hk.split("+"))
+
+    def _start_capture(self):
+        self._capturing = True
+        self.hotkey_btn.configure(text="⌨  Press any key combo or mouse button…",
+                                  bg="#fff8e1", fg=self.FG2)
+        self.win.focus_set()
+
+    def _on_key(self, event):
+        if not self._capturing: return
+        key = event.keysym.lower()
+        if key in ("control_l","control_r","alt_l","alt_r","shift_l","shift_r",
+                   "super_l","super_r","meta_l","meta_r","caps_lock","num_lock"):
+            return
+        if key == "escape":
+            self._capturing = False
+            self.hotkey_btn.configure(text=self._fmt_hotkey(self._hotkey),
+                                      fg=self.FG, bg=self.CARD)
+            return
+        mods = []
+        if keyboard.is_pressed("ctrl"):  mods.append("ctrl")
+        if keyboard.is_pressed("alt"):   mods.append("alt")
+        if keyboard.is_pressed("shift"): mods.append("shift")
+        self._set_hotkey("+".join(mods + [key]))
+
+    def _on_mouse(self, event):
+        if self._capturing:
+            self._set_hotkey("mouse:middle")
+
+    def _set_hotkey(self, combo):
+        self._hotkey = combo
+        self._capturing = False
+        self.hotkey_btn.configure(text=self._fmt_hotkey(combo), fg=self.FG, bg=self.CARD)
+
+    def _dim(self, hex_c, factor):
+        r = int(int(hex_c[1:3],16)*factor); g = int(int(hex_c[3:5],16)*factor)
+        b = int(int(hex_c[5:7],16)*factor)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _finish(self):
+        old_hk = cfg["hotkey"]
+        cfg["hotkey"]          = self._hotkey
+        cfg["language"]        = self._lang.get()
+        cfg["backend"]         = self._backend.get()
+        cfg["onboarding_done"] = True
+        save_config(cfg)
+        if old_hk != cfg["hotkey"]:
+            self.app._setup_hotkey(cfg["hotkey"], remove_old=old_hk)
+        try:
+            self.win.grab_release()
+            self.win.destroy()
+        except Exception:
+            pass
+
 # ── Main App ──────────────────────────────────────────────────────────────────
 
 class App:
@@ -1476,6 +1723,7 @@ def _parse_version(v):
         return (0, 0, 0)
 
 def check_for_update(on_update_found):
+    """Background check. Calls on_update_found(tag, installer_url) if newer version exists."""
     def _run():
         try:
             resp = requests.get(RELEASES_API,
@@ -1483,11 +1731,46 @@ def check_for_update(on_update_found):
                                 timeout=8)
             if resp.status_code != 200:
                 return
-            latest = resp.json().get("tag_name", "")
+            data = resp.json()
+            latest = data.get("tag_name", "")
             if _parse_version(latest) > _parse_version(APP_VERSION):
-                on_update_found(latest)
+                installer_url = None
+                for asset in data.get("assets", []):
+                    name = asset.get("name", "").lower()
+                    if "setup" in name and name.endswith(".exe"):
+                        installer_url = asset.get("browser_download_url")
+                        break
+                on_update_found(latest, installer_url)
         except Exception:
             pass
+    threading.Thread(target=_run, daemon=True).start()
+
+def download_and_install_update(installer_url, on_progress=None, on_done=None, on_error=None):
+    """Download installer to temp and launch it with silent flags. App exits when launched."""
+    def _run():
+        try:
+            import tempfile, os, subprocess
+            tmp = os.path.join(tempfile.gettempdir(), "TranscribeApp-Setup.exe")
+            with requests.get(installer_url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("Content-Length", 0))
+                got = 0
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=64 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            got += len(chunk)
+                            if on_progress and total:
+                                on_progress(got, total)
+            # Launch installer; /SILENT shows progress bar, /CLOSEAPPLICATIONS handles us,
+            # /RESTARTAPPLICATIONS re-launches us after install.
+            subprocess.Popen([tmp, "/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"],
+                             creationflags=0x00000010 if sys.platform == "win32" else 0)
+            if on_done:
+                on_done()
+        except Exception as e:
+            if on_error:
+                on_error(e)
     threading.Thread(target=_run, daemon=True).start()
 
 # ── Tray ──────────────────────────────────────────────────────────────────────
@@ -1504,7 +1787,7 @@ def make_icon(color="#3b82f6"):
     return img
 
 def run_tray(app: App):
-    _update_tag = [None]  # mutable container so inner functions can write it
+    _update_state = {"tag": None, "url": None, "installing": False}
 
     def on_settings(icon, _): app.open_settings()
     def on_history(icon, _):  app.open_history()
@@ -1512,17 +1795,46 @@ def run_tray(app: App):
         icon.stop()
         app.shutdown()
         app.overlay.root.after(0, app.overlay.root.quit)
-    def on_download(icon, _):
-        webbrowser.open(RELEASES_URL)
+
+    def on_install_update(icon, _):
+        if _update_state["installing"]:
+            return
+        if _update_state["url"] and sys.platform == "win32":
+            _update_state["installing"] = True
+            icon.menu = _build_menu()
+            try: icon.notify("Downloading update… app will restart automatically.",
+                             "Installing update")
+            except Exception: pass
+            def _on_done():
+                try: icon.notify("Update is installing. Transcribe will restart.",
+                                 "Installing update")
+                except Exception: pass
+            def _on_error(e):
+                _update_state["installing"] = False
+                icon.menu = _build_menu()
+                try: icon.notify(f"Update failed: {e}", "Update error")
+                except Exception: pass
+            download_and_install_update(_update_state["url"],
+                                        on_done=_on_done, on_error=_on_error)
+        else:
+            webbrowser.open(RELEASES_URL)
 
     def _build_menu():
         items = [
             pystray.MenuItem(f"Transcribe  v{APP_VERSION}", None, enabled=False),
             pystray.Menu.SEPARATOR,
         ]
-        if _update_tag[0]:
+        if _update_state["installing"]:
             items += [
-                pystray.MenuItem(f"⬆  Update available: {_update_tag[0]}", on_download),
+                pystray.MenuItem("⬇  Installing update…", None, enabled=False),
+                pystray.Menu.SEPARATOR,
+            ]
+        elif _update_state["tag"]:
+            label = (f"⬆  Install update: {_update_state['tag']}"
+                     if _update_state["url"] and sys.platform == "win32"
+                     else f"⬆  Download update: {_update_state['tag']}")
+            items += [
+                pystray.MenuItem(label, on_install_update),
                 pystray.Menu.SEPARATOR,
             ]
         items += [
@@ -1537,14 +1849,15 @@ def run_tray(app: App):
                         f"Transcribe  ·  {cfg['hotkey']}",
                         menu=_build_menu())
 
-    def _on_update_found(tag):
-        _update_tag[0] = tag
+    def _on_update_found(tag, installer_url):
+        _update_state["tag"] = tag
+        _update_state["url"] = installer_url
         icon.menu = _build_menu()
         try:
-            icon.notify(
-                f"Transcribe {tag} is available — click here to download",
-                "Update available",
-            )
+            msg = (f"Transcribe {tag} is available. Click the tray menu to install."
+                   if installer_url and sys.platform == "win32"
+                   else f"Transcribe {tag} is available — click to download")
+            icon.notify(msg, "Update available")
         except Exception:
             pass
 
@@ -1566,6 +1879,8 @@ def main():
     _apply_taskbar_icon(overlay.root)
     app     = App(overlay)
     threading.Thread(target=run_tray, args=(app,), daemon=True).start()
+    if not cfg.get("onboarding_done"):
+        overlay.root.after(400, lambda: Onboarding(overlay.root, app).show())
     overlay.run()
 
 if __name__ == "__main__":
