@@ -53,13 +53,9 @@ _tk.ttk = _tk_ttk  # needed for Python ≤ 3.11
 _stub("history",       {"add": MagicMock, "all": MagicMock(return_value=[]),
                          "clear": MagicMock, "search": MagicMock(return_value=[])})
 _stub("requests",      {"get": MagicMock, "post": MagicMock})
-import ctypes as _real_ctypes
-_stub("ctypes",        {"windll": MagicMock, "byref": MagicMock,
-                         "c_int":    _real_ctypes.c_int,
-                         "sizeof":   _real_ctypes.sizeof,
-                         "POINTER":  _real_ctypes.POINTER,
-                         "pointer":  _real_ctypes.pointer,
-                         "Structure": _real_ctypes.Structure})
+# ctypes is NOT stubbed — it is stdlib and works cross-platform.
+# ctypes.windll only appears inside apply_glass() which is never called by tests.
+# Replacing ctypes in sys.modules breaks ctypes._layout imports on Python 3.11.
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
