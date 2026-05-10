@@ -22,8 +22,53 @@ jobs:
       - name: Install test dependencies
         run: pip install pytest requests psutil pillow numpy pyaudio --quiet || true
 
+      - name: Diagnose import
+        run: |
+          python - <<'EOF'
+          import sys, os, types, traceback
+          from unittest.mock import MagicMock
+          def _stub(name, attrs=None):
+              m = types.ModuleType(name)
+              if attrs:
+                  for k,v in attrs.items(): setattr(m,k,v)
+              sys.modules[name] = m
+              return m
+          _stub("pyaudio",{"PyAudio":MagicMock,"paInt16":8})
+          _stub("pystray",{"Icon":MagicMock,"Menu":MagicMock,"MenuItem":MagicMock})
+          _pkb=_stub("pynput.keyboard",{"Controller":MagicMock,"Key":MagicMock})
+          _pm=_stub("pynput.mouse",{"Listener":MagicMock,"Button":MagicMock})
+          _p=_stub("pynput",{}); _p.keyboard=_pkb; _p.mouse=_pm
+          _stub("keyboard",{"add_hotkey":MagicMock,"remove_hotkey":MagicMock,"is_pressed":MagicMock(return_value=False)})
+          _stub("pyperclip",{"copy":MagicMock,"paste":MagicMock})
+          _stub("faster_whisper",{"WhisperModel":MagicMock})
+          _stub("psutil",{"virtual_memory":MagicMock(return_value=MagicMock(total=16*1024**3)),"cpu_count":MagicMock(return_value=8)})
+          _stub("ctranslate2",{"get_cuda_device_count":MagicMock(return_value=0)})
+          _stub("numpy",{"frombuffer":MagicMock,"abs":MagicMock,"percentile":MagicMock(return_value=100),"concatenate":MagicMock,"array":MagicMock,"int16":MagicMock,"float32":MagicMock,"mean":MagicMock(return_value=0.0)})
+          _pi=_stub("PIL.Image",{"new":MagicMock,"LANCZOS":MagicMock})
+          _pd=_stub("PIL.ImageDraw",{"Draw":MagicMock})
+          _pil=_stub("PIL",{}); _pil.Image=_pi; _pil.ImageDraw=_pd
+          _tk=_stub("tkinter"); _tk.Tk=MagicMock; _tk.Toplevel=MagicMock; _tk.Frame=MagicMock
+          _tk.Label=MagicMock; _tk.Canvas=MagicMock; _tk.StringVar=MagicMock
+          _tk.IntVar=MagicMock; _tk.BooleanVar=MagicMock; _tk.Text=MagicMock
+          _tk.Entry=MagicMock; _tk.Button=MagicMock; _tk.Scrollbar=MagicMock
+          _tk.Radiobutton=MagicMock; _tk.END="end"
+          _ttt=_stub("tkinter.ttk",{"Scrollbar":MagicMock}); _tk.ttk=_ttt
+          _stub("history",{"add":MagicMock,"all":MagicMock(return_value=[]),"clear":MagicMock,"search":MagicMock(return_value=[])})
+          _stub("requests",{"get":MagicMock,"post":MagicMock})
+          sys.path.insert(0,".")
+          print("Python", sys.version)
+          print("Stubs ready, importing main...")
+          try:
+              import main
+              print("main OK")
+          except Exception as e:
+              print("IMPORT FAILED:", e)
+              traceback.print_exc()
+              sys.exit(1)
+          EOF
+
       - name: Run unit tests
-        run: python -m pytest tests/ -v
+        run: python -m pytest tests/ -v --tb=long
 
   # ── Windows .exe ─────────────────────────────────────────────────────────────
   build-windows:
