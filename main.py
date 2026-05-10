@@ -779,17 +779,22 @@ PALETTE = {
 }
 
 class Settings:
-    BG   = "#0f0f0f"
-    CARD = "#181818"
-    SEP  = "#212121"
-    FG   = "#ffffff"
-    FG2  = "#555555"
+    BG     = "#f5f5f7"
+    CARD   = "#ffffff"
+    BORDER = "#e2e2e7"
+    FG     = "#1d1d1f"
+    FG2    = "#6e6e73"
+    SEL_BG = "#eaf1ff"   # selected card tint
+
+    TABS = ["General", "Model", "Language", "Appearance"]
 
     def __init__(self, root, app):
         self.root         = root
         self.app          = app
         self.win          = None
-        self._backend_sep = None
+        self._active_tab  = 0
+        self._tab_frames  = []
+        self._tab_btns    = []
 
     def open(self):
         if self.win and self.win.winfo_exists():
@@ -800,303 +805,398 @@ class Settings:
         win.title("Settings")
         win.resizable(False, False)
         win.configure(bg=self.BG)
-        win.geometry("480x680")
+        win.geometry("520x640")
         win.attributes("-topmost", True)
         win.update_idletasks()
-        apply_glass(win.winfo_id(), "#0f0f0ff2")
 
-        # scrollable canvas
-        outer = tk.Frame(win, bg=self.BG)
-        outer.pack(fill="both", expand=True)
-        canvas = tk.Canvas(outer, bg=self.BG, highlightthickness=0)
-        sb = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=sb.set)
+        self._build(win)
+
+    def _build(self, win):
+        # ── Title bar ─────────────────────────────────────────────────────────
+        header = tk.Frame(win, bg=self.BG)
+        header.pack(fill="x", padx=24, pady=(20, 0))
+        tk.Label(header, text="Settings", bg=self.BG, fg=self.FG,
+                 font=("Segoe UI Semibold", 17)).pack(side="left")
+        tk.Label(header, text=f"{RAM_GB:.0f} GB RAM · {psutil.cpu_count()} cores",
+                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 9)).pack(side="right", anchor="s", pady=3)
+
+        # ── Tab bar ───────────────────────────────────────────────────────────
+        tab_bar = tk.Frame(win, bg=self.BG)
+        tab_bar.pack(fill="x", padx=16, pady=(10, 0))
+        self._tab_btns = []
+        for i, name in enumerate(self.TABS):
+            btn = tk.Label(tab_bar, text=name, bg=self.BG, fg=self.FG2,
+                           font=("Segoe UI", 10), padx=14, pady=7, cursor="hand2")
+            btn.pack(side="left")
+            btn.bind("<Button-1>", lambda e, idx=i: self._switch_tab(idx))
+            btn.bind("<Enter>",    lambda e, b=btn: b.configure(fg=self.FG))
+            btn.bind("<Leave>",    lambda e, b=btn, idx=i: b.configure(
+                fg=self.FG if self._active_tab == idx else self.FG2))
+            self._tab_btns.append(btn)
+
+        self._tab_indicator = tk.Frame(win, bg=self.BORDER, height=1)
+        self._tab_indicator.pack(fill="x", padx=16)
+        self._active_line   = tk.Frame(win, bg=cfg["accent_color"], height=2)
+
+        # ── Content area (scrollable) ─────────────────────────────────────────
+        content_outer = tk.Frame(win, bg=self.BG)
+        content_outer.pack(fill="both", expand=True, pady=(4, 0))
+        self._canvas = tk.Canvas(content_outer, bg=self.BG, highlightthickness=0)
+        sb = tk.Scrollbar(content_outer, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        frame = tk.Frame(canvas, bg=self.BG)
-        fw = canvas.create_window((0,0), window=frame, anchor="nw")
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._scroll_frame = tk.Frame(self._canvas, bg=self.BG)
+        self._fw = self._canvas.create_window((0, 0), window=self._scroll_frame, anchor="nw")
+        self._scroll_frame.bind("<Configure>", lambda e: (
+            self._canvas.configure(scrollregion=self._canvas.bbox("all")),
+            self._canvas.itemconfig(self._fw, width=self._canvas.winfo_width())
+        ))
+        self._canvas.bind("<Configure>", lambda e: self._canvas.itemconfig(self._fw, width=e.width))
+        win.bind("<MouseWheel>", lambda e: self._canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
 
-        def _resize(e):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfig(fw, width=canvas.winfo_width())
-        frame.bind("<Configure>", _resize)
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(fw, width=e.width))
-        win.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
-
-        self._build(frame)
-
-    def _build(self, f):
-        # Header
-        tk.Label(f, text="Settings", bg=self.BG, fg=self.FG,
-                 font=("Segoe UI Semibold", 18)).pack(anchor="w", padx=24, pady=(22,2))
-        tk.Label(f, text=f"{RAM_GB:.0f} GB RAM  ·  {psutil.cpu_count()} CPU cores",
-                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 9)).pack(anchor="w", padx=24)
-        self._sep(f)
-
-        # ── Backend ──────────────────────────────────────────────────────────
-        self._label(f, "BACKEND")
+        # ── Init state ────────────────────────────────────────────────────────
         self.backend_var = tk.StringVar(value=cfg["backend"])
-        bf = tk.Frame(f, bg=self.BG)
-        bf.pack(anchor="w", padx=24, pady=(8,4))
-        for val, title, desc in [
-            ("local",  "Local",  "Offline · private · free"),
-            ("google", "Google Cloud", "Online · best for Armenian · 60 min/mo free"),
-        ]:
-            brd = cfg["accent_color"] if self.backend_var.get()==val else self.SEP
-            bg  = "#1a2233" if self.backend_var.get()==val else self.CARD
-            fr  = tk.Frame(bf, bg=brd, padx=1, pady=1)
-            fr.pack(side="left", padx=(0,10))
-            inn = tk.Frame(fr, bg=bg, padx=16, pady=10); inn.pack()
-            tk.Radiobutton(inn, text=title, variable=self.backend_var, value=val,
-                           bg=bg, fg=self.FG, selectcolor=bg,
-                           activebackground=bg, font=("Segoe UI Semibold", 11),
-                           cursor="hand2",
-                           command=self._on_backend_change).pack(anchor="w")
-            tk.Label(inn, text=desc, bg=bg, fg=self.FG2,
-                     font=("Segoe UI", 8)).pack(anchor="w")
-
-        self._backend_sep = self._sep(f)
-
-        # ── Google section (hidden when local) ───────────────────────────────
-        self.google_frame = tk.Frame(f, bg=self.BG)
-        self._label(self.google_frame, "GOOGLE API KEY")
         self.api_key_var = tk.StringVar(value=cfg["google_api_key"])
-        kf = tk.Frame(self.google_frame, bg=self.CARD,
-                      highlightthickness=1, highlightbackground=self.SEP)
-        kf.pack(fill="x", padx=24, pady=(4,4))
-        tk.Entry(kf, textvariable=self.api_key_var, bg=self.CARD,
-                 fg=self.FG, insertbackground=self.FG, show="•",
-                 font=("Segoe UI", 10), relief="flat", bd=8).pack(fill="x")
-        self.test_result = tk.StringVar(value="")
-        tr = tk.Frame(self.google_frame, bg=self.BG)
-        tr.pack(anchor="w", padx=24, pady=(0,4))
-        tk.Button(tr, text="Test Key", command=self._test_google,
-                  bg="#1e1e1e", fg="#aaaaaa", activebackground="#2a2a2a",
-                  font=("Segoe UI", 9), relief="flat", padx=10, pady=4,
-                  cursor="hand2").pack(side="left")
-        self.test_label = tk.Label(tr, textvariable=self.test_result,
-                                   bg=self.BG, fg="#888888", font=("Segoe UI", 9))
-        self.test_label.pack(side="left", padx=(10,0))
-        sep_g = tk.Frame(self.google_frame, bg=self.SEP, height=1)
-        sep_g.pack(fill="x", pady=(8,0))
-
-        # ── Local model section (hidden when google) ─────────────────────────
-        self.local_frame = tk.Frame(f, bg=self.BG)
-        self._label(self.local_frame, "MODEL")
-        self.model_var = tk.StringVar(value=cfg["whisper_model"])
-        mf = tk.Frame(self.local_frame, bg=self.BG)
-        mf.pack(fill="x", padx=24, pady=(6,4))
-        for name, info in MODELS.items():
-            self._model_row(mf, name, info)
-
-        # ── GPU / NeMo section ───────────────────────────────────────────
-        tk.Label(self.local_frame, text="GPU-ACCELERATED  (BEST ARMENIAN QUALITY)",
-                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 8)
-                 ).pack(anchor="w", padx=24, pady=(12, 0))
-        gf = tk.Frame(self.local_frame, bg=self.BG)
-        gf.pack(fill="x", padx=24, pady=(4, 4))
-        self._nemo_row(gf)
-
-        tk.Frame(self.local_frame, bg=self.SEP, height=1).pack(fill="x", pady=(8,0))
-
-        # Show correct section
-        self._on_backend_change()
-
-        # ── Hotkey ───────────────────────────────────────────────────────────
-        self._label(f, "HOTKEY")
-        tk.Label(f, text="Click the badge, then press any key combo or mouse button  ·  Esc cancels",
-                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 8)).pack(anchor="w", padx=24, pady=(2,4))
+        self.model_var   = tk.StringVar(value=cfg["whisper_model"])
+        self.lang_var    = tk.StringVar(value=cfg["language"])
+        self.color_var   = tk.StringVar(value=self._color_name())
         self._captured_hotkey  = cfg["hotkey"]
         self._capturing_hotkey = False
-        hf = tk.Frame(f, bg=self.CARD, highlightthickness=1, highlightbackground=self.SEP)
-        hf.pack(fill="x", padx=24, pady=(0,4))
-        self.hotkey_badge = tk.Label(hf, text=self._fmt_hotkey(cfg["hotkey"]),
+
+        self.test_result = tk.StringVar(value="")
+
+        # Hotkey binding (window-level)
+        win.bind("<KeyPress>",  self._hk_keypress, add="+")
+        win.bind("<Button-2>",  self._hk_mouse,    add="+")
+
+        # ── Save bar ──────────────────────────────────────────────────────────
+        save_bar = tk.Frame(win, bg=self.BG, pady=10)
+        save_bar.pack(fill="x", side="bottom", padx=24)
+        tk.Frame(save_bar, bg=self.BORDER, height=1).pack(fill="x", pady=(0, 10))
+        save_btn = tk.Label(save_bar, text="Save & Apply",
+                            bg=cfg["accent_color"], fg="#ffffff",
+                            font=("Segoe UI Semibold", 10),
+                            padx=24, pady=8, cursor="hand2")
+        save_btn.pack(side="right")
+        save_btn.bind("<Button-1>", lambda e: self._save())
+        save_btn.bind("<Enter>", lambda e: save_btn.configure(bg=self._dim(cfg["accent_color"], 0.85)))
+        save_btn.bind("<Leave>", lambda e: save_btn.configure(bg=cfg["accent_color"]))
+
+        # Render first tab
+        self._switch_tab(0)
+
+    # ── Tab switching ─────────────────────────────────────────────────────────
+
+    def _switch_tab(self, idx):
+        self._active_tab = idx
+        # Update tab button styles
+        for i, btn in enumerate(self._tab_btns):
+            btn.configure(fg=self.FG if i == idx else self.FG2,
+                          font=("Segoe UI Semibold", 10) if i == idx else ("Segoe UI", 10))
+        # Move underline indicator
+        self._active_line.place_forget()
+        btn = self._tab_btns[idx]
+        btn.update_idletasks()
+        x = btn.winfo_x() + btn.winfo_rootx() - self._tab_indicator.winfo_rootx()
+        self._active_line.place(in_=self._tab_indicator, x=btn.winfo_x(), y=-2,
+                                width=btn.winfo_width(), height=2)
+        # Clear and rebuild scroll content
+        for w in self._scroll_frame.winfo_children():
+            w.destroy()
+        [self._build_general, self._build_model,
+         self._build_language, self._build_appearance][idx](self._scroll_frame)
+        self._canvas.yview_moveto(0)
+
+    # ── Tab: General ──────────────────────────────────────────────────────────
+
+    def _build_general(self, f):
+        self._section(f, "Backend")
+        bf = tk.Frame(f, bg=self.BG); bf.pack(fill="x", padx=20, pady=(4, 0))
+
+        self._backend_cards = {}
+        for val, title, desc, icon in [
+            ("local",  "Local (Offline)",  "Private · free · no internet needed", "💻"),
+            ("google", "Google Cloud",     "Best accuracy for Armenian · 60 min/mo free", "☁"),
+        ]:
+            self._backend_card(bf, val, title, desc, icon)
+
+        # Google API key (shown conditionally)
+        self.google_section = tk.Frame(f, bg=self.BG)
+        self._build_google_section(self.google_section)
+        self._toggle_google_section()
+
+        self._section(f, "Hotkey")
+        tk.Label(f, text="Click the badge then press any key combo or mouse button  ·  Esc cancels",
+                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 8)
+                 ).pack(anchor="w", padx=20, pady=(2, 6))
+
+        hf = tk.Frame(f, bg=self.CARD,
+                      highlightthickness=1, highlightbackground=self.BORDER)
+        hf.pack(fill="x", padx=20, pady=(0, 16))
+        self.hotkey_badge = tk.Label(hf,
+                                     text=self._fmt_hotkey(self._captured_hotkey),
                                      bg=self.CARD, fg=self.FG,
                                      font=("Segoe UI Semibold", 11),
-                                     padx=16, pady=10, anchor="w", cursor="hand2")
+                                     padx=16, pady=11, anchor="w", cursor="hand2")
         self.hotkey_badge.pack(fill="x")
         self.hotkey_badge.bind("<Button-1>", lambda e: self._start_capture())
-        self.win.bind("<KeyPress>", self._hk_keypress, add="+")
-        self.win.bind("<Button-2>", self._hk_mouse,   add="+")
-        self._sep(f)
+        self.hotkey_badge.bind("<Enter>", lambda e: self.hotkey_badge.configure(bg="#f0f0f5"))
+        self.hotkey_badge.bind("<Leave>", lambda e: self.hotkey_badge.configure(bg=self.CARD))
 
-        # ── Language ─────────────────────────────────────────────────────────
-        self._label(f, "LANGUAGE")
-        self.lang_var = tk.StringVar(value=cfg["language"])
-        lf = tk.Frame(f, bg=self.BG)
-        lf.pack(anchor="w", padx=24, pady=(6,4))
-        for i, (code, name) in enumerate(LANG_NAMES.items()):
-            tk.Radiobutton(lf, text=name, variable=self.lang_var, value=code,
-                           bg=self.BG, fg="#cccccc", selectcolor=self.CARD,
-                           activebackground=self.BG, activeforeground=self.FG,
-                           font=("Segoe UI", 10), cursor="hand2"
-                           ).grid(row=i//3, column=i%3, sticky="w", padx=(0,20), pady=2)
-        self._sep(f)
+    def _backend_card(self, parent, val, title, desc, icon):
+        sel   = self.backend_var.get() == val
+        bg    = self.SEL_BG if sel else self.CARD
+        bord  = cfg["accent_color"] if sel else self.BORDER
 
-        # ── Color ─────────────────────────────────────────────────────────────
-        self._label(f, "ACCENT COLOR")
-        self.color_var = tk.StringVar(value=self._color_name())
-        cf = tk.Frame(f, bg=self.BG)
-        cf.pack(anchor="w", padx=24, pady=(6,16))
-        for name, hex_v in PALETTE.items():
-            self._color_swatch(cf, name, hex_v)
-
-        # ── Custom Vocabulary / Prompt ────────────────────────────────────────
-        self._sep(f)
-        self._label(f, "CUSTOM VOCABULARY / PROMPT")
-        tk.Label(f, text="Seed words or phrases to improve recognition accuracy\n(e.g. names, technical terms, Armenian proper nouns)",
-                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 8),
-                 justify="left").pack(anchor="w", padx=24, pady=(2,4))
-        pf = tk.Frame(f, bg=self.CARD, highlightthickness=1, highlightbackground=self.SEP)
-        pf.pack(fill="x", padx=24, pady=(0,4))
-        self.prompt_text = tk.Text(pf, height=3, bg=self.CARD, fg=self.FG,
-                                   insertbackground=self.FG, font=("Segoe UI", 9),
-                                   relief="flat", padx=8, pady=6, wrap="word")
-        self.prompt_text.pack(fill="x")
-        self.prompt_text.insert("1.0", cfg.get("initial_prompt", ""))
-
-        # ── Save ──────────────────────────────────────────────────────────────
-        tk.Button(f, text="Save & Apply", command=self._save,
-                  bg=cfg["accent_color"], fg="#ffffff",
-                  activebackground=cfg["accent_color"],
-                  font=("Segoe UI Semibold", 11), relief="flat",
-                  bd=0, padx=32, pady=10, cursor="hand2").pack(pady=(4,28))
-
-    def _on_backend_change(self):
-        if self.backend_var.get() == "google":
-            self.local_frame.pack_forget()
-            self.google_frame.pack(fill="x", after=self._backend_sep)
-        else:
-            self.google_frame.pack_forget()
-            self.local_frame.pack(fill="x", after=self._backend_sep)
-
-    def _radio_card(self, parent, var, val, title, desc):
-        sel  = var.get() == val
-        bg   = "#1e2a3a" if sel else self.CARD
-        bord = cfg["accent_color"] if sel else self.SEP
-        f    = tk.Frame(parent, bg=bord, padx=1, pady=1)
-        f.pack(side="left", padx=(0,10))
-        inner = tk.Frame(f, bg=bg, padx=14, pady=10)
-        inner.pack()
-        tk.Radiobutton(inner, text=title, variable=var, value=val,
-                       bg=bg, fg=self.FG, selectcolor=bg,
-                       activebackground=bg, activeforeground=self.FG,
-                       font=("Segoe UI Semibold", 10), cursor="hand2").pack(anchor="w")
-        tk.Label(inner, text=desc, bg=bg, fg=self.FG2,
-                 font=("Segoe UI", 8)).pack(anchor="w")
-
-    def _model_row(self, parent, name, info):
-        ok   = model_ok(name)
-        sel  = self.model_var.get() == name
-        fg   = self.FG  if ok else "#333333"
-        fg2  = "#888888" if ok else "#2a2a2a"
-        bg   = "#1a2233" if sel else (self.CARD if ok else "#111111")
-        bord = cfg["accent_color"] if sel else (self.SEP if ok else "#151515")
-
-        f = tk.Frame(parent, bg=bord, padx=1, pady=1)
-        f.pack(fill="x", pady=(0,6))
-        inner = tk.Frame(f, bg=bg, padx=14, pady=8)
+        card = tk.Frame(parent, bg=bord, padx=1, pady=1, cursor="hand2")
+        card.pack(fill="x", pady=(0, 8))
+        inner = tk.Frame(card, bg=bg, padx=14, pady=10)
         inner.pack(fill="x")
 
-        left = tk.Frame(inner, bg=bg); left.pack(side="left", fill="x", expand=True)
-        right = tk.Frame(inner, bg=bg); right.pack(side="right")
+        row = tk.Frame(inner, bg=bg); row.pack(fill="x")
+        dot_c = tk.Canvas(row, width=16, height=16, bg=bg, highlightthickness=0)
+        dot_c.pack(side="left", padx=(0, 8))
+        if sel:
+            dot_c.create_oval(2, 2, 14, 14, outline=cfg["accent_color"], width=2)
+            dot_c.create_oval(5, 5, 11, 11, fill=cfg["accent_color"], outline="")
+        else:
+            dot_c.create_oval(2, 2, 14, 14, outline="#b0b0ba", width=2)
 
-        top = tk.Frame(left, bg=bg); top.pack(anchor="w")
-        lock = " 🔒" if not ok else (" ✓" if sel else "")
-        lock_color = "#333" if not ok else cfg["accent_color"]
-        tk.Label(top, text=name, bg=bg, fg=fg,
+        tk.Label(row, text=f"{icon}  {title}", bg=bg, fg=self.FG,
+                 font=("Segoe UI Semibold", 10)).pack(side="left")
+        tk.Label(inner, text=desc, bg=bg, fg=self.FG2,
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=24)
+
+        def _select(e=None):
+            self.backend_var.set(val)
+            self._build_general(self._scroll_frame)  # rebuild tab
+        for w in [card, inner, row] + list(row.winfo_children()) + list(inner.winfo_children()):
+            w.bind("<Button-1>", _select)
+            if hasattr(w, 'configure'):
+                try: w.configure(cursor="hand2")
+                except: pass
+
+    def _build_google_section(self, parent):
+        self._section(parent, "Google API Key")
+        kf = tk.Frame(parent, bg=self.CARD,
+                      highlightthickness=1, highlightbackground=self.BORDER)
+        kf.pack(fill="x", padx=20, pady=(4, 4))
+        entry_row = tk.Frame(kf, bg=self.CARD); entry_row.pack(fill="x")
+        tk.Entry(entry_row, textvariable=self.api_key_var,
+                 bg=self.CARD, fg=self.FG, insertbackground=self.FG,
+                 show="•", font=("Segoe UI", 10), relief="flat",
+                 bd=10).pack(fill="x")
+
+        tr = tk.Frame(parent, bg=self.BG); tr.pack(anchor="w", padx=20, pady=(0, 8))
+        test_btn = tk.Label(tr, text="Test Key",
+                            bg="#efefef", fg=self.FG,
+                            font=("Segoe UI", 9), padx=12, pady=5, cursor="hand2")
+        test_btn.pack(side="left")
+        test_btn.bind("<Button-1>", lambda e: self._test_google())
+        test_btn.bind("<Enter>",    lambda e: test_btn.configure(bg="#e0e0e8"))
+        test_btn.bind("<Leave>",    lambda e: test_btn.configure(bg="#efefef"))
+        self.test_label = tk.Label(tr, textvariable=self.test_result,
+                                   bg=self.BG, fg=self.FG2, font=("Segoe UI", 9))
+        self.test_label.pack(side="left", padx=(10, 0))
+
+    def _toggle_google_section(self):
+        if self.backend_var.get() == "google":
+            self.google_section.pack(fill="x")
+        else:
+            self.google_section.pack_forget()
+
+    # ── Tab: Model ────────────────────────────────────────────────────────────
+
+    def _build_model(self, f):
+        self._section(f, "Whisper Models")
+        mf = tk.Frame(f, bg=self.BG); mf.pack(fill="x", padx=20, pady=(4, 0))
+        for name, info in MODELS.items():
+            self._model_card(mf, name, info)
+
+        self._section(f, "GPU-Accelerated  (Best Armenian Quality)")
+        gf = tk.Frame(f, bg=self.BG); gf.pack(fill="x", padx=20, pady=(4, 16))
+        self._nemo_card(gf)
+
+    def _model_card(self, parent, name, info):
+        ok  = model_ok(name)
+        sel = self.model_var.get() == name
+
+        bg   = self.SEL_BG   if sel  else (self.CARD    if ok else "#f9f9f9")
+        bord = cfg["accent_color"] if sel else (self.BORDER if ok else "#ebebeb")
+        fg   = self.FG  if ok else "#b0b0ba"
+        fg2  = self.FG2 if ok else "#c8c8d0"
+
+        card = tk.Frame(parent, bg=bord, padx=1, pady=1)
+        card.pack(fill="x", pady=(0, 6))
+        inner = tk.Frame(card, bg=bg, padx=14, pady=9); inner.pack(fill="x")
+
+        left  = tk.Frame(inner, bg=bg); left.pack(side="left",  fill="x", expand=True)
+        right = tk.Frame(inner, bg=bg); right.pack(side="right", anchor="center")
+
+        name_row = tk.Frame(left, bg=bg); name_row.pack(anchor="w")
+        tk.Label(name_row, text=name, bg=bg, fg=fg,
                  font=("Segoe UI Semibold", 11)).pack(side="left")
-        tk.Label(top, text=lock, bg=bg, fg=lock_color,
-                 font=("Segoe UI", 10)).pack(side="left")
+        if sel:
+            tk.Label(name_row, text="  ✓", bg=bg, fg=cfg["accent_color"],
+                     font=("Segoe UI", 10)).pack(side="left")
+        elif not ok:
+            tk.Label(name_row, text="  locked", bg=bg, fg="#c8c8d0",
+                     font=("Segoe UI", 8)).pack(side="left")
+
         tk.Label(left, text=f"{info['quality']}  ·  {info['size']}",
                  bg=bg, fg=fg2, font=("Segoe UI", 8)).pack(anchor="w")
 
         tk.Label(right, text=info["speed"], bg=bg, fg=fg,
-                 font=("Segoe UI Semibold", 12)).pack()
+                 font=("Segoe UI Semibold", 13)).pack()
         tk.Label(right, text="per clip", bg=bg, fg=fg2,
                  font=("Segoe UI", 7)).pack()
+        if not ok:
+            tk.Label(right, text=f"Need {info['min_ram']} GB RAM",
+                     bg=bg, fg=fg2, font=("Segoe UI", 7)).pack()
 
         if ok:
-            for w in [f, inner, left, right, top] + \
-                     list(left.winfo_children()) + list(top.winfo_children()) + \
+            def _pick(e=None, n=name):
+                self.model_var.set(n)
+                self._build_model(self._scroll_frame)
+            for w in [card, inner, left, right, name_row] + \
+                     list(left.winfo_children()) + list(name_row.winfo_children()) + \
                      list(right.winfo_children()):
-                w.configure(cursor="hand2")
-                w.bind("<Button-1>", lambda e, n=name: self._pick_model(n))
+                try: w.configure(cursor="hand2")
+                except: pass
+                w.bind("<Button-1>", _pick)
+            inner.bind("<Enter>", lambda e: inner.configure(bg=self._tint(bg)))
+            inner.bind("<Leave>", lambda e: inner.configure(bg=bg))
 
-        if not ok:
-            tk.Label(right, text=f"Need {info['min_ram']}GB RAM",
-                     bg=bg, fg="#2a1a1a", font=("Segoe UI", 7)).pack()
+    def _nemo_card(self, parent):
+        gpu  = HAS_GPU
+        bg   = "#f9f9f9" if not gpu else self.CARD
+        bord = "#ebebeb"  if not gpu else self.BORDER
+        fg   = "#b0b0ba"  if not gpu else self.FG
+        fg2  = "#c8c8d0"  if not gpu else self.FG2
 
-    def _nemo_row(self, parent):
-        gpu_ok = HAS_GPU
-        bg     = "#111111"
-        bord   = "#1a1a1a"
-        fg     = "#333333" if not gpu_ok else self.FG
-        fg2    = "#222222" if not gpu_ok else "#888888"
+        card  = tk.Frame(parent, bg=bord, padx=1, pady=1); card.pack(fill="x")
+        inner = tk.Frame(card, bg=bg, padx=14, pady=9);    inner.pack(fill="x")
+        left  = tk.Frame(inner, bg=bg); left.pack(side="left",  fill="x", expand=True)
+        right = tk.Frame(inner, bg=bg); right.pack(side="right", anchor="center")
 
-        f = tk.Frame(parent, bg=bord, padx=1, pady=1)
-        f.pack(fill="x", pady=(0, 6))
-        inner = tk.Frame(f, bg=bg, padx=14, pady=8)
-        inner.pack(fill="x")
-
-        left  = tk.Frame(inner, bg=bg); left.pack(side="left", fill="x", expand=True)
-        right = tk.Frame(inner, bg=bg); right.pack(side="right")
-
-        top = tk.Frame(left, bg=bg); top.pack(anchor="w")
-        tk.Label(top, text="NeMo FastConformer", bg=bg, fg=fg,
+        name_row = tk.Frame(left, bg=bg); name_row.pack(anchor="w")
+        tk.Label(name_row, text="NeMo FastConformer", bg=bg, fg=fg,
                  font=("Segoe UI Semibold", 11)).pack(side="left")
-        badge_col  = "#1a3a1a" if gpu_ok else "#1a1a1a"
-        badge_text = "GPU ready" if gpu_ok else "No GPU detected"
-        badge_fg   = "#22c55e" if gpu_ok else "#333333"
-        tk.Label(top, text=f"  {badge_text}", bg=bg, fg=badge_fg,
-                 font=("Segoe UI", 9)).pack(side="left")
+        badge_fg  = "#22c55e" if gpu else "#b0b0ba"
+        badge_txt = "  GPU ready" if gpu else "  No GPU"
+        tk.Label(name_row, text=badge_txt, bg=bg, fg=badge_fg,
+                 font=("Segoe UI", 8)).pack(side="left")
 
-        tk.Label(left, text="Armenian best · 9.9% WER · Requires NeMo framework",
+        tk.Label(left, text="Armenian best · 9.9% WER · GPU required",
                  bg=bg, fg=fg2, font=("Segoe UI", 8)).pack(anchor="w")
 
-        tk.Label(right, text="~2s", bg=bg, fg=fg,
-                 font=("Segoe UI Semibold", 12)).pack()
-        tk.Label(right, text="per clip", bg=bg, fg=fg2,
-                 font=("Segoe UI", 7)).pack()
+        tk.Label(right, text="~2s",    bg=bg, fg=fg, font=("Segoe UI Semibold", 13)).pack()
+        tk.Label(right, text="per clip", bg=bg, fg=fg2, font=("Segoe UI", 7)).pack()
+        tk.Label(right, text="Coming soon" if gpu else "GPU required",
+                 bg=bg, fg=fg2, font=("Segoe UI", 7)).pack()
 
-        if not gpu_ok:
-            tk.Label(right, text="GPU required", bg=bg, fg="#2a1a1a",
-                     font=("Segoe UI", 7)).pack()
-        else:
-            tk.Label(right, text="Coming soon", bg=bg, fg=fg2,
-                     font=("Segoe UI", 7)).pack()
+    # ── Tab: Language ─────────────────────────────────────────────────────────
 
-    def _pick_model(self, name):
-        self.model_var.set(name)
-        # refresh rows
-        for w in self.win.winfo_children():
-            pass  # full rebuild not needed; save will apply
+    def _build_language(self, f):
+        self._section(f, "Recognition Language")
+        lf = tk.Frame(f, bg=self.BG); lf.pack(fill="x", padx=20, pady=(6, 0))
+        self._lang_pills = {}
+        for i, (code, name) in enumerate(LANG_NAMES.items()):
+            self._lang_pill(lf, code, name, i)
+
+        self._section(f, "Custom Vocabulary / Prompt")
+        tk.Label(f, text="Words or phrases to improve recognition (names, technical terms, Armenian nouns)",
+                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 8),
+                 wraplength=460, justify="left").pack(anchor="w", padx=20, pady=(2, 6))
+        pf = tk.Frame(f, bg=self.CARD,
+                      highlightthickness=1, highlightbackground=self.BORDER)
+        pf.pack(fill="x", padx=20, pady=(0, 16))
+        self.prompt_text = tk.Text(pf, height=4, bg=self.CARD, fg=self.FG,
+                                   insertbackground=self.FG, font=("Segoe UI", 9),
+                                   relief="flat", padx=10, pady=8, wrap="word")
+        self.prompt_text.pack(fill="x")
+        self.prompt_text.insert("1.0", cfg.get("initial_prompt", ""))
+
+    def _lang_pill(self, parent, code, name, idx):
+        sel = self.lang_var.get() == code
+        bg  = cfg["accent_color"] if sel else self.CARD
+        fg  = "#ffffff"           if sel else self.FG
+        brd = cfg["accent_color"] if sel else self.BORDER
+
+        col = idx % 4
+        row = idx // 4
+        cell = tk.Frame(parent, bg=self.BG)
+        cell.grid(row=row, column=col, padx=(0, 8), pady=(0, 8), sticky="w")
+
+        pill = tk.Label(cell, text=name, bg=bg, fg=fg,
+                        font=("Segoe UI", 9), padx=14, pady=6,
+                        cursor="hand2",
+                        highlightthickness=1, highlightbackground=brd)
+        pill.pack()
+
+        def _select(e=None, c=code):
+            self.lang_var.set(c)
+            self._build_language(self._scroll_frame)
+
+        pill.bind("<Button-1>", _select)
+        if not sel:
+            pill.bind("<Enter>", lambda e: pill.configure(bg="#f0f0f5"))
+            pill.bind("<Leave>", lambda e: pill.configure(bg=self.CARD))
+
+    # ── Tab: Appearance ───────────────────────────────────────────────────────
+
+    def _build_appearance(self, f):
+        self._section(f, "Accent Color")
+        tk.Label(f, text="Applied to the recording overlay and UI highlights",
+                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 8)).pack(anchor="w", padx=20, pady=(2, 8))
+        cf = tk.Frame(f, bg=self.BG); cf.pack(anchor="w", padx=20)
+        for name, hex_v in PALETTE.items():
+            self._color_swatch(cf, name, hex_v)
 
     def _color_swatch(self, parent, name, hex_v):
         sel  = self.color_var.get() == name
-        bord = hex_v if sel else "#1e1e1e"
-        f = tk.Frame(parent, bg=bord, padx=2, pady=2); f.pack(side="left", padx=(0,6))
-        btn = tk.Label(f, text=name, bg="#181818", fg=hex_v,
-                       font=("Segoe UI", 9), padx=10, pady=5, cursor="hand2")
-        btn.pack()
-        btn.bind("<Button-1>", lambda e, n=name: self._pick_color(n))
+        outer = tk.Frame(parent, bg=self.BG); outer.pack(side="left", padx=(0, 10))
 
-    def _pick_color(self, name):
-        self.color_var.set(name)
+        dot = tk.Canvas(outer, width=36, height=36, bg=self.BG, highlightthickness=0,
+                        cursor="hand2")
+        dot.pack()
+        dot.create_oval(4, 4, 32, 32, fill=hex_v, outline="")
+        if sel:
+            dot.create_oval(8, 8, 28, 28, fill="#ffffff", outline="")
+            dot.create_oval(13, 13, 23, 23, fill=hex_v, outline="")
+
+        tk.Label(outer, text=name, bg=self.BG, fg=self.FG2,
+                 font=("Segoe UI", 8)).pack()
+
+        def _pick(e=None, n=name):
+            self.color_var.set(n)
+            self._build_appearance(self._scroll_frame)
+        dot.bind("<Button-1>", _pick)
+
+    # ── Shared helpers ────────────────────────────────────────────────────────
+
+    def _section(self, parent, text):
+        tk.Label(parent, text=text.upper(), bg=self.BG, fg=self.FG2,
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=20, pady=(16, 0))
+        tk.Frame(parent, bg=self.BORDER, height=1).pack(fill="x", padx=20, pady=(4, 0))
+
+    def _tint(self, base, amt=0.05):
+        r = int(base[1:3], 16); g = int(base[3:5], 16); b = int(base[5:7], 16)
+        r = max(0, r - int(amt * 255)); g = max(0, g - int(amt * 255))
+        b = max(0, b - int(amt * 255))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _dim(self, hex_c, factor):
+        r = int(int(hex_c[1:3], 16) * factor)
+        g = int(int(hex_c[3:5], 16) * factor)
+        b = int(int(hex_c[5:7], 16) * factor)
+        return f"#{min(r,255):02x}{min(g,255):02x}{min(b,255):02x}"
 
     def _color_name(self):
         for n, h in PALETTE.items():
             if h == cfg["accent_color"]: return n
         return "Blue"
-
-    def _label(self, parent, text):
-        tk.Label(parent, text=text, bg=self.BG, fg=self.FG2,
-                 font=("Segoe UI", 8)).pack(anchor="w", padx=24, pady=(14,0))
-
-    def _sep(self, parent):
-        w = tk.Frame(parent, bg=self.SEP, height=1)
-        w.pack(fill="x", pady=(10,0))
-        return w
 
     # ── Hotkey capture ────────────────────────────────────────────────────────
 
@@ -1110,34 +1210,33 @@ class Settings:
                 "x2":     "Mouse Forward Button",
             }
             return f"🖱  {names.get(hk.split(':')[1], hk)}"
-        caps = {"ctrl":"Ctrl","alt":"Alt","shift":"Shift","win":"Win","super":"Super"}
-        parts = hk.split("+")
-        return " + ".join(caps.get(p, p.upper() if len(p) == 1 else p.capitalize()) for p in parts)
+        caps = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "win": "Win", "super": "Super"}
+        return " + ".join(caps.get(p, p.upper() if len(p) == 1 else p.capitalize())
+                          for p in hk.split("+"))
 
     def _start_capture(self):
         self._capturing_hotkey = True
         self.hotkey_badge.configure(
-            text="⌨  Press any key combo or mouse button…", fg="#888888")
+            text="⌨  Press any key combo or mouse button…", fg=self.FG2, bg="#fff8e1")
         self.win.focus_set()
 
     def _hk_keypress(self, event):
         if not self._capturing_hotkey:
             return
         key = event.keysym.lower()
-        if key in ("control_l","control_r","alt_l","alt_r","shift_l","shift_r",
-                   "super_l","super_r","meta_l","meta_r","caps_lock","num_lock"):
+        if key in ("control_l", "control_r", "alt_l", "alt_r", "shift_l", "shift_r",
+                   "super_l", "super_r", "meta_l", "meta_r", "caps_lock", "num_lock"):
             return
         if key == "escape":
             self._capturing_hotkey = False
             self.hotkey_badge.configure(
-                text=self._fmt_hotkey(self._captured_hotkey), fg=self.FG)
+                text=self._fmt_hotkey(self._captured_hotkey), fg=self.FG, bg=self.CARD)
             return
         mods = []
         if keyboard.is_pressed("ctrl"):  mods.append("ctrl")
         if keyboard.is_pressed("alt"):   mods.append("alt")
         if keyboard.is_pressed("shift"): mods.append("shift")
-        combo = "+".join(mods + [key])
-        self._hk_set(combo)
+        self._hk_set("+".join(mods + [key]))
 
     def _hk_mouse(self, event):
         if not self._capturing_hotkey:
@@ -1147,7 +1246,7 @@ class Settings:
     def _hk_set(self, combo):
         self._captured_hotkey  = combo
         self._capturing_hotkey = False
-        self.hotkey_badge.configure(text=self._fmt_hotkey(combo), fg=self.FG)
+        self.hotkey_badge.configure(text=self._fmt_hotkey(combo), fg=self.FG, bg=self.CARD)
 
     def _test_google(self):
         key = self.api_key_var.get().strip()
@@ -1155,39 +1254,36 @@ class Settings:
             self.test_result.set("⚠ No key entered")
             self.test_label.configure(fg="#f97316")
             return
-        self.test_result.set("Testing...")
-        self.test_label.configure(fg="#888888")
+        self.test_result.set("Testing…")
+        self.test_label.configure(fg=self.FG2)
         self.win.update()
 
         def _run():
             try:
-                # Send a minimal silent audio clip just to test auth
-                silence = b"\x00\x00" * 1600  # 0.1s of silence
+                silence = b"\x00\x00" * 1600
                 buf = io.BytesIO()
                 with wave.open(buf, "wb") as wf:
                     wf.setnchannels(1); wf.setsampwidth(2)
                     wf.setframerate(16000); wf.writeframes(silence)
                 audio_b64 = base64.b64encode(buf.getvalue()).decode()
                 payload = {
-                    "config": {"encoding":"LINEAR16","sampleRateHertz":16000,
-                               "languageCode":"en-US"},
-                    "audio":  {"content": audio_b64}
+                    "config": {"encoding": "LINEAR16", "sampleRateHertz": 16000,
+                               "languageCode": "en-US"},
+                    "audio":  {"content": audio_b64},
                 }
                 resp = requests.post(
                     f"https://speech.googleapis.com/v1/speech:recognize?key={key}",
-                    json=payload, timeout=10
+                    json=payload, timeout=10,
                 )
                 data = resp.json()
                 if resp.status_code == 200:
                     msg, col = "✓ Key works!", "#22c55e"
                 elif resp.status_code == 403:
-                    err = data.get("error", {}).get("message", "Forbidden")
-                    msg, col = f"✗ 403: {err}", "#ef4444"
+                    msg, col = f"✗ 403: {data.get('error',{}).get('message','Forbidden')}", "#ef4444"
                 elif resp.status_code == 400:
-                    err = data.get("error", {}).get("message", "Bad request")
-                    msg, col = f"✗ 400: {err}", "#ef4444"
+                    msg, col = f"✗ 400: {data.get('error',{}).get('message','Bad request')}", "#ef4444"
                 else:
-                    msg, col = f"✗ {resp.status_code}: {data}", "#ef4444"
+                    msg, col = f"✗ {resp.status_code}", "#ef4444"
             except Exception as e:
                 msg, col = f"✗ {e}", "#ef4444"
 
@@ -1204,7 +1300,9 @@ class Settings:
         cfg["accent_color"]   = PALETTE.get(self.color_var.get(), PALETTE["Blue"])
         cfg["backend"]        = self.backend_var.get()
         cfg["google_api_key"] = self.api_key_var.get().strip()
-        cfg["initial_prompt"] = self.prompt_text.get("1.0", tk.END).strip()
+        cfg["initial_prompt"] = self.prompt_text.get("1.0", tk.END).strip() \
+            if hasattr(self, "prompt_text") and self.prompt_text.winfo_exists() else \
+            cfg.get("initial_prompt", "")
         save_config(cfg)
 
         if old_hk != cfg["hotkey"]:
@@ -1212,7 +1310,7 @@ class Settings:
 
         threading.Thread(
             target=lambda: self.app.recorder.load_model(cfg["whisper_model"]),
-            daemon=True
+            daemon=True,
         ).start()
         self.win.destroy()
 
