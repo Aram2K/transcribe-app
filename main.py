@@ -1,24 +1,36 @@
-import sys, threading, time, json, math, wave, io, struct, webbrowser, socket
+import sys, threading, time, json, math, wave, io, struct, webbrowser, socket, queue, logging, hashlib
 import tkinter as tk
 from tkinter import ttk
+from urllib.parse import urlparse
 import psutil, pyaudio, numpy as np, keyboard, pyperclip, pystray, requests, base64, ctypes
 from PIL import Image, ImageDraw
 from pynput.keyboard import Controller, Key
 from pynput import mouse as pynput_mouse
 from faster_whisper import WhisperModel
+import storage
 import history as hist
 
 # ── Version ───────────────────────────────────────────────────────────────────
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
+RELEASES_MANIFEST_URL = "https://github.com/Aram2K/transcribe-app/releases/latest/download/update-manifest.json"
 
 SINGLE_INSTANCE_PORT = 47823   # localhost-only IPC for "open on second launch"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-CONFIG_PATH = "config.json"
+LOG_PATH = str(storage.path_for("transcribe.log"))
+logging.basicConfig(
+    filename=LOG_PATH,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("transcribe")
+
+CONFIG_PATH = str(storage.path_for("config.json"))
+LEGACY_CONFIG_PATH = "config.json"
 DEFAULT = {
     "hotkey":        "alt+r",
     "whisper_model": "base",
@@ -29,21 +41,43 @@ DEFAULT = {
     "backend":       "local",
     "google_api_key": "",
     "initial_prompt": "",
+    "input_device_index": None,
+    "silence_trigger_sec": 0.8,
+    "min_speech_sec": 1.5,
+    "max_speech_sec": 25.0,
     "onboarding_done": False,
     "dismissed_update_version": "",   # remember which update tag the user dismissed
     "tray_hint_shown": False,         # whether we've shown the "I live in your tray" hint
 }
 
+storage.migrate_legacy_file(LEGACY_CONFIG_PATH, CONFIG_PATH)
+
 def load_config():
-    try:
-        with open(CONFIG_PATH) as f:
-            return {**DEFAULT, **json.load(f)}
-    except (FileNotFoundError, json.JSONDecodeError, PermissionError):
-        return DEFAULT.copy()
+    data = storage.read_json(CONFIG_PATH, DEFAULT)
+    if not isinstance(data, dict):
+        data = {}
+    loaded = {**DEFAULT, **data}
+
+    key = (loaded.get("google_api_key") or "").strip()
+    if key:
+        if storage.write_secret(storage.GOOGLE_API_KEY_SECRET, key):
+            loaded["google_api_key"] = key
+            disk = {**loaded, "google_api_key": ""}
+            try:
+                storage.atomic_write_json(CONFIG_PATH, disk)
+            except OSError as e:
+                logger.warning("Could not sanitize API key in config: %s", e)
+    else:
+        loaded["google_api_key"] = storage.read_secret(storage.GOOGLE_API_KEY_SECRET)
+
+    return loaded
 
 def save_config(c):
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(c, f, indent=2)
+    disk = {**c}
+    key = (disk.get("google_api_key") or "").strip()
+    if storage.write_secret(storage.GOOGLE_API_KEY_SECRET, key):
+        disk["google_api_key"] = ""
+    storage.atomic_write_json(CONFIG_PATH, disk)
 
 cfg = load_config()
 
@@ -67,8 +101,9 @@ def acquire_single_instance_lock():
 def signal_running_instance(action="show_settings"):
     try:
         with socket.create_connection(("127.0.0.1", SINGLE_INSTANCE_PORT), timeout=1) as s:
+            s.settimeout(1)
             s.sendall(action.encode("utf-8"))
-        return True
+            return s.recv(32) == b"transcribe-ok"
     except OSError:
         return False
 
@@ -78,6 +113,8 @@ def start_ipc_server(server_sock, on_action):
             try:
                 conn, _ = server_sock.accept()
                 data = conn.recv(64).decode("utf-8", errors="ignore").strip()
+                if data in ("show_settings", "show_onboarding"):
+                    conn.sendall(b"transcribe-ok")
                 conn.close()
                 if data:
                     on_action(data)
@@ -153,6 +190,17 @@ SILENCE_TRIGGER_SEC = 0.8   # silence duration that triggers a transcription chu
 MIN_SPEECH_SEC      = 1.5   # minimum speech before a chunk is considered complete
 MAX_SPEECH_SEC      = 25    # force-flush chunk after this duration regardless
 
+def cfg_float(name, default, minimum=None, maximum=None):
+    try:
+        value = float(cfg.get(name, default))
+    except (TypeError, ValueError):
+        value = float(default)
+    if minimum is not None:
+        value = max(float(minimum), value)
+    if maximum is not None:
+        value = min(float(maximum), value)
+    return value
+
 class AudioRecorder:
     def __init__(self):
         self.recording        = False
@@ -173,6 +221,8 @@ class AudioRecorder:
         self._samples_in_chunk= 0
         self._session_lang    = None   # cached detected language for this recording
         self._chunk_threads   = []     # active background chunk threads
+        self._chunk_errors    = []
+        self._record_error    = ""
 
     def load_model(self, name=None):
         name = name or cfg["whisper_model"]
@@ -189,27 +239,40 @@ class AudioRecorder:
             self._chunk_results    = {}
             self._chunk_idx        = 0
             self._samples_in_chunk = 0
+            self._chunk_errors     = []
         self._session_lang  = None   # reset on each new recording
         self._chunk_threads = []     # reset thread list each session
-        self.stream = self.audio.open(
-            format=pyaudio.paFloat32, channels=1,
-            rate=cfg["sample_rate"], input=True,
-            frames_per_buffer=cfg["chunk_size"]
-        )
+        self._record_error  = ""
+        open_args = {
+            "format": pyaudio.paFloat32,
+            "channels": 1,
+            "rate": cfg["sample_rate"],
+            "input": True,
+            "frames_per_buffer": cfg["chunk_size"],
+        }
+        device_index = cfg.get("input_device_index")
+        if device_index not in (None, "", "default"):
+            open_args["input_device_index"] = int(device_index)
+        self.stream = self.audio.open(**open_args)
         threading.Thread(target=self._record, daemon=True).start()
 
     def _record(self):
         sr          = cfg["sample_rate"]
         frame_dur   = cfg["chunk_size"] / sr   # seconds per audio frame
+        silence_trigger_sec = cfg_float("silence_trigger_sec", SILENCE_TRIGGER_SEC, 0.2, 5.0)
+        min_speech_sec      = cfg_float("min_speech_sec", MIN_SPEECH_SEC, 0.2, 10.0)
+        max_speech_sec      = cfg_float("max_speech_sec", MAX_SPEECH_SEC, 2.0, 120.0)
 
         vad_buf      = []    # frames for the current utterance
         speech_sec   = 0.0
         silence_sec  = 0.0
         noise_hist   = []    # sliding window for adaptive noise floor
+        read_errors   = 0
 
         while self.recording:
             try:
                 data = self.stream.read(cfg["chunk_size"], exception_on_overflow=False)
+                read_errors = 0
                 self.frames.append(data)
 
                 arr = np.frombuffer(data, dtype=np.float32)
@@ -242,11 +305,11 @@ class AudioRecorder:
 
                 total_sec    = speech_sec + silence_sec
                 should_chunk = (
-                    (silence_sec >= SILENCE_TRIGGER_SEC and speech_sec >= MIN_SPEECH_SEC)
-                    or total_sec >= MAX_SPEECH_SEC
+                    (silence_sec >= silence_trigger_sec and speech_sec >= min_speech_sec)
+                    or total_sec >= max_speech_sec
                 )
 
-                if should_chunk and speech_sec >= MIN_SPEECH_SEC:
+                if should_chunk and speech_sec >= min_speech_sec:
                     with self._chunk_lock:
                         chunk_audio = np.frombuffer(
                             b"".join(vad_buf), dtype=np.float32).copy()
@@ -261,8 +324,14 @@ class AudioRecorder:
                     self._chunk_threads.append(t)
                     t.start()
 
-            except Exception:
-                pass
+            except Exception as e:
+                read_errors += 1
+                if read_errors >= 5:
+                    print(f"[Audio] Stopping after repeated read errors: {e}")
+                    self._record_error = f"!audio:{e}"
+                    self.recording = False
+                    break
+                time.sleep(0.05)
 
     def _transcribe_chunk(self, audio, idx):
         try:
@@ -270,6 +339,11 @@ class AudioRecorder:
                 text, lang = self._run_google(audio)
             else:
                 text, lang = self._run_local(audio)
+
+            if lang and lang.startswith("!"):
+                with self._chunk_lock:
+                    self._chunk_errors.append(lang)
+                return
 
             with self._chunk_lock:
                 self._chunk_results[idx] = text
@@ -284,6 +358,8 @@ class AudioRecorder:
                 self.on_lang_detected(lang, LANG_NAMES.get(lang, lang.upper()))
         except Exception as e:
             print(f"[Chunk {idx}] Transcription error: {e}")
+            with self._chunk_lock:
+                self._chunk_errors.append(f"!transcribe:{e}")
 
     def stop_recording(self):
         self.recording = False
@@ -313,6 +389,12 @@ class AudioRecorder:
             wait = max(0.0, deadline - time.time())
             if wait > 0:
                 t.join(timeout=wait)
+
+        if self._record_error:
+            return "", self._record_error
+        with self._chunk_lock:
+            if self._chunk_errors:
+                return "", self._chunk_errors[0]
 
         # Transcribe remaining (last partial chunk) then merge
         remaining = np.frombuffer(b"".join(self._chunk_frames), dtype=np.float32).copy()
@@ -479,6 +561,51 @@ class AudioRecorder:
             print(f"[Google] Exception: {e}")
             return "", f"!google:{e}"
 
+    def list_input_devices(self):
+        devices = []
+        try:
+            for i in range(self.audio.get_device_count()):
+                info = self.audio.get_device_info_by_index(i)
+                if int(info.get("maxInputChannels", 0)) > 0:
+                    devices.append({
+                        "index": i,
+                        "name": info.get("name", f"Input {i}"),
+                    })
+        except Exception as e:
+            logger.warning("Could not list input devices: %s", e)
+        return devices
+
+    def test_input_level(self, device_index=None, seconds=0.7):
+        stream = None
+        try:
+            open_args = {
+                "format": pyaudio.paFloat32,
+                "channels": 1,
+                "rate": cfg["sample_rate"],
+                "input": True,
+                "frames_per_buffer": cfg["chunk_size"],
+            }
+            if device_index not in (None, "", "default"):
+                open_args["input_device_index"] = int(device_index)
+            stream = self.audio.open(**open_args)
+            chunks = max(1, int(seconds * cfg["sample_rate"] / cfg["chunk_size"]))
+            levels = []
+            for _ in range(chunks):
+                data = stream.read(cfg["chunk_size"], exception_on_overflow=False)
+                arr = np.frombuffer(data, dtype=np.float32)
+                if len(arr):
+                    levels.append(float(np.sqrt(np.mean(arr ** 2))))
+            return max(levels) if levels else 0.0, ""
+        except Exception as e:
+            return 0.0, str(e)
+        finally:
+            if stream:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
+
     def shutdown(self):
         try:
             self.audio.terminate()
@@ -517,9 +644,33 @@ class Overlay:
         self._done_pasted = False
         self._done_error  = False
         self._hide_at     = None
+        self._ui_tasks    = queue.Queue()
 
         self.root.withdraw()
         self._loop()
+
+    def call_soon(self, func, *args, **kwargs):
+        self._ui_tasks.put((func, args, kwargs))
+
+    def _drain_ui_tasks(self):
+        while True:
+            try:
+                func, args, kwargs = self._ui_tasks.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                func(*args, **kwargs)
+            except Exception as e:
+                print(f"[UI] Task error: {e}")
+
+    def _has_child_windows(self):
+        for child in self.root.winfo_children():
+            try:
+                if child.winfo_exists() and child.winfo_toplevel() is child:
+                    return True
+            except Exception:
+                pass
+        return False
 
     def _pos(self):
         sw = self.root.winfo_screenwidth()
@@ -567,13 +718,16 @@ class Overlay:
         self._hide_at     = time.time() + 4.0
 
     def _loop(self):
+        self._drain_ui_tasks()
+
         if self._hide_at and time.time() >= self._hide_at:
             self._hide_at = None
             self._visible = False
 
         target      = 0.93 if self._visible else 0.0
         self._alpha += (target - self._alpha) * 0.3
-        if self._alpha < 0.02 and not self._visible:
+        keep_root_awake = self._has_child_windows()
+        if self._alpha < 0.02 and not self._visible and not keep_root_awake:
             self._alpha = 0.0
             self.root.withdraw()
         else:
@@ -720,10 +874,17 @@ class HistoryWindow:
     def __init__(self, root):
         self.root = root
         self.win  = None
+        self.search_var = None
+        self._list_outer = None
+        self._count_label = None
 
     def open(self):
+        self.root.deiconify()
         if self.win and self.win.winfo_exists():
-            self.win.lift(); return
+            self.win.deiconify()
+            self.win.lift()
+            self.win.focus_force()
+            return
 
         self.win = tk.Toplevel(self.root)
         self.win.title("History")
@@ -736,9 +897,13 @@ class HistoryWindow:
         apply_glass(self.win.winfo_id(), "#0f0f0ff5")
 
         self._build()
+        self.win.lift()
+        self.win.focus_force()
 
     def _build(self):
         w = self.win
+        for child in w.winfo_children():
+            child.destroy()
         entries = hist.load()
 
         # Header
@@ -746,13 +911,26 @@ class HistoryWindow:
         hdr.pack(fill="x", padx=20, pady=(18, 6))
         tk.Label(hdr, text="History", bg=self.BG, fg=self.FG,
                  font=("Segoe UI Semibold", 16)).pack(side="left")
-        tk.Label(hdr, text=f"  {len(entries)} entries",
-                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 9)).pack(side="left", pady=4)
+        self._count_label = tk.Label(hdr, text=f"  {len(entries)} entries",
+                                     bg=self.BG, fg=self.FG2, font=("Segoe UI", 9))
+        self._count_label.pack(side="left", pady=4)
 
         if entries:
-            tk.Button(hdr, text="Clear all", command=self._clear,
-                      bg=self.BG, fg="#555555", activebackground=self.BG,
-                      font=("Segoe UI", 9), relief="flat", cursor="hand2").pack(side="right")
+            for label, cmd in [
+                ("Clear all", self._clear),
+                ("Export TXT", lambda: self._export("txt")),
+                ("Export CSV", lambda: self._export("csv")),
+            ]:
+                tk.Button(hdr, text=label, command=cmd,
+                          bg=self.BG, fg="#555555", activebackground=self.BG,
+                          font=("Segoe UI", 9), relief="flat", cursor="hand2").pack(side="right", padx=(8, 0))
+
+            self.search_var = tk.StringVar(value=self.search_var.get() if self.search_var else "")
+            search_box = tk.Entry(w, textvariable=self.search_var, bg="#171717", fg=self.FG,
+                                  insertbackground=self.FG, relief="flat",
+                                  font=("Segoe UI", 10))
+            search_box.pack(fill="x", padx=20, pady=(4, 10), ipady=7)
+            search_box.bind("<KeyRelease>", lambda e: self._render_entries())
 
         tk.Frame(w, bg=self.SEP, height=1).pack(fill="x")
 
@@ -763,10 +941,44 @@ class HistoryWindow:
             return
 
         # Scrollable list
-        outer = tk.Frame(w, bg=self.BG)
-        outer.pack(fill="both", expand=True)
-        canvas = tk.Canvas(outer, bg=self.BG, highlightthickness=0)
-        sb = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        self._list_outer = tk.Frame(w, bg=self.BG)
+        self._list_outer.pack(fill="both", expand=True)
+        self._render_entries()
+
+    def _filtered_entries(self):
+        query = self.search_var.get() if self.search_var else ""
+        query = (query or "").strip().lower()
+        pairs = list(enumerate(hist.load()))
+        if not query:
+            return pairs
+        return [
+            (i, e) for i, e in pairs
+            if query in e.get("text", "").lower()
+            or query in e.get("language", "").lower()
+            or query in e.get("backend", "").lower()
+            or query in e.get("timestamp", "").lower()
+        ]
+
+    def _render_entries(self):
+        if not self._list_outer or not self._list_outer.winfo_exists():
+            return
+        for child in self._list_outer.winfo_children():
+            child.destroy()
+
+        entries = self._filtered_entries()
+        total = len(hist.load())
+        if self._count_label and self._count_label.winfo_exists():
+            suffix = f"  {len(entries)} of {total} entries" if len(entries) != total else f"  {total} entries"
+            self._count_label.configure(text=suffix)
+
+        if not entries:
+            tk.Label(self._list_outer, text="No matches.",
+                     bg=self.BG, fg=self.FG2,
+                     font=("Segoe UI", 11)).pack(expand=True)
+            return
+
+        canvas = tk.Canvas(self._list_outer, bg=self.BG, highlightthickness=0)
+        sb = tk.Scrollbar(self._list_outer, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
@@ -778,14 +990,14 @@ class HistoryWindow:
             canvas.itemconfig(fw, width=canvas.winfo_width())
         frame.bind("<Configure>", _resize)
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(fw, width=e.width))
-        w.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+        self.win.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
 
-        for i, entry in enumerate(entries):
-            self._entry_card(frame, entry, i)
+        for display_idx, (original_idx, entry) in enumerate(entries):
+            self._entry_card(frame, entry, original_idx, display_idx)
 
-    def _entry_card(self, parent, entry, idx):
+    def _entry_card(self, parent, entry, original_idx, display_idx):
         card = tk.Frame(parent, bg=self.CARD, padx=16, pady=12)
-        card.pack(fill="x", padx=12, pady=(8 if idx == 0 else 0, 0))
+        card.pack(fill="x", padx=12, pady=(8 if display_idx == 0 else 0, 0))
 
         # Top row: timestamp + language + backend
         top = tk.Frame(card, bg=self.CARD)
@@ -804,6 +1016,11 @@ class HistoryWindow:
                              font=("Segoe UI", 8), relief="flat", padx=8, pady=2,
                              cursor="hand2")
         copy_btn.pack(side="right")
+        delete_btn = tk.Button(top, text="Delete", command=lambda idx=original_idx: self._delete(idx),
+                               bg="#1e1e1e", fg="#888888", activebackground="#2a2a2a",
+                               font=("Segoe UI", 8), relief="flat", padx=8, pady=2,
+                               cursor="hand2")
+        delete_btn.pack(side="right", padx=(0, 6))
 
         # Text
         tk.Label(card, text=entry["text"], bg=self.CARD, fg=self.FG,
@@ -812,10 +1029,39 @@ class HistoryWindow:
 
         tk.Frame(parent, bg=self.SEP, height=1).pack(fill="x", padx=12)
 
+    def _delete(self, idx):
+        hist.delete(idx)
+        self._render_entries()
+
+    def _export(self, kind):
+        from tkinter import filedialog, messagebox
+        if kind == "csv":
+            path = filedialog.asksaveasfilename(
+                parent=self.win,
+                title="Export history as CSV",
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv")],
+            )
+            if path:
+                count = hist.export_csv(path)
+                messagebox.showinfo("History exported", f"Exported {count} entries.", parent=self.win)
+        else:
+            path = filedialog.asksaveasfilename(
+                parent=self.win,
+                title="Export history as text",
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt")],
+            )
+            if path:
+                count = hist.export_txt(path)
+                messagebox.showinfo("History exported", f"Exported {count} entries.", parent=self.win)
+
     def _clear(self):
+        from tkinter import messagebox
+        if not messagebox.askyesno("Clear history", "Delete all transcription history?", parent=self.win):
+            return
         hist.clear()
-        self.win.destroy()
-        self.win = None
+        self._build()
 
 # ── Settings Window ───────────────────────────────────────────────────────────
 
@@ -847,8 +1093,12 @@ class Settings:
         self._tab_btns    = []
 
     def open(self):
+        self.root.deiconify()
         if self.win and self.win.winfo_exists():
-            self.win.lift(); return
+            self.win.deiconify()
+            self.win.lift()
+            self.win.focus_force()
+            return
 
         win = tk.Toplevel(self.root)
         self.win = win
@@ -861,6 +1111,8 @@ class Settings:
         win.update_idletasks()
 
         self._build(win)
+        win.lift()
+        win.focus_force()
 
     def _build(self, win):
         # ── Title bar ─────────────────────────────────────────────────────────
@@ -912,8 +1164,15 @@ class Settings:
         self.model_var   = tk.StringVar(value=cfg["whisper_model"])
         self.lang_var    = tk.StringVar(value=cfg["language"])
         self.color_var   = tk.StringVar(value=self._color_name())
+        self.device_var  = tk.StringVar(value="Default microphone")
+        self.mic_result  = tk.StringVar(value="")
+        self.silence_var = tk.StringVar(value=str(cfg.get("silence_trigger_sec", DEFAULT["silence_trigger_sec"])))
+        self.min_speech_var = tk.StringVar(value=str(cfg.get("min_speech_sec", DEFAULT["min_speech_sec"])))
+        self.max_speech_var = tk.StringVar(value=str(cfg.get("max_speech_sec", DEFAULT["max_speech_sec"])))
         self._captured_hotkey  = cfg["hotkey"]
         self._capturing_hotkey = False
+        self._device_map = {}
+        self._prompt_value = cfg.get("initial_prompt", "")
 
         self.test_result = tk.StringVar(value="")
 
@@ -940,6 +1199,7 @@ class Settings:
     # ── Tab switching ─────────────────────────────────────────────────────────
 
     def _switch_tab(self, idx):
+        self._capture_prompt()
         self._active_tab = idx
         # Update tab button styles
         for i, btn in enumerate(self._tab_btns):
@@ -958,6 +1218,14 @@ class Settings:
         [self._build_general, self._build_model,
          self._build_language, self._build_appearance][idx](self._scroll_frame)
         self._canvas.yview_moveto(0)
+
+    def _capture_prompt(self):
+        if hasattr(self, "prompt_text"):
+            try:
+                if self.prompt_text.winfo_exists():
+                    self._prompt_value = self.prompt_text.get("1.0", tk.END).strip()
+            except Exception:
+                pass
 
     # ── Tab: General ──────────────────────────────────────────────────────────
 
@@ -989,6 +1257,12 @@ class Settings:
         self.hotkey_badge.bind("<Button-1>", lambda e: self._start_capture())
         self.hotkey_badge.bind("<Enter>", lambda e: self.hotkey_badge.configure(bg="#f0f0f5"))
         self.hotkey_badge.bind("<Leave>", lambda e: self.hotkey_badge.configure(bg=self.CARD))
+
+        self._section(f, "Microphone")
+        self._build_microphone_section(f)
+
+        self._section(f, "Silence Detection")
+        self._build_silence_section(f)
 
     def _render_backend_cards(self):
         """Rebuild ONLY the backend cards section. Avoids full-tab redraw flicker."""
@@ -1064,6 +1338,89 @@ class Settings:
             self.google_section.pack(fill="x")
         else:
             self.google_section.pack_forget()
+
+    def _build_microphone_section(self, parent):
+        box = tk.Frame(parent, bg=self.CARD, highlightthickness=1, highlightbackground=self.BORDER)
+        box.pack(fill="x", padx=20, pady=(4, 10))
+
+        row = tk.Frame(box, bg=self.CARD)
+        row.pack(fill="x", padx=12, pady=(10, 6))
+
+        choices = self._load_device_choices()
+        menu = tk.OptionMenu(row, self.device_var, *choices)
+        menu.configure(bg=self.CARD, fg=self.FG, activebackground="#f0f0f5",
+                       relief="flat", highlightthickness=0, font=("Segoe UI", 9))
+        menu.pack(side="left", fill="x", expand=True)
+
+        test_btn = tk.Label(row, text="Test Mic", bg="#efefef", fg=self.FG,
+                            font=("Segoe UI", 9), padx=12, pady=5, cursor="hand2")
+        test_btn.pack(side="right", padx=(8, 0))
+        test_btn.bind("<Button-1>", lambda e: self._test_microphone())
+        test_btn.bind("<Enter>", lambda e: test_btn.configure(bg="#e0e0e8"))
+        test_btn.bind("<Leave>", lambda e: test_btn.configure(bg="#efefef"))
+
+        self.mic_label = tk.Label(box, textvariable=self.mic_result, bg=self.CARD, fg=self.FG2,
+                                  font=("Segoe UI", 8), anchor="w")
+        self.mic_label.pack(fill="x", padx=14, pady=(0, 10))
+
+    def _load_device_choices(self):
+        self._device_map = {"Default microphone": None}
+        current = cfg.get("input_device_index")
+        selected = "Default microphone"
+        for device in self.app.recorder.list_input_devices():
+            label = f"{device['index']}: {device['name']}"
+            self._device_map[label] = device["index"]
+            try:
+                if current not in (None, "", "default") and int(current) == int(device["index"]):
+                    selected = label
+            except (TypeError, ValueError):
+                selected = "Default microphone"
+        choices = list(self._device_map.keys())
+        self.device_var.set(selected if selected in self._device_map else choices[0])
+        return choices
+
+    def _build_silence_section(self, parent):
+        box = tk.Frame(parent, bg=self.CARD, highlightthickness=1, highlightbackground=self.BORDER)
+        box.pack(fill="x", padx=20, pady=(4, 16))
+        for label, var, hint in [
+            ("Stop after silence", self.silence_var, "seconds"),
+            ("Minimum speech", self.min_speech_var, "seconds"),
+            ("Force chunk after", self.max_speech_var, "seconds"),
+        ]:
+            row = tk.Frame(box, bg=self.CARD)
+            row.pack(fill="x", padx=14, pady=(10 if label == "Stop after silence" else 2, 8))
+            tk.Label(row, text=label, bg=self.CARD, fg=self.FG,
+                     font=("Segoe UI", 9)).pack(side="left")
+            tk.Label(row, text=hint, bg=self.CARD, fg=self.FG2,
+                     font=("Segoe UI", 8)).pack(side="right", padx=(6, 0))
+            tk.Entry(row, textvariable=var, bg="#f8f8fb", fg=self.FG,
+                     insertbackground=self.FG, relief="flat", width=8,
+                     justify="right", font=("Segoe UI", 9)).pack(side="right")
+
+    def _selected_device_index(self):
+        return self._device_map.get(self.device_var.get())
+
+    def _test_microphone(self):
+        self.mic_result.set("Listening…")
+        device_index = self._selected_device_index()
+
+        def _run():
+            level, err = self.app.recorder.test_input_level(device_index)
+            if err:
+                msg, col = f"✕ {err}", "#ef4444"
+            elif level > 0.01:
+                msg, col = "✓ Microphone is receiving audio", "#22c55e"
+            else:
+                msg, col = "No clear signal detected", "#f97316"
+
+            def _apply():
+                if self.win and self.win.winfo_exists():
+                    self.mic_result.set(msg)
+                    if hasattr(self, "mic_label") and self.mic_label.winfo_exists():
+                        self.mic_label.configure(fg=col)
+            self.app.overlay.call_soon(_apply)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # ── Tab: Model ────────────────────────────────────────────────────────────
 
@@ -1202,7 +1559,7 @@ class Settings:
                                    insertbackground=self.FG, font=("Segoe UI", 9),
                                    relief="flat", padx=10, pady=8, wrap="word")
         self.prompt_text.pack(fill="x")
-        self.prompt_text.insert("1.0", cfg.get("initial_prompt", ""))
+        self.prompt_text.insert("1.0", self._prompt_value)
 
     def _render_lang_pills(self):
         for w in self._lang_pills_frame.winfo_children():
@@ -1350,6 +1707,26 @@ class Settings:
         self._capturing_hotkey = False
         self.hotkey_badge.configure(text=self._fmt_hotkey(combo), fg=self.FG, bg=self.CARD)
 
+    def _hotkey_error(self, combo):
+        combo = (combo or "").strip().lower()
+        if combo in ("enter", "return", "esc", "escape"):
+            return "Enter and Esc are reserved while recording."
+        if combo in ("mouse:left", "mouse:right"):
+            return "Left and right mouse buttons would trigger constantly during normal clicking."
+        parts = [p for p in combo.split("+") if p]
+        if len(parts) == 1 and len(parts[0]) == 1 and parts[0].isalnum():
+            return "Use a modifier such as Ctrl, Alt, or Shift with single-letter hotkeys."
+        return ""
+
+    def _float_setting(self, var, label, default, minimum, maximum):
+        try:
+            value = float(var.get())
+        except (TypeError, ValueError):
+            raise ValueError(f"{label} must be a number.")
+        if value < minimum or value > maximum:
+            raise ValueError(f"{label} must be between {minimum:g} and {maximum:g} seconds.")
+        return value
+
     def _test_google(self):
         key = self.api_key_var.get().strip()
         if not key:
@@ -1389,31 +1766,60 @@ class Settings:
             except Exception as e:
                 msg, col = f"✗ {e}", "#ef4444"
 
-            self.win.after(0, lambda: self.test_result.set(msg))
-            self.win.after(0, lambda: self.test_label.configure(fg=col))
+            def _apply():
+                if self.win and self.win.winfo_exists():
+                    self.test_result.set(msg)
+                    self.test_label.configure(fg=col)
+            self.app.overlay.call_soon(_apply)
 
         threading.Thread(target=_run, daemon=True).start()
 
     def _save(self):
+        self._capture_prompt()
+        hotkey_error = self._hotkey_error(self._captured_hotkey or cfg["hotkey"])
+        if hotkey_error:
+            from tkinter import messagebox
+            messagebox.showwarning("Hotkey not saved", hotkey_error, parent=self.win)
+            return
+
+        try:
+            silence_trigger = self._float_setting(self.silence_var, "Stop after silence", 0.8, 0.2, 5.0)
+            min_speech = self._float_setting(self.min_speech_var, "Minimum speech", 1.5, 0.2, 10.0)
+            max_speech = self._float_setting(self.max_speech_var, "Force chunk after", 25.0, 2.0, 120.0)
+        except ValueError as e:
+            from tkinter import messagebox
+            messagebox.showwarning("Recording setting not saved", str(e), parent=self.win)
+            return
+
         old_hk = cfg["hotkey"]
-        cfg["hotkey"]         = self._captured_hotkey or cfg["hotkey"]
+        new_hk = self._captured_hotkey or cfg["hotkey"]
+        if old_hk != new_hk and not self.app._setup_hotkey(new_hk, remove_old=old_hk):
+            from tkinter import messagebox
+            messagebox.showwarning(
+                "Hotkey not saved",
+                "Transcribe could not register that hotkey. Please choose another one.",
+                parent=self.win,
+            )
+            return
+
+        cfg["hotkey"]         = new_hk
         cfg["whisper_model"]  = self.model_var.get()
         cfg["language"]       = self.lang_var.get()
         cfg["accent_color"]   = PALETTE.get(self.color_var.get(), PALETTE["Blue"])
         cfg["backend"]        = self.backend_var.get()
         cfg["google_api_key"] = self.api_key_var.get().strip()
-        cfg["initial_prompt"] = self.prompt_text.get("1.0", tk.END).strip() \
-            if hasattr(self, "prompt_text") and self.prompt_text.winfo_exists() else \
-            cfg.get("initial_prompt", "")
+        cfg["initial_prompt"] = self._prompt_value
+        cfg["input_device_index"] = self._selected_device_index()
+        cfg["silence_trigger_sec"] = silence_trigger
+        cfg["min_speech_sec"] = min_speech
+        cfg["max_speech_sec"] = max_speech
         save_config(cfg)
 
-        if old_hk != cfg["hotkey"]:
-            self.app._setup_hotkey(cfg["hotkey"], remove_old=old_hk)
-
-        threading.Thread(
-            target=lambda: self.app.recorder.load_model(cfg["whisper_model"]),
-            daemon=True,
-        ).start()
+        if cfg["backend"] == "local":
+            threading.Thread(
+                target=lambda: self.app.recorder.load_model(cfg["whisper_model"]),
+                daemon=True,
+            ).start()
         self.win.destroy()
 
 # ── Onboarding (first-run welcome) ────────────────────────────────────────────
@@ -1768,18 +2174,42 @@ class Onboarding:
         b = int(int(hex_c[5:7],16)*factor)
         return f"#{r:02x}{g:02x}{b:02x}"
 
+    def _hotkey_error(self, combo):
+        combo = (combo or "").strip().lower()
+        if combo in ("enter", "return", "esc", "escape"):
+            return "Enter and Esc are reserved while recording."
+        if combo in ("mouse:left", "mouse:right"):
+            return "Left and right mouse buttons would trigger constantly during normal clicking."
+        parts = [p for p in combo.split("+") if p]
+        if len(parts) == 1 and len(parts[0]) == 1 and parts[0].isalnum():
+            return "Use a modifier such as Ctrl, Alt, or Shift with single-letter hotkeys."
+        return ""
+
     def _finish(self):
+        hotkey_error = self._hotkey_error(self._hotkey)
+        if hotkey_error:
+            from tkinter import messagebox
+            messagebox.showwarning("Hotkey not saved", hotkey_error, parent=self.win)
+            return
+
         old_hk = cfg["hotkey"]
         old_model = cfg.get("whisper_model", "base")
+        if old_hk != self._hotkey and not self.app._setup_hotkey(self._hotkey, remove_old=old_hk):
+            from tkinter import messagebox
+            messagebox.showwarning(
+                "Hotkey not saved",
+                "Transcribe could not register that hotkey. Please choose another one.",
+                parent=self.win,
+            )
+            return
+
         cfg["hotkey"]          = self._hotkey
         cfg["language"]        = self._lang.get()
         cfg["backend"]         = self._backend.get()
         cfg["whisper_model"]   = self._model.get()
         cfg["onboarding_done"] = True
         save_config(cfg)
-        if old_hk != cfg["hotkey"]:
-            self.app._setup_hotkey(cfg["hotkey"], remove_old=old_hk)
-        if old_model != cfg["whisper_model"]:
+        if old_model != cfg["whisper_model"] and cfg["backend"] == "local":
             threading.Thread(
                 target=lambda: self.app.recorder.load_model(cfg["whisper_model"]),
                 daemon=True).start()
@@ -1816,7 +2246,6 @@ class App:
         self._setup_hotkey(cfg["hotkey"])
         keyboard.add_hotkey("enter", self._on_enter)
         keyboard.add_hotkey("esc",   self._on_escape)
-        threading.Thread(target=self.recorder.load_model, daemon=True).start()
 
     def show_tray_hint(self, title, message):
         """Send a Windows tray balloon. Used post-onboarding so users know
@@ -1840,45 +2269,58 @@ class App:
                           for p in hk.split("+"))
 
     def _setup_hotkey(self, hotkey, remove_old=None):
-        if remove_old:
+        old_listener = self._mouse_listener
+        try:
+            if hotkey.startswith("mouse:"):
+                btn_map = {
+                    "middle": pynput_mouse.Button.middle,
+                    "left":   pynput_mouse.Button.left,
+                    "right":  pynput_mouse.Button.right,
+                    "x1":     pynput_mouse.Button.x1,
+                    "x2":     pynput_mouse.Button.x2,
+                }
+                target = btn_map.get(hotkey.split(":")[1], pynput_mouse.Button.middle)
+                def _on_click(x, y, btn, pressed):
+                    if pressed and btn == target:
+                        self._on_hotkey()
+                new_listener = pynput_mouse.Listener(on_click=_on_click)
+                new_listener.daemon = True
+                new_listener.start()
+                self._mouse_listener = new_listener
+            else:
+                keyboard.add_hotkey(hotkey, self._on_hotkey)
+        except Exception as e:
+            logger.warning("Could not register hotkey %s: %s", hotkey, e)
+            return False
+
+        if remove_old and remove_old != hotkey:
             if remove_old.startswith("mouse:"):
-                if self._mouse_listener:
-                    self._mouse_listener.stop()
-                    self._mouse_listener = None
+                if old_listener:
+                    try: old_listener.stop()
+                    except Exception: pass
+                    if self._mouse_listener is old_listener:
+                        self._mouse_listener = None
             else:
                 try: keyboard.remove_hotkey(remove_old)
-                except: pass
+                except Exception: pass
+        elif old_listener and hotkey.startswith("mouse:") and old_listener is not self._mouse_listener:
+            try: old_listener.stop()
+            except Exception: pass
 
-        if hotkey.startswith("mouse:"):
-            btn_map = {
-                "middle": pynput_mouse.Button.middle,
-                "left":   pynput_mouse.Button.left,
-                "right":  pynput_mouse.Button.right,
-                "x1":     pynput_mouse.Button.x1,
-                "x2":     pynput_mouse.Button.x2,
-            }
-            target = btn_map.get(hotkey.split(":")[1], pynput_mouse.Button.middle)
-            def _on_click(x, y, btn, pressed):
-                if pressed and btn == target:
-                    self._on_hotkey()
-            self._mouse_listener = pynput_mouse.Listener(on_click=_on_click)
-            self._mouse_listener.daemon = True
-            self._mouse_listener.start()
-        else:
-            keyboard.add_hotkey(hotkey, self._on_hotkey)
+        return True
 
     def _on_levels(self, levels):
-        self.overlay.root.after(0, lambda: self.overlay.update_levels(levels))
+        self.overlay.call_soon(self.overlay.update_levels, levels)
 
     def _on_lang(self, code, name):
-        self.overlay.root.after(0, lambda: self.overlay.set_lang(name))
+        self.overlay.call_soon(self.overlay.set_lang, name)
 
     def _on_partial(self, text):
-        self.overlay.root.after(0, lambda: self.overlay.set_partial(text))
+        self.overlay.call_soon(self.overlay.set_partial, text)
 
     def _on_hotkey(self):
         if not self.is_rec:
-            self.overlay.root.after(0, self._start)
+            self.overlay.call_soon(self._start)
         else:
             threading.Thread(target=self._stop, daemon=True).start()
 
@@ -1891,28 +2333,41 @@ class App:
             threading.Thread(target=self._cancel, daemon=True).start()
 
     def _start(self):
-        self.is_rec = True
-        self.overlay._partial = ""
-        self.overlay.show(RECORDING)
-        self.recorder.start_recording()
+        if self.is_rec:
+            return
+        try:
+            self.is_rec = True
+            self.overlay._partial = ""
+            self.overlay.show(RECORDING)
+            self.recorder.start_recording()
+            if cfg["backend"] == "local":
+                threading.Thread(
+                    target=self.recorder.load_model,
+                    daemon=True,
+                ).start()
+        except Exception as e:
+            self.is_rec = False
+            self.overlay.show_error(f"Microphone error: {e}")
 
     def _cancel(self):
         self.recorder.stop_recording()
         self.is_rec = False
-        self.overlay.root.after(0, self.overlay.hide)
+        self.overlay.call_soon(self.overlay.hide)
 
     def _stop(self):
         self.recorder.stop_recording()
-        self.overlay.root.after(0, lambda: self.overlay.set_state(TRANSCRIBING))
+        self.overlay.call_soon(self.overlay.set_state, TRANSCRIBING)
         text, lang = self.recorder.transcribe()
         self.is_rec = False
 
         if not text:
-            if lang and lang.startswith("!google:"):
-                err_msg = lang[8:]          # strip "!google:" prefix
-                self.overlay.root.after(0, lambda m=err_msg: self.overlay.show_error(m))
+            if lang and lang.startswith("!"):
+                err_msg = lang[1:]
+                if ":" in err_msg:
+                    err_msg = err_msg.split(":", 1)[1]
+                self.overlay.call_soon(self.overlay.show_error, err_msg)
             else:
-                self.overlay.root.after(0, self.overlay.hide)
+                self.overlay.call_soon(self.overlay.hide)
             return
 
         hist.save_entry(text, lang, cfg["backend"])
@@ -1929,13 +2384,13 @@ class App:
         except Exception as e:
             print(f"[Paste] Error: {e}")
 
-        self.overlay.root.after(0, lambda: self.overlay.show_done(pasted))
+        self.overlay.call_soon(self.overlay.show_done, pasted)
 
     def open_settings(self):
-        self.overlay.root.after(0, self.settings.open)
+        self.overlay.call_soon(self.settings.open)
 
     def open_history(self):
-        self.overlay.root.after(0, self.history.open)
+        self.overlay.call_soon(self.history.open)
 
     def shutdown(self):
         if self._mouse_listener:
@@ -1952,37 +2407,119 @@ def _parse_version(v):
     except Exception:
         return (0, 0, 0)
 
-def check_for_update(on_update_found):
-    """Background check. Calls on_update_found(tag, installer_url, body)
-    only if a newer version exists AND the user hasn't dismissed that exact tag."""
+def _trusted_update_url(url):
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme == "https" and parsed.netloc.lower() == "github.com"
+    except Exception:
+        return False
+
+def _sha256_from_checksum_text(text):
+    for token in (text or "").replace("\r", " ").replace("\n", " ").split():
+        token = token.strip()
+        if len(token) == 64 and all(c in "0123456789abcdefABCDEF" for c in token):
+            return token.lower()
+    return ""
+
+def _asset_url(data, wanted_name):
+    wanted = wanted_name.lower()
+    for asset in data.get("assets", []):
+        if asset.get("name", "").lower() == wanted:
+            return asset.get("browser_download_url")
+    return None
+
+def _update_info_from_manifest(manifest, ignore_dismissed=False):
+    tag = manifest.get("tag") or f"v{manifest.get('version', '')}"
+    version = manifest.get("version") or tag
+    if not tag or _parse_version(version) <= _parse_version(APP_VERSION):
+        return None
+    if not ignore_dismissed and cfg.get("dismissed_update_version") == tag:
+        return None
+
+    windows = manifest.get("windows", {})
+    installer = windows.get("installer", {})
+    return {
+        "tag": tag,
+        "installer_url": installer.get("url"),
+        "checksum_url": installer.get("sha256_url"),
+        "checksum": installer.get("sha256", ""),
+        "body": manifest.get("notes", ""),
+        "source": "manifest",
+    }
+
+def _update_info_from_release(data, ignore_dismissed=False):
+    latest = data.get("tag_name", "")
+    if _parse_version(latest) <= _parse_version(APP_VERSION):
+        return None
+    if not ignore_dismissed and cfg.get("dismissed_update_version") == latest:
+        return None
+
+    installer_url = None
+    installer_name = ""
+    preferred = _asset_url(data, "TranscribeApp-Windows-Setup.exe")
+    if preferred:
+        installer_url = preferred
+        installer_name = "transcribeapp-windows-setup.exe"
+    else:
+        for asset in data.get("assets", []):
+            name = asset.get("name", "").lower()
+            if "setup" in name and name.endswith(".exe"):
+                installer_url = asset.get("browser_download_url")
+                installer_name = name
+                break
+
+    checksum_url = None
+    if installer_name:
+        checksum_url = (
+            _asset_url(data, f"{installer_name}.sha256")
+            or _asset_url(data, f"{installer_name}.sha256sum")
+        )
+
+    return {
+        "tag": latest,
+        "installer_url": installer_url,
+        "checksum_url": checksum_url,
+        "checksum": "",
+        "body": data.get("body", "") or "",
+        "source": "api",
+    }
+
+def fetch_update_info(ignore_dismissed=False):
+    try:
+        manifest_resp = requests.get(RELEASES_MANIFEST_URL, timeout=5)
+        if manifest_resp.status_code == 200:
+            info = _update_info_from_manifest(manifest_resp.json(), ignore_dismissed=ignore_dismissed)
+            if info:
+                return info
+    except Exception as e:
+        logger.info("Release manifest unavailable, falling back to API: %s", e)
+
+    resp = requests.get(RELEASES_API,
+                        headers={"Accept": "application/vnd.github+json"},
+                        timeout=8)
+    if resp.status_code != 200:
+        raise RuntimeError(f"GitHub returned {resp.status_code}")
+    return _update_info_from_release(resp.json(), ignore_dismissed=ignore_dismissed)
+
+def check_for_update(on_update_found, on_no_update=None, on_error=None, ignore_dismissed=False):
+    """Background check. Calls on_update_found(info) only when a newer version exists."""
     def _run():
         try:
-            resp = requests.get(RELEASES_API,
-                                headers={"Accept": "application/vnd.github+json"},
-                                timeout=8)
-            if resp.status_code != 200:
-                return
-            data = resp.json()
-            latest = data.get("tag_name", "")
-            if _parse_version(latest) <= _parse_version(APP_VERSION):
-                return  # already on latest or newer
-            if cfg.get("dismissed_update_version") == latest:
-                return  # user explicitly dismissed this exact version
-            installer_url = None
-            for asset in data.get("assets", []):
-                name = asset.get("name", "").lower()
-                if "setup" in name and name.endswith(".exe"):
-                    installer_url = asset.get("browser_download_url")
-                    break
-            body = data.get("body", "") or ""
-            on_update_found(latest, installer_url, body)
-        except Exception:
-            pass
+            info = fetch_update_info(ignore_dismissed=ignore_dismissed)
+            if info:
+                on_update_found(info)
+            elif on_no_update:
+                on_no_update()
+        except Exception as e:
+            logger.warning("Update check failed: %s", e)
+            if on_error:
+                on_error(e)
     threading.Thread(target=_run, daemon=True).start()
 
 def show_changelog_window(root, tag, body):
     """Lightweight window listing what's new in a release. Body is GitHub markdown
     (we render as plain text — links visible as URLs)."""
+    root.deiconify()
     win = tk.Toplevel(root)
     win.title(f"What's new in {tag}")
     win.configure(bg="#f5f5f7")
@@ -2018,12 +2555,16 @@ def show_changelog_window(root, tag, body):
     close.bind("<Enter>", lambda e: close.configure(bg="#e0e0e8"))
     close.bind("<Leave>", lambda e: close.configure(bg="#efefef"))
 
-def download_and_install_update(installer_url, on_progress=None, on_done=None, on_error=None):
+def download_and_install_update(installer_url, checksum_url=None, expected_sha256=None,
+                                on_progress=None, on_done=None, on_error=None):
     """Download installer to temp and launch it with silent flags. App exits when launched."""
     def _run():
         try:
             import tempfile, os, subprocess
+            if not _trusted_update_url(installer_url):
+                raise ValueError("Untrusted update URL")
             tmp = os.path.join(tempfile.gettempdir(), "TranscribeApp-Setup.exe")
+            digest = hashlib.sha256()
             with requests.get(installer_url, stream=True, timeout=60) as r:
                 r.raise_for_status()
                 total = int(r.headers.get("Content-Length", 0))
@@ -2032,9 +2573,23 @@ def download_and_install_update(installer_url, on_progress=None, on_done=None, o
                     for chunk in r.iter_content(chunk_size=64 * 1024):
                         if chunk:
                             f.write(chunk)
+                            digest.update(chunk)
                             got += len(chunk)
                             if on_progress and total:
                                 on_progress(got, total)
+            expected = (expected_sha256 or "").strip().lower()
+            if checksum_url:
+                if not _trusted_update_url(checksum_url):
+                    raise ValueError("Untrusted checksum URL")
+                check_resp = requests.get(checksum_url, timeout=15)
+                check_resp.raise_for_status()
+                expected = expected or _sha256_from_checksum_text(check_resp.text)
+                if not expected:
+                    raise ValueError("Release checksum was unreadable")
+            if expected:
+                actual = digest.hexdigest()
+                if actual != expected:
+                    raise ValueError("Downloaded installer checksum did not match the release checksum")
             # Launch installer; /SILENT shows progress bar, /CLOSEAPPLICATIONS handles us,
             # /RESTARTAPPLICATIONS re-launches us after install.
             subprocess.Popen([tmp, "/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"],
@@ -2060,19 +2615,32 @@ def make_icon(color="#3b82f6"):
     return img
 
 def run_tray(app: App):
-    _update_state = {"tag": None, "url": None, "body": "", "installing": False}
+    _update_state = {
+        "tag": None,
+        "url": None,
+        "checksum_url": None,
+        "checksum": "",
+        "body": "",
+        "installing": False,
+        "checking": False,
+        "last_check": 0.0,
+    }
 
     def on_settings(icon, _): app.open_settings()
     def on_history(icon, _):  app.open_history()
     def on_quit(icon, _):
         icon.stop()
         app.shutdown()
-        app.overlay.root.after(0, app.overlay.root.quit)
+        app.overlay.call_soon(app.overlay.root.quit)
 
     def on_show_changelog(icon, _):
         if _update_state["tag"]:
-            app.overlay.root.after(0, lambda: show_changelog_window(
-                app.overlay.root, _update_state["tag"], _update_state["body"]))
+            app.overlay.call_soon(
+                show_changelog_window,
+                app.overlay.root,
+                _update_state["tag"],
+                _update_state["body"],
+            )
 
     def on_dismiss_update(icon, _):
         tag = _update_state["tag"]
@@ -2082,6 +2650,8 @@ def run_tray(app: App):
         save_config(cfg)
         _update_state["tag"] = None
         _update_state["url"] = None
+        _update_state["checksum_url"] = None
+        _update_state["checksum"] = ""
         _update_state["body"] = ""
         icon.menu = _build_menu()
 
@@ -2101,12 +2671,73 @@ def run_tray(app: App):
             def _on_error(e):
                 _update_state["installing"] = False
                 icon.menu = _build_menu()
-                try: icon.notify(f"Update failed: {e}", "Update error")
+                try:
+                    icon.notify(f"Update failed: {e}. Opening downloads page.", "Update error")
                 except Exception: pass
+                webbrowser.open(RELEASES_URL)
             download_and_install_update(_update_state["url"],
+                                        checksum_url=_update_state["checksum_url"],
+                                        expected_sha256=_update_state["checksum"],
                                         on_done=_on_done, on_error=_on_error)
         else:
             webbrowser.open(RELEASES_URL)
+
+    def _set_update_info(info):
+        _update_state["tag"] = info["tag"]
+        _update_state["url"] = info.get("installer_url")
+        _update_state["checksum_url"] = info.get("checksum_url")
+        _update_state["checksum"] = info.get("checksum", "")
+        _update_state["body"] = info.get("body") or ""
+        _update_state["last_check"] = time.time()
+        icon.menu = _build_menu()
+        try:
+            msg = (f"Transcribe {info['tag']} is available. Right-click the tray icon to install."
+                   if info.get("installer_url") and sys.platform == "win32"
+                   else f"Transcribe {info['tag']} is available. Open downloads to update.")
+            icon.notify(msg, "Update available")
+        except Exception:
+            pass
+
+    def _check_updates(manual=False):
+        if _update_state["checking"]:
+            return
+        _update_state["checking"] = True
+        icon.menu = _build_menu()
+
+        def _found(info):
+            _update_state["checking"] = False
+            _set_update_info(info)
+
+        def _none():
+            _update_state["checking"] = False
+            _update_state["last_check"] = time.time()
+            icon.menu = _build_menu()
+            if manual:
+                try: icon.notify("You're already on the latest version.", "No update found")
+                except Exception: pass
+
+        def _error(e):
+            _update_state["checking"] = False
+            _update_state["last_check"] = time.time()
+            icon.menu = _build_menu()
+            if manual:
+                try: icon.notify(f"Could not check for updates: {e}", "Update check failed")
+                except Exception: pass
+
+        check_for_update(
+            _found,
+            on_no_update=_none,
+            on_error=_error,
+            ignore_dismissed=manual,
+        )
+
+    def on_check_updates(icon, _):
+        _check_updates(manual=True)
+
+    def _periodic_update_check():
+        while True:
+            time.sleep(6 * 60 * 60)
+            _check_updates(manual=False)
 
     def _build_menu():
         items = [
@@ -2116,6 +2747,11 @@ def run_tray(app: App):
         if _update_state["installing"]:
             items += [
                 pystray.MenuItem("⬇  Installing update…", None, enabled=False),
+                pystray.Menu.SEPARATOR,
+            ]
+        elif _update_state["checking"]:
+            items += [
+                pystray.MenuItem("Checking for updates…", None, enabled=False),
                 pystray.Menu.SEPARATOR,
             ]
         elif _update_state["tag"]:
@@ -2130,9 +2766,10 @@ def run_tray(app: App):
                 pystray.Menu.SEPARATOR,
             ]
         items += [
-            pystray.MenuItem("Open Settings",
+            pystray.MenuItem("Settings",
                              on_settings, default=True),
             pystray.MenuItem("History",  on_history),
+            pystray.MenuItem("Check for Updates", on_check_updates),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", on_quit),
         ]
@@ -2143,20 +2780,8 @@ def run_tray(app: App):
                         menu=_build_menu())
     app._tray_icon = icon  # let App.show_tray_hint use it
 
-    def _on_update_found(tag, installer_url, body):
-        _update_state["tag"]  = tag
-        _update_state["url"]  = installer_url
-        _update_state["body"] = body or ""
-        icon.menu = _build_menu()
-        try:
-            msg = (f"Transcribe {tag} is available. Right-click the tray icon to install."
-                   if installer_url and sys.platform == "win32"
-                   else f"Transcribe {tag} is available — click to download")
-            icon.notify(msg, "Update available")
-        except Exception:
-            pass
-
-    check_for_update(_on_update_found)
+    _check_updates(manual=False)
+    threading.Thread(target=_periodic_update_check, daemon=True).start()
     icon.run()
 
 def _apply_taskbar_icon(root):
@@ -2169,14 +2794,26 @@ def _apply_taskbar_icon(root):
     except Exception:
         pass
 
+def _launch_action_from_args():
+    args = {a.lower() for a in sys.argv[1:]}
+    if args & {"--background", "--startup", "--tray"}:
+        return "background"
+    if args & {"--show-settings", "--settings"}:
+        return "show_settings"
+    # A normal double-click should surface the app instead of silently
+    # becoming another invisible tray process.
+    return "show_settings"
+
 def main():
     # Single-instance: if another copy is already running, ask it to show
     # Settings (so a second desktop double-click does something visible),
     # then exit immediately.
+    launch_action = _launch_action_from_args()
     lock_sock = acquire_single_instance_lock()
     if lock_sock is None:
-        signal_running_instance("show_settings")
-        sys.exit(0)
+        if launch_action == "show_settings":
+            if signal_running_instance("show_settings"):
+                sys.exit(0)
 
     overlay = Overlay()
     _apply_taskbar_icon(overlay.root)
@@ -2186,12 +2823,15 @@ def main():
         if action == "show_settings":
             app.open_settings()
         elif action == "show_onboarding":
-            overlay.root.after(0, lambda: Onboarding(overlay.root, app).show())
-    start_ipc_server(lock_sock, _on_ipc)
+            overlay.call_soon(lambda: Onboarding(overlay.root, app).show())
+    if lock_sock is not None:
+        start_ipc_server(lock_sock, _on_ipc)
 
     threading.Thread(target=run_tray, args=(app,), daemon=True).start()
     if not cfg.get("onboarding_done"):
         overlay.root.after(400, lambda: Onboarding(overlay.root, app).show())
+    elif launch_action == "show_settings":
+        overlay.call_soon(app.settings.open)
     overlay.run()
 
 if __name__ == "__main__":

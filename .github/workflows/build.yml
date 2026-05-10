@@ -149,15 +149,27 @@ jobs:
           & $iscc /DMyAppVersion="${{ steps.version.outputs.version }}" installer\installer.iss
           Move-Item installer\TranscribeApp-Setup.exe TranscribeApp-Windows-Setup.exe
 
+      - name: Generate Windows checksums
+        shell: pwsh
+        run: |
+          foreach ($file in @("TranscribeApp-Windows-Setup.exe", "TranscribeApp-Windows.zip")) {
+            $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $file" | Set-Content "$file.sha256" -Encoding ascii
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
-          path: TranscribeApp-Windows-Setup.exe
+          path: |
+            TranscribeApp-Windows-Setup.exe
+            TranscribeApp-Windows-Setup.exe.sha256
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-zip
-          path: TranscribeApp-Windows.zip
+          path: |
+            TranscribeApp-Windows.zip
+            TranscribeApp-Windows.zip.sha256
 
   # ── macOS .dmg ───────────────────────────────────────────────────────────────
   build-macos:
@@ -204,11 +216,14 @@ jobs:
             -srcfolder dist/TranscribeApp.app \
             -ov -format UDZO \
             TranscribeApp-Mac.dmg
+          shasum -a 256 TranscribeApp-Mac.dmg > TranscribeApp-Mac.dmg.sha256
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-dmg
-          path: TranscribeApp-Mac.dmg
+          path: |
+            TranscribeApp-Mac.dmg
+            TranscribeApp-Mac.dmg.sha256
 
   # ── GitHub Release ────────────────────────────────────────────────────────────
   release:
@@ -220,11 +235,64 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
 
+      - name: Generate update manifest
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = tag[1:] if tag.startswith("v") else tag
+          base = f"https://github.com/{repo}/releases/download/{tag}"
+
+          def read_hash(path):
+              text = pathlib.Path(path).read_text(encoding="utf-8").strip()
+              return text.split()[0].lower()
+
+          manifest = {
+              "schema": 1,
+              "version": version,
+              "tag": tag,
+              "notes_url": f"https://github.com/{repo}/releases/tag/{tag}",
+              "windows": {
+                  "installer": {
+                      "name": "TranscribeApp-Windows-Setup.exe",
+                      "url": f"{base}/TranscribeApp-Windows-Setup.exe",
+                      "sha256": read_hash("windows-installer/TranscribeApp-Windows-Setup.exe.sha256"),
+                      "sha256_url": f"{base}/TranscribeApp-Windows-Setup.exe.sha256",
+                  },
+                  "portable": {
+                      "name": "TranscribeApp-Windows.zip",
+                      "url": f"{base}/TranscribeApp-Windows.zip",
+                      "sha256": read_hash("windows-zip/TranscribeApp-Windows.zip.sha256"),
+                      "sha256_url": f"{base}/TranscribeApp-Windows.zip.sha256",
+                  },
+              },
+              "macos": {
+                  "dmg": {
+                      "name": "TranscribeApp-Mac.dmg",
+                      "url": f"{base}/TranscribeApp-Mac.dmg",
+                      "sha256": read_hash("macos-dmg/TranscribeApp-Mac.dmg.sha256"),
+                      "sha256_url": f"{base}/TranscribeApp-Mac.dmg.sha256",
+                  },
+              },
+          }
+          pathlib.Path("update-manifest.json").write_text(
+              json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
+            update-manifest.json
             windows-installer/TranscribeApp-Windows-Setup.exe
+            windows-installer/TranscribeApp-Windows-Setup.exe.sha256
             windows-zip/TranscribeApp-Windows.zip
+            windows-zip/TranscribeApp-Windows.zip.sha256
             macos-dmg/TranscribeApp-Mac.dmg
+            macos-dmg/TranscribeApp-Mac.dmg.sha256
