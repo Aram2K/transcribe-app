@@ -17,9 +17,11 @@ def _stub(name, attrs=None):
 
 _stub("pyaudio",       {"PyAudio": MagicMock, "paInt16": 8})
 _stub("pystray",       {"Icon": MagicMock, "Menu": MagicMock, "MenuItem": MagicMock})
-_stub("pynput",        {})
-_stub("pynput.keyboard", {"Controller": MagicMock, "Key": MagicMock})
-_stub("pynput.mouse",  {"Listener": MagicMock, "Button": MagicMock})
+_pynput_kb    = _stub("pynput.keyboard", {"Controller": MagicMock, "Key": MagicMock})
+_pynput_mouse = _stub("pynput.mouse",   {"Listener": MagicMock, "Button": MagicMock})
+_pynput       = _stub("pynput",         {})
+_pynput.keyboard = _pynput_kb    # needed for Python ≤ 3.11 (no sys.modules fallback in IMPORT_FROM)
+_pynput.mouse    = _pynput_mouse
 _stub("keyboard",      {"add_hotkey": MagicMock, "remove_hotkey": MagicMock,
                          "is_pressed": MagicMock(return_value=False)})
 _stub("pyperclip",     {"copy": MagicMock, "paste": MagicMock})
@@ -32,9 +34,11 @@ _stub("numpy",         {"frombuffer": MagicMock, "abs": MagicMock,
                          "concatenate": MagicMock, "array": MagicMock,
                          "int16": MagicMock, "float32": MagicMock,
                          "mean": MagicMock(return_value=0.0)})
-_stub("PIL",           {})
-_stub("PIL.Image",     {"new": MagicMock, "LANCZOS": MagicMock})
-_stub("PIL.ImageDraw", {"Draw": MagicMock})
+_pil_image = _stub("PIL.Image",     {"new": MagicMock, "LANCZOS": MagicMock})
+_pil_draw  = _stub("PIL.ImageDraw", {"Draw": MagicMock})
+_pil       = _stub("PIL",           {})
+_pil.Image     = _pil_image   # needed for Python ≤ 3.11
+_pil.ImageDraw = _pil_draw
 
 # Stub tkinter so no display is needed
 _tk = _stub("tkinter")
@@ -43,7 +47,8 @@ _tk.Label = MagicMock; _tk.Canvas = MagicMock; _tk.StringVar = MagicMock
 _tk.IntVar = MagicMock; _tk.BooleanVar = MagicMock; _tk.Text = MagicMock
 _tk.Entry = MagicMock; _tk.Button = MagicMock; _tk.Scrollbar = MagicMock
 _tk.Radiobutton = MagicMock; _tk.END = "end"
-_stub("tkinter.ttk",   {"Scrollbar": MagicMock})
+_tk_ttk = _stub("tkinter.ttk", {"Scrollbar": MagicMock})
+_tk.ttk = _tk_ttk  # needed for Python ≤ 3.11
 
 _stub("history",       {"add": MagicMock, "all": MagicMock(return_value=[]),
                          "clear": MagicMock, "search": MagicMock(return_value=[])})
