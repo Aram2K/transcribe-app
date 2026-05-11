@@ -5,6 +5,7 @@
 
 #define MyAppName "Transcribe"
 #define MyAppPublisher "Aram Adamyan"
+#define MyAppPublisherURL "https://aibuben.xyz"
 #define MyAppURL "https://github.com/Aram2K/transcribe-app"
 #define MyAppExeName "TranscribeApp.exe"
 
@@ -18,7 +19,7 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-AppPublisherURL={#MyAppURL}
+AppPublisherURL={#MyAppPublisherURL}
 AppSupportURL={#MyAppURL}/issues
 AppUpdatesURL={#MyAppURL}/releases
 DefaultDirName={autopf}\{#MyAppName}
@@ -65,6 +66,12 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "--show-settings"; Description: "
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
+Type: filesandordirs; Name: "{userprofile}\.cache\huggingface\hub\models--Systran--faster-whisper-tiny"
+Type: filesandordirs; Name: "{userprofile}\.cache\huggingface\hub\models--Systran--faster-whisper-base"
+Type: filesandordirs; Name: "{userprofile}\.cache\huggingface\hub\models--Systran--faster-whisper-small"
+Type: filesandordirs; Name: "{userprofile}\.cache\huggingface\hub\models--Systran--faster-whisper-medium"
+Type: filesandordirs; Name: "{userprofile}\.cache\huggingface\hub\models--Systran--faster-whisper-large-v3-turbo"
+Type: filesandordirs; Name: "{userprofile}\.cache\huggingface\hub\models--Systran--faster-whisper-large-v3"
 
 [Code]
 function InitializeSetup(): Boolean;

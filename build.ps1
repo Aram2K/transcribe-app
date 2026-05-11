@@ -17,6 +17,7 @@ pyinstaller `
     --add-data "config.example.json;." `
     --add-data "history.py;." `
     --hidden-import "faster_whisper" `
+    --hidden-import "faster_whisper.utils" `
     --hidden-import "ctranslate2" `
     --hidden-import "huggingface_hub" `
     --hidden-import "tokenizers" `
