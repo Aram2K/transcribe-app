@@ -12,7 +12,7 @@ import history as hist
 
 # ── Version ───────────────────────────────────────────────────────────────────
 
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
 RELEASES_MANIFEST_URL = "https://github.com/Aram2K/transcribe-app/releases/latest/download/update-manifest.json"
