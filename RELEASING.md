@@ -13,6 +13,12 @@ Do not publish a release manually unless you intentionally want to bypass the te
 
 Older versions discover updates through GitHub's latest release API and look for a setup `.exe`. Newer versions also use `update-manifest.json` and `.sha256` files when present.
 
+## What Needs a Release
+
+- App code, tray UI, installer behavior, bundled dependencies, icons, and anything users run locally require a new tagged release.
+- README, website text, docs, GitHub release notes, and backend/server changes can update without a new app release.
+- Remote config can change without a release only after the app has shipped code that reads that remote config.
+
 ## Release Steps
 
 1. Make sure `APP_VERSION` in `main.py` matches the tag version without the `v` prefix.

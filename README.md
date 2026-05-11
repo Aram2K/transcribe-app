@@ -131,7 +131,7 @@ Open via **right-click tray icon → Settings**.
 | **Hotkey** | Click the badge, press any key combo or mouse button |
 | **Language** | Auto-detect, Armenian, English, Russian, and more |
 | **Accent color** | Blue, Green, Purple, Pink, Orange, White |
-| **Custom vocabulary** | Words/names to help recognition (e.g. "Aram, Claude, AI") |
+| **Custom vocabulary** | Words/names to help recognition (e.g. "Aram, Aibuben, AI") |
 
 ---
 
@@ -229,9 +229,9 @@ See the full [LICENSE](LICENSE) for details. For commercial licensing inquiries:
 
 ## Author
 
-Built by **Aram Adamyan**
+Created by **Aram Adamyan**, Founder of [Aibuben.xyz](https://aibuben.xyz).
 
-[GitHub](https://github.com/Aram2K) · [Report an issue](https://github.com/Aram2K/transcribe-app/issues)
+[Aibuben.xyz](https://aibuben.xyz) · [GitHub](https://github.com/Aram2K) · [Report an issue](https://github.com/Aram2K/transcribe-app/issues)
 
 ---
 
