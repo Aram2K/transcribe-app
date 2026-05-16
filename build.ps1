@@ -18,6 +18,8 @@ pyinstaller `
     --add-data "history.py;." `
     --hidden-import "faster_whisper" `
     --hidden-import "faster_whisper.utils" `
+    --hidden-import "tqdm" `
+    --hidden-import "tqdm.auto" `
     --hidden-import "ctranslate2" `
     --hidden-import "huggingface_hub" `
     --hidden-import "tokenizers" `

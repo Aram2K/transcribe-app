@@ -12,7 +12,7 @@ import history as hist
 
 # ── Version ───────────────────────────────────────────────────────────────────
 
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.21"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
 RELEASES_MANIFEST_URL = "https://github.com/Aram2K/transcribe-app/releases/latest/download/update-manifest.json"
@@ -204,9 +204,95 @@ def model_downloaded(name):
     except Exception:
         return False
 
-def download_whisper_model(name):
-    from faster_whisper.utils import download_model
-    return download_model(name)
+def download_whisper_model(name, on_progress=None):
+    if on_progress is None:
+        from faster_whisper.utils import download_model
+        return download_model(name)
+
+    import huggingface_hub
+    from tqdm.auto import tqdm
+    import faster_whisper.utils as fw_utils
+
+    model_map = getattr(fw_utils, "_MODELS", {})
+    repo_id = model_map.get(name, name)
+    if "/" not in repo_id and name not in model_map:
+        from faster_whisper.utils import download_model
+        return download_model(name)
+
+    allow_patterns = [
+        "config.json",
+        "preprocessor_config.json",
+        "model.bin",
+        "tokenizer.json",
+        "vocabulary.*",
+    ]
+
+    progress_lock = threading.Lock()
+    bars = {}
+    totals = {"done": 0, "expected": 0, "last_emit": 0.0}
+
+    def _emit(force=False):
+        now = time.time()
+        if not force and now - totals["last_emit"] < 0.2:
+            return
+        totals["last_emit"] = now
+        with progress_lock:
+            active_done = sum(max(0, v.get("n") or 0) for v in bars.values())
+            active_expected = sum(max(0, v.get("total") or 0) for v in bars.values())
+            done = totals["done"] + active_done
+            expected = totals["expected"] + active_expected
+        percent = None
+        if expected > 0:
+            percent = max(0, min(99, int(done * 100 / expected)))
+        try:
+            on_progress(percent, done, expected)
+        except Exception:
+            pass
+
+    class ProgressTqdm(tqdm):
+        def __init__(self, *args, **kwargs):
+            kwargs["file"] = io.StringIO()
+            kwargs["disable"] = False
+            super().__init__(*args, **kwargs)
+            with progress_lock:
+                bars[id(self)] = {"n": self.n or 0, "total": self.total or 0}
+            _emit(force=True)
+
+        def update(self, n=1):
+            result = super().update(n)
+            with progress_lock:
+                bars[id(self)] = {"n": self.n or 0, "total": self.total or 0}
+            _emit()
+            return result
+
+        def close(self):
+            with progress_lock:
+                item = bars.pop(id(self), None)
+                if item:
+                    done = max(item.get("n") or 0, item.get("total") or 0)
+                    totals["done"] += done
+                    totals["expected"] += max(item.get("total") or done, done)
+            try:
+                super().close()
+            finally:
+                _emit(force=True)
+
+    on_progress(0, 0, 0)
+    kwargs = {
+        "local_files_only": False,
+        "allow_patterns": allow_patterns,
+        "tqdm_class": ProgressTqdm,
+        "max_workers": 8,
+    }
+    try:
+        path = huggingface_hub.snapshot_download(repo_id, **kwargs)
+    except TypeError as e:
+        if "max_workers" not in str(e):
+            raise
+        kwargs.pop("max_workers", None)
+        path = huggingface_hub.snapshot_download(repo_id, **kwargs)
+    on_progress(100, totals["expected"], totals["expected"])
+    return path
 
 # Detect CUDA GPU via ctranslate2 (already a dependency of faster-whisper)
 HAS_GPU = False
@@ -1153,6 +1239,7 @@ class Settings:
         self._device_scan_running = False
         self._device_menu = None
         self._model_states = {}
+        self._model_progress = {}
         self._model_scan_running = False
 
     def open(self):
@@ -1650,21 +1737,52 @@ class Settings:
         if self._model_states.get(name) == "downloading":
             return
         self._model_states[name] = "downloading"
+        self._model_progress[name] = {"percent": 0, "downloaded": 0, "total": 0}
         self._render_model_cards()
+
+        def _on_progress(percent, downloaded, total):
+            def _apply():
+                if not self.win or not self.win.winfo_exists():
+                    return
+                if self._model_states.get(name) != "downloading":
+                    return
+                self._model_progress[name] = {
+                    "percent": percent,
+                    "downloaded": downloaded,
+                    "total": total,
+                }
+                if self._active_tab == 1 and hasattr(self, "_model_cards_frame"):
+                    try:
+                        if self._model_cards_frame.winfo_exists():
+                            self._render_model_cards()
+                    except Exception:
+                        pass
+
+            self.app.overlay.call_soon(_apply)
 
         def _run():
             try:
-                download_whisper_model(name)
+                download_whisper_model(name, on_progress=_on_progress)
                 state = "downloaded"
             except Exception as e:
                 logger.warning("Could not download model %s: %s", name, e)
                 state = "failed"
 
             def _apply():
+                self._model_states[name] = state
+                if state == "downloaded":
+                    self.model_var.set(name)
+                    self._model_progress[name] = {"percent": 100, "downloaded": 0, "total": 0}
+                    self.app.show_tray_hint(
+                        "Model download complete",
+                        f"{name} is ready to use in Transcribe.",
+                    )
+                elif state == "failed":
+                    self.app.show_tray_hint(
+                        "Model download failed",
+                        f"Could not download {name}. Check your connection and try again.",
+                    )
                 if self.win and self.win.winfo_exists():
-                    self._model_states[name] = state
-                    if state == "downloaded":
-                        self.model_var.set(name)
                     self._render_model_cards()
 
             self.app.overlay.call_soon(_apply)
@@ -1676,6 +1794,30 @@ class Settings:
             w.destroy()
         for name, info in MODELS.items():
             self._model_card(self._model_cards_frame, name, info)
+
+    def _format_bytes(self, value):
+        try:
+            value = float(value or 0)
+        except (TypeError, ValueError):
+            value = 0
+        for unit in ("B", "KB", "MB", "GB"):
+            if value < 1024 or unit == "GB":
+                return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+            value /= 1024
+        return f"{value:.1f} GB"
+
+    def _progress_bar(self, parent, percent, bg, width=116, height=8):
+        canvas = tk.Canvas(parent, width=width, height=height, bg=bg, highlightthickness=0)
+        canvas.pack(pady=(4, 2))
+        canvas.create_rectangle(0, 0, width, height, fill="#e5e7eb", outline="")
+        if percent is None:
+            pulse_w = max(24, width // 3)
+            phase = int((time.time() * 90) % (width + pulse_w)) - pulse_w
+            canvas.create_rectangle(max(0, phase), 0, min(width, phase + pulse_w),
+                                    height, fill=cfg["accent_color"], outline="")
+        else:
+            fill_w = int(width * max(0, min(100, percent)) / 100)
+            canvas.create_rectangle(0, 0, fill_w, height, fill=cfg["accent_color"], outline="")
 
     def _model_card(self, parent, name, info):
         ram_ok = model_ok(name)
@@ -1705,7 +1847,10 @@ class Settings:
         elif state == "checking":
             tag, tag_fg = "  checking", "#6e6e73"
         elif state == "downloading":
-            tag, tag_fg = "  downloading", "#f97316"
+            progress = self._model_progress.get(name, {})
+            percent = progress.get("percent")
+            suffix = f" {percent}%" if percent is not None else ""
+            tag, tag_fg = f"  downloading{suffix}", "#f97316"
         elif state == "failed":
             tag, tag_fg = "  download failed", "#ef4444"
         elif downloaded:
@@ -1743,6 +1888,23 @@ class Settings:
                      font=("Segoe UI Semibold", 13)).pack()
             tk.Label(right, text="per clip", bg=bg, fg=fg2,
                      font=("Segoe UI", 7)).pack()
+        elif state == "downloading":
+            progress = self._model_progress.get(name, {})
+            percent = progress.get("percent")
+            downloaded_bytes = progress.get("downloaded", 0)
+            total_bytes = progress.get("total", 0)
+            text = f"{percent}%" if percent is not None else "Downloading"
+            tk.Label(right, text=text, bg=bg, fg=cfg["accent_color"],
+                     font=("Segoe UI Semibold", 10)).pack()
+            self._progress_bar(right, percent, bg)
+            if total_bytes >= 1024:
+                detail = f"{self._format_bytes(downloaded_bytes)} / {self._format_bytes(total_bytes)}"
+            elif total_bytes:
+                detail = f"{int(downloaded_bytes)} / {int(total_bytes)} files"
+            else:
+                detail = "Starting..."
+            tk.Label(right, text=detail, bg=bg, fg=fg2,
+                     font=("Segoe UI", 7)).pack()
         else:
             label = "Downloading..." if state == "downloading" else "Retry" if state == "failed" else "Download"
             btn_bg = "#e8eefc" if state == "downloading" else cfg["accent_color"]
@@ -1755,6 +1917,13 @@ class Settings:
                 btn.bind("<Button-1>", lambda e, n=name: self._download_model(n))
                 btn.bind("<Enter>", lambda e: btn.configure(bg=self._dim(cfg["accent_color"], 0.85)))
                 btn.bind("<Leave>", lambda e: btn.configure(bg=cfg["accent_color"]))
+                def _start_download(e=None, n=name):
+                    self._download_model(n)
+                for w in [card, inner, left, right, name_row] + \
+                         list(left.winfo_children()) + list(name_row.winfo_children()):
+                    try: w.configure(cursor="hand2")
+                    except: pass
+                    w.bind("<Button-1>", _start_download)
 
         if ram_ok and downloaded:
             def _pick(e=None, n=name):
