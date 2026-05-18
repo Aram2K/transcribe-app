@@ -85,8 +85,7 @@ begin
     wpSelectTasks,
     'Privacy',
     'Anonymous usage analytics',
-    'Help improve Transcribe by sharing safe usage events.',
-    'Analytics is optional. It never includes audio, transcription text, clipboard content, API keys, file paths, microphone names, or window titles.',
+    'Help improve Transcribe by sharing safe usage events. Analytics is optional. It never includes audio, transcription text, clipboard content, API keys, file paths, microphone names, or window titles.',
     False,
     False
   );
