@@ -222,6 +222,15 @@ jobs:
             --exclude-module IPython \
             main.py
 
+      - name: Ad-hoc sign the .app
+        # Without an Apple Developer ID we can only sign ad-hoc. This still
+        # produces a valid signature (so the hardened runtime and library
+        # validation don't complain), but Gatekeeper will still warn on
+        # first launch. Users bypass it once via right-click → Open.
+        run: |
+          codesign --force --deep --sign - dist/TranscribeApp.app
+          codesign --verify --verbose=2 dist/TranscribeApp.app || true
+
       - name: Package as DMG
         run: |
           hdiutil create \
@@ -246,7 +255,43 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history to diff against the previous tag
+
       - uses: actions/download-artifact@v4
+
+      - name: Generate release notes from commits
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          prev="$(git tag --sort=-version:refname --list 'v*.*.*' | grep -vFx "${tag}" | head -n 1 || true)"
+          {
+            echo "## What's new in ${tag}"
+            echo
+            if [ -n "${prev}" ]; then
+              echo "Changes since **${prev}**:"
+              echo
+              git log --no-merges --pretty=format:'- %s' "${prev}..${tag}"
+              echo
+              echo
+              echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${prev}...${tag}"
+            else
+              echo "First tagged release."
+              echo
+              git log --no-merges --pretty=format:'- %s' "${tag}"
+            fi
+            echo
+            echo
+            echo "### Download"
+            echo "- **Windows installer**: \`TranscribeApp-Windows-Setup.exe\`"
+            echo "- **Windows portable**: \`TranscribeApp-Windows.zip\`"
+            echo "- **macOS**: \`TranscribeApp-Mac.dmg\` — on first launch right-click → **Open** to bypass Gatekeeper (the app is ad-hoc signed, not notarized)."
+          } > release_notes.md
+          echo "--- release_notes.md ---"
+          cat release_notes.md
 
       - name: Generate update manifest
         shell: bash
@@ -300,7 +345,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: release_notes.md
           files: |
             update-manifest.json
             windows-installer/TranscribeApp-Windows-Setup.exe

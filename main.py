@@ -16,7 +16,7 @@ import telemetry
 
 # ── Version ───────────────────────────────────────────────────────────────────
 
-APP_VERSION = "1.5.28"
+APP_VERSION = "1.5.29"
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
@@ -4378,13 +4378,24 @@ def run_tray(app: App):
         app.overlay.call_soon(app.overlay.root.quit)
 
     def on_show_changelog(icon, _):
-        if _update_state["tag"]:
-            app.overlay.call_soon(
-                show_changelog_window,
-                app.overlay.root,
-                _update_state["tag"],
-                _update_state["body"],
-            )
+        if not _update_state["tag"]:
+            return
+        primary_label = None
+        primary_action = None
+        if _update_state.get("url") and sys.platform == "win32" and not _update_state["installing"]:
+            primary_label = "Install Update"
+            primary_action = lambda: _begin_install_update(icon)
+        else:
+            primary_label = "Open Releases"
+            primary_action = lambda: webbrowser.open(RELEASES_URL)
+        app.overlay.call_soon(
+            show_changelog_window,
+            app.overlay.root,
+            _update_state["tag"],
+            _update_state["body"],
+            primary_label,
+            primary_action,
+        )
 
     def on_dismiss_update(icon, _):
         tag = _update_state["tag"]
