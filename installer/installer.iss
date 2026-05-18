@@ -66,6 +66,7 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "--show-settings"; Description: "
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
+Type: filesandordirs; Name: "{userappdata}\Transcribe\action_models"
 Type: filesandordirs; Name: "{%USERPROFILE}\.cache\huggingface\hub\models--Systran--faster-whisper-tiny"
 Type: filesandordirs; Name: "{%USERPROFILE}\.cache\huggingface\hub\models--Systran--faster-whisper-base"
 Type: filesandordirs; Name: "{%USERPROFILE}\.cache\huggingface\hub\models--Systran--faster-whisper-small"
@@ -75,6 +76,36 @@ Type: filesandordirs; Name: "{%USERPROFILE}\.cache\huggingface\hub\models--Systr
 Type: filesandordirs; Name: "{%USERPROFILE}\.cache\huggingface\hub\models--mobiuslabsgmbh--faster-whisper-large-v3-turbo"
 
 [Code]
+var
+  AnalyticsPage: TInputOptionWizardPage;
+
+procedure InitializeWizard;
+begin
+  AnalyticsPage := CreateInputOptionPage(
+    wpSelectTasks,
+    'Privacy',
+    'Anonymous usage analytics',
+    'Help improve Transcribe by sharing safe usage events.',
+    'Analytics is optional. It never includes audio, transcription text, clipboard content, API keys, file paths, microphone names, or window titles.',
+    False,
+    False
+  );
+  AnalyticsPage.Add('Accept anonymous usage analytics');
+  AnalyticsPage.Values[0] := False;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ConsentDir: string;
+begin
+  if (CurStep = ssPostInstall) and (not WizardSilent) and AnalyticsPage.Values[0] then
+  begin
+    ConsentDir := ExpandConstant('{userappdata}\Transcribe');
+    ForceDirectories(ConsentDir);
+    SaveStringToFile(ConsentDir + '\analytics_consent.accepted', 'accepted', False);
+  end;
+end;
+
 function InitializeSetup(): Boolean;
 begin
   Result := True;

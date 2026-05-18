@@ -11,6 +11,7 @@ from pathlib import Path
 APP_DIR_NAME = "Transcribe"
 SECRET_SERVICE = "TranscribeApp"
 GOOGLE_API_KEY_SECRET = "google_api_key"
+ACTION_API_KEY_SECRET = "action_api_key"
 
 
 def app_data_dir():

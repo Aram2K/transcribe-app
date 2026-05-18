@@ -54,6 +54,28 @@ class TestActions(unittest.TestCase):
         self.assertEqual(out, "LLM output")
         run_action.assert_called_once()
 
+    def test_rule_based_formatter_does_not_call_llm(self):
+        with patch.object(actions.local_llm, "model_downloaded", return_value=True), \
+             patch.object(actions.local_llm, "run_action") as run_action:
+            out = actions.process(
+                "send the report today",
+                "write_email",
+                model=actions.RULE_BASED_ID,
+            )
+        self.assertIn("Subject:", out)
+        run_action.assert_not_called()
+
+    def test_cloud_action_uses_configured_api(self):
+        with patch.object(actions.action_api, "run_action", return_value="API output") as run_action:
+            out = actions.process(
+                "send the report today",
+                "write_email",
+                model=actions.API_OPENAI_ID,
+                config={"action_api_key": "secret", "privacy_mode": False},
+            )
+        self.assertEqual(out, "API output")
+        run_action.assert_called_once()
+
     def test_translate_can_use_qwen_when_argos_is_missing(self):
         with patch.object(actions.local_llm, "model_downloaded", return_value=True), \
              patch.object(actions.local_llm, "run_action", return_value="Bonjour") as run_action, \

@@ -9,7 +9,11 @@
   "google_api_key": "",
   "initial_prompt": "",
   "output_action": "transcribe_only",
-  "action_model": "built_in",
+  "action_model": "rule_based",
+  "action_api_provider": "openai_compatible",
+  "action_api_key": "",
+  "action_api_base_url": "",
+  "action_api_model": "",
   "translate_target": "en",
   "input_device_index": null,
   "silence_trigger_sec": 0.8,
@@ -18,5 +22,6 @@
   "privacy_mode": false,
   "save_history": true,
   "analytics_enabled": false,
+  "analytics_consent_applied": false,
   "analytics_endpoint": "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-analytics"
 }

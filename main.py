@@ -16,7 +16,7 @@ import telemetry
 
 # ── Version ───────────────────────────────────────────────────────────────────
 
-APP_VERSION = "1.5.27"
+APP_VERSION = "1.5.28"
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
@@ -39,6 +39,7 @@ logger = logging.getLogger("transcribe")
 
 CONFIG_PATH = str(storage.path_for("config.json"))
 LEGACY_CONFIG_PATH = "config.json"
+ANALYTICS_CONSENT_PATH = storage.path_for("analytics_consent.accepted")
 DEFAULT = {
     "hotkey":        "alt+r",
     "whisper_model": "base",
@@ -50,7 +51,11 @@ DEFAULT = {
     "google_api_key": "",
     "initial_prompt": "",
     "output_action": "transcribe_only",
-    "action_model": "built_in",
+    "action_model": "rule_based",
+    "action_api_provider": "openai_compatible",
+    "action_api_key": "",
+    "action_api_base_url": "",
+    "action_api_model": "",
     "translate_target": "en",
     "input_device_index": None,
     "silence_trigger_sec": 0.8,
@@ -59,6 +64,7 @@ DEFAULT = {
     "privacy_mode": False,
     "save_history": True,
     "analytics_enabled": False,
+    "analytics_consent_applied": False,
     "analytics_endpoint": "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-analytics",
     "onboarding_done": False,
     "dismissed_update_version": "",   # remember which update tag the user dismissed
@@ -92,6 +98,30 @@ def load_config():
         loaded["backend"] = "local"
         loaded["save_history"] = False
         loaded["analytics_enabled"] = False
+        if actions.ACTION_MODELS.get(actions.normalize_action_model(loaded.get("action_model")), {}).get("kind") == "cloud":
+            loaded["action_model"] = actions.RULE_BASED_ID
+    loaded["action_model"] = actions.normalize_action_model(loaded.get("action_model"))
+
+    action_key = (loaded.get("action_api_key") or "").strip()
+    if action_key:
+        if storage.write_secret(storage.ACTION_API_KEY_SECRET, action_key):
+            loaded["action_api_key"] = action_key
+            disk = {**loaded, "google_api_key": "", "action_api_key": ""}
+            try:
+                storage.atomic_write_json(CONFIG_PATH, disk)
+            except OSError as e:
+                logger.warning("Could not sanitize action API key in config: %s", e)
+    else:
+        loaded["action_api_key"] = storage.read_secret(storage.ACTION_API_KEY_SECRET)
+
+    if ANALYTICS_CONSENT_PATH.exists() and not loaded.get("analytics_consent_applied"):
+        loaded["analytics_enabled"] = not bool(loaded.get("privacy_mode"))
+        loaded["analytics_consent_applied"] = True
+        disk = {**loaded, "google_api_key": "", "action_api_key": ""}
+        try:
+            storage.atomic_write_json(CONFIG_PATH, disk)
+        except OSError as e:
+            logger.warning("Could not apply installer analytics consent: %s", e)
 
     return loaded
 
@@ -101,9 +131,14 @@ def save_config(c):
         disk["backend"] = "local"
         disk["save_history"] = False
         disk["analytics_enabled"] = False
+        if actions.ACTION_MODELS.get(actions.normalize_action_model(disk.get("action_model")), {}).get("kind") == "cloud":
+            disk["action_model"] = actions.RULE_BASED_ID
     key = (disk.get("google_api_key") or "").strip()
     if storage.write_secret(storage.GOOGLE_API_KEY_SECRET, key):
         disk["google_api_key"] = ""
+    action_key = (disk.get("action_api_key") or "").strip()
+    if storage.write_secret(storage.ACTION_API_KEY_SECRET, action_key):
+        disk["action_api_key"] = ""
     storage.atomic_write_json(CONFIG_PATH, disk)
 
 cfg = load_config()
@@ -1111,7 +1146,6 @@ class HistoryWindow:
         self.win.configure(bg=self.BG)
         self.win.geometry("520x600")
         self.win.resizable(False, True)
-        self.win.attributes("-topmost", True)
         self.win.transient(self.root)
         self.win.update_idletasks()
         apply_glass(self.win.winfo_id(), "#0f0f0ff5")
@@ -1408,7 +1442,6 @@ class Settings:
         win.resizable(False, False)
         win.configure(bg=self.BG)
         win.geometry("520x640")
-        win.attributes("-topmost", True)
         win.transient(self.root)
         win.update_idletasks()
 
@@ -1487,6 +1520,9 @@ class Settings:
         self.analytics_enabled_var = tk.BooleanVar(value=bool(cfg.get("analytics_enabled", False)))
         self.action_mode_var = tk.StringVar(value=actions.normalize_action_mode(cfg.get("output_action")))
         self.action_model_var = tk.StringVar(value=actions.normalize_action_model(cfg.get("action_model")))
+        self.action_api_key_var = tk.StringVar(value=cfg.get("action_api_key", ""))
+        self.action_api_base_url_var = tk.StringVar(value=cfg.get("action_api_base_url", ""))
+        self.action_api_model_var = tk.StringVar(value=cfg.get("action_api_model", ""))
         self.translate_target_var = tk.StringVar(value=actions.normalize_translate_target(cfg.get("translate_target")))
         self._captured_hotkey  = cfg["hotkey"]
         self._capturing_hotkey = False
@@ -1599,7 +1635,7 @@ class Settings:
         tk.Label(box,
                  text="Forces local transcription, disables Google Cloud, turns off analytics, and stops saving History.",
                  bg=self.CARD, fg=self.FG2, font=("Segoe UI", 8),
-                 wraplength=430, justify="left").pack(anchor="w", padx=42, pady=(0, 10))
+                 wraplength=380, justify="left").pack(anchor="w", padx=42, pady=(0, 10))
 
         analytics_row = tk.Frame(box, bg=self.CARD)
         analytics_row.pack(fill="x", padx=14, pady=(0, 2))
@@ -1614,12 +1650,14 @@ class Settings:
         tk.Label(box,
                  text="Analytics never includes audio, transcription text, clipboard content, API keys, file paths, or microphone names.",
                  bg=self.CARD, fg=self.FG2, font=("Segoe UI", 8),
-                 wraplength=430, justify="left").pack(anchor="w", padx=42, pady=(0, 12))
+                 wraplength=380, justify="left").pack(anchor="w", padx=42, pady=(0, 12))
         self._refresh_privacy_controls()
 
     def _privacy_toggled(self):
         if self.privacy_mode_var.get():
             self.backend_var.set("local")
+            if actions.ACTION_MODELS.get(actions.normalize_action_model(self.action_model_var.get()), {}).get("kind") == "cloud":
+                self.action_model_var.set(actions.RULE_BASED_ID)
             self.save_history_var.set(False)
             self.analytics_enabled_var.set(False)
             self.test_result.set("Privacy Mode uses local models only.")
@@ -1628,6 +1666,8 @@ class Settings:
             self._render_backend_cards()
         if hasattr(self, "google_section") and self.google_section.winfo_exists():
             self._toggle_google_section()
+        if hasattr(self, "_action_model_cards_frame") and self._action_model_cards_frame.winfo_exists():
+            self._render_action_model_cards()
 
     def _refresh_privacy_controls(self):
         private = bool(self.privacy_mode_var.get())
@@ -2411,24 +2451,33 @@ class Settings:
         current = actions.TRANSLATE_TARGETS[self.translate_target_var.get()]
         current_label = f"{current} ({self.translate_target_var.get()})"
         self.translate_target_label_var = tk.StringVar(value=current_label)
-        menu = tk.OptionMenu(target_box, self.translate_target_label_var, *labels)
-        menu.configure(bg=self.CARD, fg=self.FG, activebackground="#f0f0f5",
-                       relief="flat", highlightthickness=0, font=("Segoe UI", 9))
-        menu.pack(fill="x", padx=12, pady=10)
+        self.translate_target_combo = ttk.Combobox(
+            target_box,
+            textvariable=self.translate_target_label_var,
+            values=labels,
+            state="readonly",
+            font=("Segoe UI", 9),
+        )
+        self.translate_target_combo.pack(fill="x", padx=12, pady=10)
         tk.Label(self._translate_options,
                  text="Translation stays local only when Argos Translate and the matching offline language pack are installed.",
                  bg=self.BG, fg=self.FG2, font=("Segoe UI", 8),
                  wraplength=460, justify="left").pack(anchor="w", padx=20, pady=(0, 12))
         self._sync_translate_options()
 
-        self._section(f, "Local Action Engine")
+        self._section(f, "Action Engine")
         tk.Label(f,
-                 text="Built-in local actions work now. Aibuben local LLM slots are prepared for future downloadable CPU/GPU models.",
+                 text="Rule-based formatting works immediately. Local Qwen models run on your computer. Cloud action APIs use your own key and are disabled in Privacy Mode.",
                  bg=self.BG, fg=self.FG2, font=("Segoe UI", 8),
                  wraplength=460, justify="left").pack(anchor="w", padx=20, pady=(2, 6))
         self._action_model_cards_frame = tk.Frame(f, bg=self.BG)
         self._action_model_cards_frame.pack(fill="x", padx=20, pady=(4, 16))
         self._render_action_model_cards()
+
+        self._action_api_options = tk.Frame(f, bg=self.BG)
+        self._section(self._action_api_options, "Action API Key")
+        self._build_action_api_section(self._action_api_options)
+        self._sync_action_api_options()
 
     def _render_action_cards(self):
         for w in self._action_cards_frame.winfo_children():
@@ -2477,6 +2526,54 @@ class Settings:
         else:
             self._translate_options.pack_forget()
 
+    def _build_action_api_section(self, parent):
+        self._action_api_title = tk.StringVar(value="")
+        self._action_api_desc = tk.StringVar(value="")
+        box = tk.Frame(parent, bg=self.CARD, highlightthickness=1, highlightbackground=self.BORDER)
+        box.pack(fill="x", padx=20, pady=(4, 14))
+        tk.Label(box, textvariable=self._action_api_title, bg=self.CARD, fg=self.FG,
+                 font=("Segoe UI Semibold", 10)).pack(anchor="w", padx=14, pady=(12, 2))
+        tk.Label(box, textvariable=self._action_api_desc, bg=self.CARD, fg=self.FG2,
+                 font=("Segoe UI", 8), wraplength=400, justify="left").pack(anchor="w", padx=14, pady=(0, 10))
+
+        for label, var, placeholder, secret in [
+            ("API Key", self.action_api_key_var, "Paste your action API key here", True),
+            ("Base URL", self.action_api_base_url_var, "Provider default", False),
+            ("Model", self.action_api_model_var, "Provider default", False),
+        ]:
+            tk.Label(box, text=label.upper(), bg=self.CARD, fg=self.FG2,
+                     font=("Segoe UI", 7)).pack(anchor="w", padx=14)
+            entry = tk.Entry(box, bg=self.CARD, fg=self.FG, insertbackground=self.FG,
+                             show="*" if secret else "", font=("Segoe UI", 9),
+                             relief="flat", bd=8)
+            entry.pack(fill="x", padx=14, pady=(2, 8 if label != "Model" else 12))
+            attach_placeholder_entry(
+                entry,
+                var,
+                placeholder,
+                self.FG,
+                "#a0a0aa",
+                secret_char="*" if secret else "",
+            )
+
+    def _sync_action_api_options(self):
+        if not hasattr(self, "_action_api_options"):
+            return
+        model = actions.normalize_action_model(self.action_model_var.get())
+        info = actions.ACTION_MODELS.get(model, {})
+        if info.get("kind") == "cloud" and not self.privacy_mode_var.get():
+            api_info = actions.ACTION_API_MODELS[model]
+            self._action_api_title.set(api_info["label"])
+            self._action_api_desc.set(api_info["description"])
+            if not (self.action_api_base_url_var.get() or "").strip():
+                self.action_api_base_url_var.set(api_info["default_base_url"])
+            if not (self.action_api_model_var.get() or "").strip():
+                self.action_api_model_var.set(api_info["default_model"])
+            if not self._action_api_options.winfo_ismapped():
+                self._action_api_options.pack(fill="x", after=self._action_model_cards_frame)
+        else:
+            self._action_api_options.pack_forget()
+
     def _render_action_model_cards(self):
         for w in self._action_model_cards_frame.winfo_children():
             w.destroy()
@@ -2490,25 +2587,29 @@ class Settings:
                 info["available"],
                 state,
             )
+        if hasattr(self, "_action_api_options"):
+            self._sync_action_api_options()
 
     def _action_model_state(self, code, info):
-        if code == "built_in":
+        if code == actions.RULE_BASED_ID:
             return "ready"
-        if not info.get("available"):
-            return "coming_soon"
         if self._action_model_states.get(code) in ("downloading", "failed", "removing"):
             return self._action_model_states[code]
-        if code == local_llm.QWEN_TINY_ID:
+        if info.get("kind") == "cloud":
+            if self.privacy_mode_var.get():
+                return "cloud_disabled"
+            return "api_ready" if (self.action_api_key_var.get() or "").strip() else "api_key"
+        if info.get("kind") == "local_llm":
             state = "downloaded" if local_llm.model_downloaded(code) else "missing"
             self._action_model_states[code] = state
             return state
-        return "coming_soon"
+        return "ready"
 
     def _download_action_model(self, code):
-        if code != local_llm.QWEN_TINY_ID or self._action_model_states.get(code) == "downloading":
+        if actions.ACTION_MODELS.get(code, {}).get("kind") != "local_llm" or self._action_model_states.get(code) == "downloading":
             return
         self._action_model_states[code] = "downloading"
-        self._action_model_progress[code] = {"percent": 0, "downloaded": 0, "total": local_llm.QWEN_TINY_SIZE}
+        self._action_model_progress[code] = {"percent": 0, "downloaded": 0, "total": local_llm.model_info(code)["size"]}
         self._render_action_model_cards()
         telemetry.track("model_download_started", {"model": code, "kind": "action_llm"}, cfg, APP_VERSION)
 
@@ -2542,10 +2643,10 @@ class Settings:
                     self.action_model_var.set(code)
                     self._action_model_progress[code] = {"percent": 100, "downloaded": 0, "total": 0}
                     telemetry.track("model_download_completed", {"model": code, "kind": "action_llm"}, cfg, APP_VERSION)
-                    self.app.show_tray_hint("Action model ready", "Qwen Tiny is ready for local actions.")
+                    self.app.show_tray_hint("Action model ready", f"{local_llm.model_info(code)['label']} is ready for local actions.")
                 else:
                     telemetry.track("model_download_failed", {"model": code, "kind": "action_llm"}, cfg, APP_VERSION)
-                    self.app.show_tray_hint("Action model download failed", "Could not download Qwen Tiny. Check your connection.")
+                    self.app.show_tray_hint("Action model download failed", f"Could not download {local_llm.model_info(code)['label']}. Check your connection.")
                 if self.win and self.win.winfo_exists():
                     self._render_action_model_cards()
 
@@ -2554,12 +2655,13 @@ class Settings:
         threading.Thread(target=_run, daemon=True).start()
 
     def _remove_action_model(self, code):
-        if code != local_llm.QWEN_TINY_ID or self._action_model_states.get(code) in ("downloading", "removing"):
+        if actions.ACTION_MODELS.get(code, {}).get("kind") != "local_llm" or self._action_model_states.get(code) in ("downloading", "removing"):
             return
         from tkinter import messagebox
+        label = local_llm.model_info(code)["label"]
         if not messagebox.askyesno(
             "Remove action model",
-            "Remove Qwen Tiny from this computer?\n\nYou can download it again later.",
+            f"Remove {label} from this computer?\n\nThis deletes the downloaded model files and any partial download. You can download it again later.",
             parent=self.win,
         ):
             return
@@ -2579,12 +2681,12 @@ class Settings:
                 )
                 self._action_model_progress.pop(code, None)
                 if self.action_model_var.get() == code:
-                    self.action_model_var.set("built_in")
+                    self.action_model_var.set(actions.RULE_BASED_ID)
                 if ok:
                     telemetry.track("model_removed", {"model": code, "kind": "action_llm"}, cfg, APP_VERSION)
-                    self.app.show_tray_hint("Action model removed", "Qwen Tiny was removed from this computer.")
+                    self.app.show_tray_hint("Action model removed", f"{label} was removed from this computer.")
                 else:
-                    self.app.show_tray_hint("Action model removal failed", "Qwen Tiny could not be removed.")
+                    self.app.show_tray_hint("Action model removal failed", f"{label} could not be removed.")
                 if self.win and self.win.winfo_exists():
                     self._render_action_model_cards()
 
@@ -2594,7 +2696,7 @@ class Settings:
 
     def _action_model_card(self, parent, code, title, desc, available, state):
         sel = self.action_model_var.get() == code
-        usable = available and state in ("ready", "downloaded")
+        usable = available and state in ("ready", "downloaded", "api_key", "api_ready")
         downloadable = available and state in ("missing", "failed")
         bg = self.SEL_BG if sel else (self.CARD if available else "#f9f9f9")
         bord = cfg["accent_color"] if sel else (self.BORDER if available else "#ebebeb")
@@ -2613,6 +2715,9 @@ class Settings:
             "downloading": ("Downloading", "#f97316"),
             "removing": ("Removing", "#f97316"),
             "coming_soon": ("Coming soon", "#f97316"),
+            "api_key": ("Bring key", "#3b82f6"),
+            "api_ready": ("Ready", "#22c55e"),
+            "cloud_disabled": ("Privacy off required", "#ef4444"),
         }
         tag, tag_fg = tag_map.get(state, ("Coming soon", "#f97316"))
         tk.Label(row, text=tag, bg=bg, fg=tag_fg,
@@ -2654,7 +2759,12 @@ class Settings:
             if not usable:
                 return
             self.action_model_var.set(code)
+            if actions.ACTION_MODELS.get(code, {}).get("kind") == "cloud":
+                api_info = actions.ACTION_API_MODELS[code]
+                self.action_api_base_url_var.set(api_info["default_base_url"])
+                self.action_api_model_var.set(api_info["default_model"])
             self._render_action_model_cards()
+            self._sync_action_api_options()
         for w in [card, inner, row] + list(row.winfo_children()):
             w.bind("<Button-1>", _select)
             try: w.configure(cursor="hand2" if usable else "arrow")
@@ -2916,6 +3026,8 @@ class Settings:
             self.backend_var.set("local")
             self.save_history_var.set(False)
             self.analytics_enabled_var.set(False)
+            if actions.ACTION_MODELS.get(actions.normalize_action_model(self.action_model_var.get()), {}).get("kind") == "cloud":
+                self.action_model_var.set(actions.RULE_BASED_ID)
 
         if not privacy_mode and self.backend_var.get() == "google" and not (self.api_key_var.get() or "").strip():
             from tkinter import messagebox
@@ -2925,6 +3037,23 @@ class Settings:
             messagebox.showwarning(
                 "Google API key required",
                 "Google Cloud needs your own API key before it can be saved as the backend.",
+                parent=self.win,
+            )
+            return
+
+        selected_action_model = actions.normalize_action_model(self.action_model_var.get())
+        if (
+            not privacy_mode
+            and actions.ACTION_MODELS.get(selected_action_model, {}).get("kind") == "cloud"
+            and not (self.action_api_key_var.get() or "").strip()
+        ):
+            from tkinter import messagebox
+            if self._active_tab != 2:
+                self._switch_tab(2)
+            self._sync_action_api_options()
+            messagebox.showwarning(
+                "Action API key required",
+                "Cloud action modes need your own API key before they can be saved.",
                 parent=self.win,
             )
             return
@@ -2959,6 +3088,11 @@ class Settings:
         cfg["initial_prompt"] = self._prompt_value
         cfg["output_action"] = actions.normalize_action_mode(self.action_mode_var.get())
         cfg["action_model"] = actions.normalize_action_model(self.action_model_var.get())
+        selected_action_info = actions.ACTION_MODELS[cfg["action_model"]]
+        cfg["action_api_provider"] = selected_action_info.get("provider", cfg.get("action_api_provider", "openai_compatible"))
+        cfg["action_api_key"] = self.action_api_key_var.get().strip()
+        cfg["action_api_base_url"] = self.action_api_base_url_var.get().strip()
+        cfg["action_api_model"] = self.action_api_model_var.get().strip()
         cfg["translate_target"] = actions.normalize_translate_target(self.translate_target_var.get())
         cfg["input_device_index"] = self._selected_device_index()
         cfg["silence_trigger_sec"] = silence_trigger
@@ -2967,6 +3101,7 @@ class Settings:
         cfg["privacy_mode"] = privacy_mode
         cfg["save_history"] = bool(self.save_history_var.get())
         cfg["analytics_enabled"] = bool(self.analytics_enabled_var.get())
+        cfg["analytics_consent_applied"] = True
         save_config(cfg)
         if privacy_mode and not old_privacy_mode:
             hist.clear()
@@ -3014,7 +3149,6 @@ class Onboarding:
         win.geometry(f"{W}x{H}")
         win.resizable(False, True)
         win.minsize(540, 600)
-        win.attributes("-topmost", True)
         win.transient(self.root)
         win.grab_set()
         win.update_idletasks()
@@ -3029,6 +3163,7 @@ class Onboarding:
         self._backend  = tk.StringVar(value=cfg.get("backend", "local"))
         self._model    = tk.StringVar(value=cfg.get("whisper_model", "base"))
         self._api_key  = tk.StringVar(value=cfg.get("google_api_key", ""))
+        self._analytics = tk.BooleanVar(value=bool(cfg.get("analytics_enabled", False)))
 
         self._build()
 
@@ -3164,6 +3299,24 @@ class Onboarding:
         get_key.bind("<Enter>", lambda e: get_key.configure(bg="#e0e0e8"))
         get_key.bind("<Leave>", lambda e: get_key.configure(bg="#efefef"))
         self._sync_google_key_area()
+
+        # Analytics consent
+        self._section("PRIVACY")
+        consent = tk.Frame(body, bg=self.CARD,
+                           highlightthickness=1, highlightbackground=self.BORDER)
+        consent.pack(fill="x", padx=32, pady=(4, 12))
+        row = tk.Frame(consent, bg=self.CARD)
+        row.pack(fill="x", padx=14, pady=(10, 2))
+        tk.Checkbutton(row, variable=self._analytics,
+                       bg=self.CARD, activebackground=self.CARD,
+                       selectcolor="#f8f8fb", highlightthickness=0, bd=0,
+                       cursor="hand2").pack(side="left", padx=(0, 8))
+        tk.Label(row, text="Share anonymous usage analytics",
+                 bg=self.CARD, fg=self.FG, font=("Segoe UI Semibold", 9)).pack(side="left")
+        tk.Label(consent,
+                 text="Optional. Analytics only records safe usage events like selected features and model downloads. It never includes audio, transcription text, clipboard content, API keys, file paths, or microphone names.",
+                 bg=self.CARD, fg=self.FG2, font=("Segoe UI", 8),
+                 wraplength=430, justify="left").pack(anchor="w", padx=42, pady=(0, 12))
 
         # Model
         self._model_section_label = self._section("STARTING MODEL")
@@ -3478,6 +3631,8 @@ class Onboarding:
         cfg["backend"]         = self._backend.get()
         cfg["google_api_key"]  = self._api_key.get().strip()
         cfg["whisper_model"]   = self._model.get()
+        cfg["analytics_enabled"] = bool(self._analytics.get())
+        cfg["analytics_consent_applied"] = True
         cfg["onboarding_done"] = True
         save_config(cfg)
         if old_model != cfg["whisper_model"] and cfg["backend"] == "local":
@@ -3660,13 +3815,14 @@ class App:
                     action_mode,
                     source_lang=lang,
                     target_lang=cfg.get("translate_target", "en"),
-                    model=cfg.get("action_model", "built_in"),
+                    model=cfg.get("action_model", actions.RULE_BASED_ID),
+                    config=cfg,
                 )
                 telemetry.track(
                     "action_completed",
                     {
                         "action": action_mode,
-                        "model": cfg.get("action_model", "built_in"),
+                        "model": cfg.get("action_model", actions.RULE_BASED_ID),
                         "language": lang,
                         "output_length_bucket": _bucket_count(len(output_text)),
                     },
@@ -3917,7 +4073,6 @@ def show_changelog_window(root, tag, body, primary_label=None, primary_action=No
     W, H = 520, 460
     sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
     win.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
-    win.attributes("-topmost", True)
     win.transient(root)
 
     tk.Label(win, text=f"What's new in {tag}", bg="#f5f5f7", fg="#1d1d1f",
@@ -3966,7 +4121,6 @@ def show_simple_window(root, title, message, primary_label=None, primary_action=
     W, H = 420, 220
     sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
     win.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
-    win.attributes("-topmost", True)
     win.transient(root)
     win.resizable(False, False)
 
@@ -4005,7 +4159,6 @@ def show_update_progress_window(root, tag):
     W, H = 440, 210
     sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
     win.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
-    win.attributes("-topmost", True)
     win.transient(root)
     win.resizable(False, False)
 
@@ -4070,7 +4223,6 @@ def show_about_window(root):
     W, H = 520, 440
     sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
     win.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
-    win.attributes("-topmost", True)
     win.transient(root)
     win.resizable(False, False)
 

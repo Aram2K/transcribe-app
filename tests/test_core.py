@@ -182,8 +182,25 @@ class TestConfig(unittest.TestCase):
         finally:
             m.CONFIG_PATH = orig
 
+    def test_action_api_key_is_sanitized_when_keyring_accepts_it(self):
+        import json
+        import main as m
+        orig = m.CONFIG_PATH
+        m.CONFIG_PATH = self._cfg_path
+        try:
+            with patch.object(m.storage, "write_secret", return_value=True), \
+                 patch.object(m.storage, "read_secret", return_value="action-secret"):
+                save_config({**DEFAULT, "action_api_key": "action-secret"})
+                with open(self._cfg_path, encoding="utf-8") as f:
+                    raw = json.load(f)
+                self.assertEqual(raw["action_api_key"], "")
+                self.assertEqual(load_config()["action_api_key"], "action-secret")
+        finally:
+            m.CONFIG_PATH = orig
+
     def test_privacy_mode_forces_local_no_history_no_analytics(self):
         import main as m
+        import actions
         orig = m.CONFIG_PATH
         m.CONFIG_PATH = self._cfg_path
         try:
@@ -193,12 +210,34 @@ class TestConfig(unittest.TestCase):
                 "backend": "google",
                 "save_history": True,
                 "analytics_enabled": True,
+                "action_model": actions.API_OPENAI_ID,
             })
             c = load_config()
             self.assertEqual(c["backend"], "local")
             self.assertFalse(c["save_history"])
             self.assertFalse(c["analytics_enabled"])
+            self.assertEqual(c["action_model"], actions.RULE_BASED_ID)
         finally:
+            m.CONFIG_PATH = orig
+
+    def test_installer_analytics_consent_marker_enables_once(self):
+        import main as m
+        orig = m.CONFIG_PATH
+        m.CONFIG_PATH = self._cfg_path
+        marker = m.ANALYTICS_CONSENT_PATH
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("accepted", encoding="ascii")
+        try:
+            c = load_config()
+            self.assertTrue(c["analytics_enabled"])
+            self.assertTrue(c["analytics_consent_applied"])
+            save_config({**c, "analytics_enabled": False})
+            self.assertFalse(load_config()["analytics_enabled"])
+        finally:
+            try:
+                marker.unlink()
+            except OSError:
+                pass
             m.CONFIG_PATH = orig
 
 

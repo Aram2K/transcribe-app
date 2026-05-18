@@ -18,12 +18,14 @@ class TestTelemetry(unittest.TestCase):
             "transcript": "hello private text",
             "clipboard": "secret",
             "google_api_key": "secret-key",
+            "action_api_key": "action-secret",
             "backend": "local",
             "count": 2,
         })
         self.assertNotIn("transcript", out)
         self.assertNotIn("clipboard", out)
         self.assertNotIn("google_api_key", out)
+        self.assertNotIn("action_api_key", out)
         self.assertEqual(out["backend"], "local")
         self.assertEqual(out["count"], 2)
 
