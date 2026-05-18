@@ -41,9 +41,11 @@ _stub("numpy",         {"frombuffer": MagicMock, "abs": MagicMock,
                          "mean": MagicMock(return_value=0.0)})
 _pil_image = _stub("PIL.Image",     {"new": MagicMock, "LANCZOS": MagicMock})
 _pil_draw  = _stub("PIL.ImageDraw", {"Draw": MagicMock})
+_pil_tk    = _stub("PIL.ImageTk",   {"PhotoImage": MagicMock})
 _pil       = _stub("PIL",           {})
 _pil.Image     = _pil_image   # needed for Python ≤ 3.11
 _pil.ImageDraw = _pil_draw
+_pil.ImageTk   = _pil_tk
 
 # Stub tkinter so no display is needed
 _tk = _stub("tkinter")
@@ -177,6 +179,25 @@ class TestConfig(unittest.TestCase):
                     raw = json.load(f)
                 self.assertEqual(raw["google_api_key"], "")
                 self.assertEqual(load_config()["google_api_key"], "secret-key")
+        finally:
+            m.CONFIG_PATH = orig
+
+    def test_privacy_mode_forces_local_no_history_no_analytics(self):
+        import main as m
+        orig = m.CONFIG_PATH
+        m.CONFIG_PATH = self._cfg_path
+        try:
+            save_config({
+                **DEFAULT,
+                "privacy_mode": True,
+                "backend": "google",
+                "save_history": True,
+                "analytics_enabled": True,
+            })
+            c = load_config()
+            self.assertEqual(c["backend"], "local")
+            self.assertFalse(c["save_history"])
+            self.assertFalse(c["analytics_enabled"])
         finally:
             m.CONFIG_PATH = orig
 

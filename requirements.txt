@@ -8,3 +8,4 @@ pystray
 Pillow
 psutil
 requests
+llama-cpp-python

@@ -72,6 +72,7 @@ Type: filesandordirs; Name: "{%USERPROFILE}\.cache\huggingface\hub\models--Systr
 Type: filesandordirs; Name: "{%USERPROFILE}\.cache\huggingface\hub\models--Systran--faster-whisper-medium"
 Type: filesandordirs; Name: "{%USERPROFILE}\.cache\huggingface\hub\models--Systran--faster-whisper-large-v3-turbo"
 Type: filesandordirs; Name: "{%USERPROFILE}\.cache\huggingface\hub\models--Systran--faster-whisper-large-v3"
+Type: filesandordirs; Name: "{%USERPROFILE}\.cache\huggingface\hub\models--mobiuslabsgmbh--faster-whisper-large-v3-turbo"
 
 [Code]
 function InitializeSetup(): Boolean;

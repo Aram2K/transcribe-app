@@ -8,8 +8,15 @@
   "backend": "local",
   "google_api_key": "",
   "initial_prompt": "",
+  "output_action": "transcribe_only",
+  "action_model": "built_in",
+  "translate_target": "en",
   "input_device_index": null,
   "silence_trigger_sec": 0.8,
   "min_speech_sec": 1.5,
-  "max_speech_sec": 25.0
+  "max_speech_sec": 25.0,
+  "privacy_mode": false,
+  "save_history": true,
+  "analytics_enabled": false,
+  "analytics_endpoint": "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-analytics"
 }

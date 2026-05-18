@@ -46,8 +46,14 @@ def delete(index):
     return False
 
 
-def export_csv(path):
-    entries = load()
+def _export_entries(entries=None):
+    if entries is None:
+        return load()
+    return list(entries)
+
+
+def export_csv(path, entries=None):
+    entries = _export_entries(entries)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as f:
@@ -63,8 +69,8 @@ def export_csv(path):
     return len(entries)
 
 
-def export_txt(path):
-    entries = load()
+def export_txt(path, entries=None):
+    entries = _export_entries(entries)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
