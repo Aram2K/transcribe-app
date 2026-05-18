@@ -46,7 +46,8 @@ jobs:
           _stub("numpy",{"frombuffer":MagicMock,"abs":MagicMock,"percentile":MagicMock(return_value=100),"concatenate":MagicMock,"array":MagicMock,"int16":MagicMock,"float32":MagicMock,"mean":MagicMock(return_value=0.0)})
           _pi=_stub("PIL.Image",{"new":MagicMock,"LANCZOS":MagicMock})
           _pd=_stub("PIL.ImageDraw",{"Draw":MagicMock})
-          _pil=_stub("PIL",{}); _pil.Image=_pi; _pil.ImageDraw=_pd
+          _pt=_stub("PIL.ImageTk",{"PhotoImage":MagicMock})
+          _pil=_stub("PIL",{}); _pil.Image=_pi; _pil.ImageDraw=_pd; _pil.ImageTk=_pt
           _tk=_stub("tkinter"); _tk.Tk=MagicMock; _tk.Toplevel=MagicMock; _tk.Frame=MagicMock
           _tk.Label=MagicMock; _tk.Canvas=MagicMock; _tk.StringVar=MagicMock
           _tk.IntVar=MagicMock; _tk.BooleanVar=MagicMock; _tk.Text=MagicMock
