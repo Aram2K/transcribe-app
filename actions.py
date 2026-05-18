@@ -1,5 +1,6 @@
 import re
 
+import action_api
 import local_llm
 
 
@@ -8,6 +9,11 @@ ACTION_WRITE_EMAIL = "write_email"
 ACTION_MAKE_TODO = "make_todo_list"
 ACTION_TRANSLATE = "translate"
 
+RULE_BASED_ID = "rule_based"
+API_OPENAI_ID = "api_openai_compatible"
+API_GEMINI_ID = "api_gemini"
+API_ANTHROPIC_ID = "api_anthropic"
+
 ACTION_MODES = {
     ACTION_TRANSCRIBE_ONLY: {
         "label": "Transcribe only",
@@ -15,39 +21,82 @@ ACTION_MODES = {
     },
     ACTION_WRITE_EMAIL: {
         "label": "Write email",
-        "description": "Turn the transcription into a simple email draft locally.",
+        "description": "Turn the transcription into an email draft.",
     },
     ACTION_MAKE_TODO: {
         "label": "Make todo list",
-        "description": "Extract a checklist from the transcription locally.",
+        "description": "Extract a checklist from the transcription.",
     },
     ACTION_TRANSLATE: {
         "label": "Translate",
-        "description": "Translate locally when an offline language pack is installed.",
+        "description": "Translate with a local language pack, local LLM, or your own action API.",
     },
 }
 
 ACTION_MODELS = {
-    "built_in": {
-        "label": "Built-in local actions",
-        "description": "Works now without downloads. Best for email/todo formatting.",
+    RULE_BASED_ID: {
+        "label": "Rule-based formatter",
+        "description": "Fast local formatting for email/todo. Simple rules, not an LLM.",
         "available": True,
+        "kind": "rules",
     },
-    local_llm.QWEN_TINY_ID: {
-        "label": "Qwen Tiny local model",
-        "description": "Downloadable GGUF action model for 16 GB RAM computers.",
+    API_OPENAI_ID: {
+        "label": "OpenAI-compatible API",
+        "description": "Bring your own key for OpenAI, OpenRouter, Groq, Together, LM Studio, or compatible APIs.",
+        "available": True,
+        "kind": "cloud",
+        "provider": action_api.PROVIDER_OPENAI,
+    },
+    API_GEMINI_ID: {
+        "label": "Google Gemini API",
+        "description": "Bring your own Gemini API key for cloud action modes.",
+        "available": True,
+        "kind": "cloud",
+        "provider": action_api.PROVIDER_GEMINI,
+    },
+    API_ANTHROPIC_ID: {
+        "label": "Anthropic API",
+        "description": "Bring your own Anthropic API key for cloud action modes.",
+        "available": True,
+        "kind": "cloud",
+        "provider": action_api.PROVIDER_ANTHROPIC,
+    },
+}
+
+for _code, _info in local_llm.MODEL_CATALOG.items():
+    ACTION_MODELS[_code] = {
+        "label": _info["label"],
+        "description": _info["description"],
         "available": True,
         "downloadable": True,
+        "kind": "local_llm",
+        "min_ram": _info["min_ram"],
+        "size": _info["size"],
+        "gpu_recommended": _info["gpu_recommended"],
+    }
+
+ACTION_MODEL_ALIASES = {
+    "built_in": RULE_BASED_ID,
+    "aibuben_tiny": local_llm.QWEN_TINY_ID,
+    "aibuben_balanced": local_llm.QWEN_3B_ID,
+    "aibuben_gpu": local_llm.QWEN_7B_ID,
+    "openai": API_OPENAI_ID,
+    "gemini": API_GEMINI_ID,
+    "anthropic": API_ANTHROPIC_ID,
+}
+
+ACTION_API_MODELS = {
+    API_OPENAI_ID: {
+        "provider": action_api.PROVIDER_OPENAI,
+        **action_api.PROVIDERS[action_api.PROVIDER_OPENAI],
     },
-    "aibuben_balanced": {
-        "label": "Aibuben Balanced local model",
-        "description": "Planned stronger local action model for faster CPUs or GPUs.",
-        "available": False,
+    API_GEMINI_ID: {
+        "provider": action_api.PROVIDER_GEMINI,
+        **action_api.PROVIDERS[action_api.PROVIDER_GEMINI],
     },
-    "aibuben_gpu": {
-        "label": "Aibuben GPU local model",
-        "description": "Planned high-quality GPU action model.",
-        "available": False,
+    API_ANTHROPIC_ID: {
+        "provider": action_api.PROVIDER_ANTHROPIC,
+        **action_api.PROVIDERS[action_api.PROVIDER_ANTHROPIC],
     },
 }
 
@@ -73,17 +122,15 @@ def normalize_action_mode(mode):
 
 
 def normalize_action_model(model):
-    model = model or "built_in"
-    if model == "aibuben_tiny":
-        model = local_llm.QWEN_TINY_ID
-    return model if model in ACTION_MODELS else "built_in"
+    model = ACTION_MODEL_ALIASES.get(model or RULE_BASED_ID, model or RULE_BASED_ID)
+    return model if model in ACTION_MODELS else RULE_BASED_ID
 
 
 def normalize_translate_target(code):
     return code if code in TRANSLATE_TARGETS else "en"
 
 
-def process(text, mode, source_lang="auto", target_lang="en", model="built_in"):
+def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_ID, config=None):
     mode = normalize_action_mode(mode)
     model = normalize_action_model(model)
     text = (text or "").strip()
@@ -91,14 +138,23 @@ def process(text, mode, source_lang="auto", target_lang="en", model="built_in"):
         return ""
     if mode == ACTION_TRANSCRIBE_ONLY:
         return text
-    if model == local_llm.QWEN_TINY_ID and local_llm.model_downloaded():
+
+    if ACTION_MODELS[model].get("kind") == "cloud":
+        if not config:
+            raise ActionError("Add your action API settings before using this action engine.")
+        api_config = {**config, "action_api_provider": ACTION_MODELS[model]["provider"]}
         try:
-            return local_llm.run_action(text, mode, source_lang=source_lang, target_lang=target_lang)
+            return action_api.run_action(text, mode, api_config, source_lang=source_lang, target_lang=target_lang)
+        except action_api.ActionAPIError as e:
+            raise ActionError(str(e)) from e
+
+    if ACTION_MODELS[model].get("kind") == "local_llm" and local_llm.model_downloaded(model):
+        try:
+            return local_llm.run_action(text, mode, source_lang=source_lang, target_lang=target_lang, model_id=model)
         except local_llm.LocalLLMError as e:
             if mode == ACTION_TRANSLATE:
                 raise ActionError(str(e)) from e
-    elif model != "built_in" and not ACTION_MODELS[model]["available"]:
-        raise ActionError("That local action model is not available yet. Use Built-in local actions for now.")
+
     if mode == ACTION_WRITE_EMAIL:
         return _write_email(text)
     if mode == ACTION_MAKE_TODO:
@@ -107,13 +163,24 @@ def process(text, mode, source_lang="auto", target_lang="en", model="built_in"):
         try:
             return _translate_local(text, source_lang, target_lang)
         except ActionError:
-            if local_llm.model_downloaded():
+            llm_model = model if ACTION_MODELS[model].get("kind") == "local_llm" else _first_downloaded_local_model()
+            if llm_model and local_llm.model_downloaded(llm_model):
                 try:
-                    return local_llm.run_action(text, mode, source_lang=source_lang, target_lang=target_lang)
+                    return local_llm.run_action(text, mode, source_lang=source_lang, target_lang=target_lang, model_id=llm_model)
                 except local_llm.LocalLLMError as e:
                     raise ActionError(str(e)) from e
             raise
     return text
+
+
+def _first_downloaded_local_model():
+    for model_id in local_llm.MODEL_CATALOG:
+        try:
+            if local_llm.model_downloaded(model_id):
+                return model_id
+        except local_llm.LocalLLMError:
+            pass
+    return None
 
 
 def _clean_sentence(text):
@@ -189,6 +256,6 @@ def _translate_local(text, source_lang, target_lang):
     translation = from_lang.get_translation(to_lang)
     if not translation:
         raise ActionError(
-            f"Missing local translation pack for {from_lang.code} -> {to_lang.code}."
+            f"Missing local translation pack for {from_lang.code} -> {target_code}."
         )
     return translation.translate(text).strip()
