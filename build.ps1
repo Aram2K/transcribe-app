@@ -16,15 +16,18 @@ pyinstaller `
     --name "TranscribeApp" `
     --add-data "config.example.json;." `
     --add-data "history.py;." `
+    --add-data "assets/google_logo.png;assets" `
     --hidden-import "faster_whisper" `
     --hidden-import "faster_whisper.utils" `
     --hidden-import "tqdm" `
     --hidden-import "tqdm.auto" `
     --hidden-import "ctranslate2" `
     --hidden-import "huggingface_hub" `
+    --hidden-import "llama_cpp" `
     --hidden-import "tokenizers" `
     --collect-all "faster_whisper" `
     --collect-all "ctranslate2" `
+    --collect-all "llama_cpp" `
     --collect-all "pystray" `
     --collect-all "pynput" `
     --collect-all "pyaudio" `

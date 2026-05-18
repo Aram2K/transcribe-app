@@ -1,22 +1,29 @@
 import sys, threading, time, json, math, wave, io, struct, webbrowser, socket, queue, logging, hashlib
 import tkinter as tk
 from tkinter import ttk
+from pathlib import Path
 from urllib.parse import urlparse
 import psutil, pyaudio, numpy as np, keyboard, pyperclip, pystray, requests, base64, ctypes
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 from pynput.keyboard import Controller, Key
 from pynput import mouse as pynput_mouse
 from faster_whisper import WhisperModel
 import storage
 import history as hist
+import actions
+import local_llm
+import telemetry
 
 # ── Version ───────────────────────────────────────────────────────────────────
 
-APP_VERSION = "1.5.21"
+APP_VERSION = "1.5.26"
+PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
 RELEASES_MANIFEST_URL = "https://github.com/Aram2K/transcribe-app/releases/latest/download/update-manifest.json"
 AIBUBEN_URL = "https://aibuben.xyz"
+GOOGLE_API_KEY_URL = "https://console.cloud.google.com/apis/credentials"
+GOOGLE_SPEECH_DOCS_URL = "https://cloud.google.com/speech-to-text/docs/reference/rest/v1/RecognitionConfig"
 
 SINGLE_INSTANCE_PORT = 47823   # localhost-only IPC for "open on second launch"
 
@@ -42,12 +49,22 @@ DEFAULT = {
     "backend":       "local",
     "google_api_key": "",
     "initial_prompt": "",
+    "output_action": "transcribe_only",
+    "action_model": "built_in",
+    "translate_target": "en",
     "input_device_index": None,
     "silence_trigger_sec": 0.8,
     "min_speech_sec": 1.5,
     "max_speech_sec": 25.0,
+    "privacy_mode": False,
+    "save_history": True,
+    "analytics_enabled": False,
+    "analytics_endpoint": "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-analytics",
     "onboarding_done": False,
     "dismissed_update_version": "",   # remember which update tag the user dismissed
+    "pending_update_version": "",
+    "pending_update_body": "",
+    "previous_version": "",
     "tray_hint_shown": False,         # whether we've shown the "I live in your tray" hint
 }
 
@@ -71,16 +88,38 @@ def load_config():
     else:
         loaded["google_api_key"] = storage.read_secret(storage.GOOGLE_API_KEY_SECRET)
 
+    if loaded.get("privacy_mode"):
+        loaded["backend"] = "local"
+        loaded["save_history"] = False
+        loaded["analytics_enabled"] = False
+
     return loaded
 
 def save_config(c):
     disk = {**c}
+    if disk.get("privacy_mode"):
+        disk["backend"] = "local"
+        disk["save_history"] = False
+        disk["analytics_enabled"] = False
     key = (disk.get("google_api_key") or "").strip()
     if storage.write_secret(storage.GOOGLE_API_KEY_SECRET, key):
         disk["google_api_key"] = ""
     storage.atomic_write_json(CONFIG_PATH, disk)
 
 cfg = load_config()
+
+def resource_path(*parts):
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    candidate = base.joinpath(*parts)
+    if candidate.exists():
+        return str(candidate)
+    return str(Path(__file__).resolve().parent.joinpath(*parts))
+
+def load_tk_image(*parts, size=None):
+    img = Image.open(resource_path(*parts)).convert("RGBA")
+    if size:
+        img = img.resize(size, Image.LANCZOS)
+    return ImageTk.PhotoImage(img)
 
 def attach_placeholder_entry(entry, variable, placeholder, normal_fg, placeholder_fg, secret_char=""):
     state = {"placeholder": False}
@@ -175,10 +214,10 @@ RAM_GB = psutil.virtual_memory().total / (1024 ** 3)
 MODELS = {
     "tiny":           {"min_ram": 2,  "speed": "~0.5s", "quality": "Good",        "size": "75 MB",   "armenian": None},
     "base":           {"min_ram": 4,  "speed": "~1s",   "quality": "Better",      "size": "140 MB",  "armenian": None},
-    "small":          {"min_ram": 6,  "speed": "~3s",   "quality": "Great",       "size": "460 MB",  "armenian": "Minimum for Armenian"},
-    "medium":         {"min_ram": 10, "speed": "~8s",   "quality": "Excellent",   "size": "1.4 GB",  "armenian": "Good for Armenian"},
+    "small":          {"min_ram": 6,  "speed": "~3s",   "quality": "Great",       "size": "460 MB",  "armenian": None},
+    "medium":         {"min_ram": 10, "speed": "~8s",   "quality": "Excellent",   "size": "1.4 GB",  "armenian": None},
     "large-v3-turbo": {"min_ram": 8,  "speed": "~5s",   "quality": "Best (fast)", "size": "1.6 GB",  "armenian": "Recommended for Armenian"},
-    "large-v3":       {"min_ram": 16, "speed": "~15s",  "quality": "Best",        "size": "3 GB",    "armenian": "Best Armenian accuracy"},
+    "large-v3":       {"min_ram": 16, "speed": "~15s",  "quality": "Best",        "size": "3 GB",    "armenian": None},
 }
 
 LANG_NAMES = {
@@ -294,6 +333,34 @@ def download_whisper_model(name, on_progress=None):
     on_progress(100, totals["expected"], totals["expected"])
     return path
 
+def whisper_model_cache_dir(name):
+    try:
+        from pathlib import Path
+        from faster_whisper.utils import download_model
+        path = Path(download_model(name, local_files_only=True)).resolve()
+        for candidate in (path, *path.parents):
+            if candidate.name.startswith("models--"):
+                return candidate
+        return path
+    except Exception:
+        return None
+
+def remove_whisper_model(name):
+    import os, stat, shutil
+    cache_dir = whisper_model_cache_dir(name)
+    if not cache_dir or not cache_dir.exists():
+        return False
+
+    def _onerror(func, path, _exc_info):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except Exception:
+            raise
+
+    shutil.rmtree(cache_dir, onerror=_onerror)
+    return True
+
 # Detect CUDA GPU via ctranslate2 (already a dependency of faster-whisper)
 HAS_GPU = False
 try:
@@ -374,6 +441,12 @@ class AudioRecorder:
             if self._model is None or self._model_name != name:
                 self._model      = WhisperModel(name, device="cpu", compute_type="int8")
                 self._model_name = name
+
+    def unload_model(self, name=None):
+        with self._model_lock:
+            if name is None or self._model_name == name:
+                self._model = None
+                self._model_name = None
 
     def start_recording(self):
         self.recording = True
@@ -1021,9 +1094,12 @@ class HistoryWindow:
         self.search_var = None
         self._list_outer = None
         self._count_label = None
+        self._selection_label = None
+        self._selected_indices = set()
 
     def open(self):
         self.root.deiconify()
+        telemetry.track("history_opened", {}, cfg, APP_VERSION)
         if self.win and self.win.winfo_exists():
             self.win.deiconify()
             self.win.lift()
@@ -1058,14 +1134,21 @@ class HistoryWindow:
         self._count_label = tk.Label(hdr, text=f"  {len(entries)} entries",
                                      bg=self.BG, fg=self.FG2, font=("Segoe UI", 9))
         self._count_label.pack(side="left", pady=4)
+        self._selection_label = tk.Label(hdr, text="",
+                                         bg=self.BG, fg=self.FG2, font=("Segoe UI", 9))
+        self._selection_label.pack(side="left", pady=4)
 
         if entries:
+            actions = tk.Frame(w, bg=self.BG)
+            actions.pack(fill="x", padx=20, pady=(0, 8))
             for label, cmd in [
                 ("Clear all", self._clear),
+                ("Clear selected", self._clear_selection),
+                ("Select visible", self._select_visible),
                 ("Export TXT", lambda: self._export("txt")),
                 ("Export CSV", lambda: self._export("csv")),
             ]:
-                tk.Button(hdr, text=label, command=cmd,
+                tk.Button(actions, text=label, command=cmd,
                           bg=self.BG, fg="#555555", activebackground=self.BG,
                           font=("Segoe UI", 9), relief="flat", cursor="hand2").pack(side="right", padx=(8, 0))
 
@@ -1079,7 +1162,10 @@ class HistoryWindow:
         tk.Frame(w, bg=self.SEP, height=1).pack(fill="x")
 
         if not entries:
-            tk.Label(w, text="No transcriptions yet.\nPress your hotkey to start.",
+            msg = ("History saving is off.\nNew transcriptions will not be saved."
+                   if not cfg.get("save_history", True)
+                   else "No transcriptions yet.\nPress your hotkey to start.")
+            tk.Label(w, text=msg,
                      bg=self.BG, fg=self.FG2,
                      font=("Segoe UI", 11)).pack(expand=True)
             return
@@ -1103,6 +1189,40 @@ class HistoryWindow:
             or query in e.get("timestamp", "").lower()
         ]
 
+    def _update_selection_label(self):
+        if not self._selection_label or not self._selection_label.winfo_exists():
+            return
+        count = len(self._selected_indices)
+        self._selection_label.configure(text=f"  {count} selected" if count else "")
+
+    def _select_visible(self):
+        for idx, _entry in self._filtered_entries():
+            self._selected_indices.add(idx)
+        self._render_entries()
+
+    def _clear_selection(self):
+        self._selected_indices.clear()
+        self._render_entries()
+
+    def _toggle_selection(self, idx, selected):
+        if selected:
+            self._selected_indices.add(idx)
+        else:
+            self._selected_indices.discard(idx)
+        self._update_selection_label()
+
+    def _entries_for_export(self):
+        entries = hist.load()
+        if self._selected_indices:
+            selected = [
+                entries[idx] for idx in sorted(self._selected_indices)
+                if 0 <= idx < len(entries)
+            ]
+            return selected, "selected"
+        filtered = [entry for _idx, entry in self._filtered_entries()]
+        query = (self.search_var.get() if self.search_var else "").strip()
+        return filtered, "visible" if query else "all"
+
     def _render_entries(self):
         if not self._list_outer or not self._list_outer.winfo_exists():
             return
@@ -1114,6 +1234,11 @@ class HistoryWindow:
         if self._count_label and self._count_label.winfo_exists():
             suffix = f"  {len(entries)} of {total} entries" if len(entries) != total else f"  {total} entries"
             self._count_label.configure(text=suffix)
+        self._selected_indices = {
+            idx for idx in self._selected_indices
+            if 0 <= idx < total
+        }
+        self._update_selection_label()
 
         if not entries:
             tk.Label(self._list_outer, text="No matches.",
@@ -1146,6 +1271,14 @@ class HistoryWindow:
         # Top row: timestamp + language + backend
         top = tk.Frame(card, bg=self.CARD)
         top.pack(fill="x")
+        selected = tk.BooleanVar(value=original_idx in self._selected_indices)
+        choose = tk.Checkbutton(top, variable=selected,
+                                command=lambda idx=original_idx, var=selected: self._toggle_selection(idx, var.get()),
+                                bg=self.CARD, activebackground=self.CARD,
+                                selectcolor="#1e1e1e", fg=self.FG2,
+                                highlightthickness=0, bd=0, cursor="hand2")
+        choose.var = selected
+        choose.pack(side="left", padx=(0, 6))
         tk.Label(top, text=entry["timestamp"], bg=self.CARD, fg=self.FG2,
                  font=("Segoe UI", 8)).pack(side="left")
 
@@ -1174,11 +1307,21 @@ class HistoryWindow:
         tk.Frame(parent, bg=self.SEP, height=1).pack(fill="x", padx=12)
 
     def _delete(self, idx):
-        hist.delete(idx)
-        self._render_entries()
+        if hist.delete(idx):
+            shifted = set()
+            for selected_idx in self._selected_indices:
+                if selected_idx == idx:
+                    continue
+                shifted.add(selected_idx - 1 if selected_idx > idx else selected_idx)
+            self._selected_indices = shifted
+            self._render_entries()
 
     def _export(self, kind):
         from tkinter import filedialog, messagebox
+        entries, scope = self._entries_for_export()
+        if not entries:
+            messagebox.showinfo("Nothing to export", "There are no history items in the current selection.", parent=self.win)
+            return
         if kind == "csv":
             path = filedialog.asksaveasfilename(
                 parent=self.win,
@@ -1187,8 +1330,9 @@ class HistoryWindow:
                 filetypes=[("CSV files", "*.csv")],
             )
             if path:
-                count = hist.export_csv(path)
-                messagebox.showinfo("History exported", f"Exported {count} entries.", parent=self.win)
+                count = hist.export_csv(path, entries)
+                telemetry.track("history_exported", {"kind": "csv", "scope": scope, "count": count}, cfg, APP_VERSION)
+                messagebox.showinfo("History exported", f"Exported {count} {scope} entries.", parent=self.win)
         else:
             path = filedialog.asksaveasfilename(
                 parent=self.win,
@@ -1197,14 +1341,17 @@ class HistoryWindow:
                 filetypes=[("Text files", "*.txt")],
             )
             if path:
-                count = hist.export_txt(path)
-                messagebox.showinfo("History exported", f"Exported {count} entries.", parent=self.win)
+                count = hist.export_txt(path, entries)
+                telemetry.track("history_exported", {"kind": "txt", "scope": scope, "count": count}, cfg, APP_VERSION)
+                messagebox.showinfo("History exported", f"Exported {count} {scope} entries.", parent=self.win)
 
     def _clear(self):
         from tkinter import messagebox
         if not messagebox.askyesno("Clear history", "Delete all transcription history?", parent=self.win):
             return
         hist.clear()
+        self._selected_indices.clear()
+        telemetry.track("history_cleared", {}, cfg, APP_VERSION)
         self._build()
 
 # ── Settings Window ───────────────────────────────────────────────────────────
@@ -1226,7 +1373,7 @@ class Settings:
     FG2    = "#6e6e73"
     SEL_BG = "#eaf1ff"   # selected card tint
 
-    TABS = ["General", "Model", "Language", "Appearance"]
+    TABS = ["General", "Model", "Actions", "Language", "Appearance"]
 
     def __init__(self, root, app):
         self.root         = root
@@ -1241,9 +1388,13 @@ class Settings:
         self._model_states = {}
         self._model_progress = {}
         self._model_scan_running = False
+        self._action_model_states = {}
+        self._action_model_progress = {}
+        self._image_refs = []
 
     def open(self):
         self.root.deiconify()
+        telemetry.track("settings_opened", {}, cfg, APP_VERSION)
         if self.win and self.win.winfo_exists():
             self.win.deiconify()
             self._center_window()
@@ -1331,6 +1482,12 @@ class Settings:
         self.silence_var = tk.StringVar(value=str(cfg.get("silence_trigger_sec", DEFAULT["silence_trigger_sec"])))
         self.min_speech_var = tk.StringVar(value=str(cfg.get("min_speech_sec", DEFAULT["min_speech_sec"])))
         self.max_speech_var = tk.StringVar(value=str(cfg.get("max_speech_sec", DEFAULT["max_speech_sec"])))
+        self.privacy_mode_var = tk.BooleanVar(value=bool(cfg.get("privacy_mode", False)))
+        self.save_history_var = tk.BooleanVar(value=bool(cfg.get("save_history", True)))
+        self.analytics_enabled_var = tk.BooleanVar(value=bool(cfg.get("analytics_enabled", False)))
+        self.action_mode_var = tk.StringVar(value=actions.normalize_action_mode(cfg.get("output_action")))
+        self.action_model_var = tk.StringVar(value=actions.normalize_action_model(cfg.get("action_model")))
+        self.translate_target_var = tk.StringVar(value=actions.normalize_translate_target(cfg.get("translate_target")))
         self._captured_hotkey  = cfg["hotkey"]
         self._capturing_hotkey = False
         self._device_map = {}
@@ -1379,8 +1536,14 @@ class Settings:
         # Clear and rebuild scroll content
         for w in self._scroll_frame.winfo_children():
             w.destroy()
-        [self._build_general, self._build_model,
+        [self._build_general, self._build_model, self._build_actions,
          self._build_language, self._build_appearance][idx](self._scroll_frame)
+        telemetry.track(
+            "settings_tab_opened",
+            {"tab": self.TABS[idx].lower()},
+            cfg,
+            APP_VERSION,
+        )
         self._canvas.yview_moveto(0)
 
     def _capture_prompt(self):
@@ -1395,6 +1558,9 @@ class Settings:
 
     def _build_general(self, f):
         self._build_hotkey_section(f)
+
+        self._section(f, "Privacy")
+        self._build_privacy_section(f)
 
         self._section(f, "Backend")
         bf = tk.Frame(f, bg=self.BG); bf.pack(fill="x", padx=20, pady=(4, 0))
@@ -1411,6 +1577,64 @@ class Settings:
 
         self._section(f, "Silence Detection")
         self._build_silence_section(f)
+
+        self._section(f, "History")
+        self._build_history_section(f)
+
+    def _build_privacy_section(self, parent):
+        box = tk.Frame(parent, bg=self.CARD, highlightthickness=1, highlightbackground=self.BORDER)
+        box.pack(fill="x", padx=20, pady=(4, 16))
+
+        row = tk.Frame(box, bg=self.CARD)
+        row.pack(fill="x", padx=14, pady=(10, 2))
+        privacy = tk.Checkbutton(row, variable=self.privacy_mode_var,
+                                 command=self._privacy_toggled,
+                                 bg=self.CARD, activebackground=self.CARD,
+                                 selectcolor="#f8f8fb", highlightthickness=0, bd=0,
+                                 cursor="hand2")
+        privacy.pack(side="left", padx=(0, 8))
+        tk.Label(row, text="Privacy Mode",
+                 bg=self.CARD, fg=self.FG, font=("Segoe UI Semibold", 9)).pack(side="left")
+
+        tk.Label(box,
+                 text="Forces local transcription, disables Google Cloud, turns off analytics, and stops saving History.",
+                 bg=self.CARD, fg=self.FG2, font=("Segoe UI", 8),
+                 wraplength=430, justify="left").pack(anchor="w", padx=42, pady=(0, 10))
+
+        analytics_row = tk.Frame(box, bg=self.CARD)
+        analytics_row.pack(fill="x", padx=14, pady=(0, 2))
+        self.analytics_check = tk.Checkbutton(analytics_row, variable=self.analytics_enabled_var,
+                                              bg=self.CARD, activebackground=self.CARD,
+                                              selectcolor="#f8f8fb", highlightthickness=0, bd=0,
+                                              cursor="hand2")
+        self.analytics_check.pack(side="left", padx=(0, 8))
+        tk.Label(analytics_row, text="Share anonymous usage analytics",
+                 bg=self.CARD, fg=self.FG, font=("Segoe UI", 9)).pack(side="left")
+
+        tk.Label(box,
+                 text="Analytics never includes audio, transcription text, clipboard content, API keys, file paths, or microphone names.",
+                 bg=self.CARD, fg=self.FG2, font=("Segoe UI", 8),
+                 wraplength=430, justify="left").pack(anchor="w", padx=42, pady=(0, 12))
+        self._refresh_privacy_controls()
+
+    def _privacy_toggled(self):
+        if self.privacy_mode_var.get():
+            self.backend_var.set("local")
+            self.save_history_var.set(False)
+            self.analytics_enabled_var.set(False)
+            self.test_result.set("Privacy Mode uses local models only.")
+        self._refresh_privacy_controls()
+        if hasattr(self, "_backend_cards_frame") and self._backend_cards_frame.winfo_exists():
+            self._render_backend_cards()
+        if hasattr(self, "google_section") and self.google_section.winfo_exists():
+            self._toggle_google_section()
+
+    def _refresh_privacy_controls(self):
+        private = bool(self.privacy_mode_var.get())
+        if hasattr(self, "analytics_check") and self.analytics_check.winfo_exists():
+            self.analytics_check.configure(state="disabled" if private else "normal")
+        if hasattr(self, "history_check") and self.history_check.winfo_exists():
+            self.history_check.configure(state="disabled" if private else "normal")
 
     def _build_hotkey_section(self, parent):
         self._section(parent, "Hotkey")
@@ -1435,19 +1659,27 @@ class Settings:
         """Rebuild ONLY the backend cards section. Avoids full-tab redraw flicker."""
         for w in self._backend_cards_frame.winfo_children():
             w.destroy()
-        for val, title, desc, icon in [
-            ("local",  "Local (Offline)",  "Private · free · no internet needed", "💻"),
-            ("google", "Google Cloud",     "Best accuracy for Armenian · 60 min/mo free", "☁"),
+        self._image_refs = []
+        google_desc = (
+            "Disabled in Privacy Mode"
+            if self.privacy_mode_var.get()
+            else "Online · bring your own API key · Google billing"
+        )
+        for val, title, desc, icon, logo in [
+            ("local",  "Local (Offline)",  "Private · free · no internet needed", "PC", None),
+            ("google", "Google Cloud",     google_desc, "", "google_logo.png"),
         ]:
-            self._backend_card(self._backend_cards_frame, val, title, desc, icon)
+            self._backend_card(self._backend_cards_frame, val, title, desc, icon, logo)
         self._toggle_google_section()
 
-    def _backend_card(self, parent, val, title, desc, icon):
+    def _backend_card(self, parent, val, title, desc, icon, logo_name=None):
         sel   = self.backend_var.get() == val
+        disabled = val == "google" and self.privacy_mode_var.get()
         bg    = self.SEL_BG if sel else self.CARD
         bord  = cfg["accent_color"] if sel else self.BORDER
+        fg_title = self.FG2 if disabled else self.FG
 
-        card = tk.Frame(parent, bg=bord, padx=1, pady=1, cursor="hand2")
+        card = tk.Frame(parent, bg=bord, padx=1, pady=1, cursor="arrow" if disabled else "hand2")
         card.pack(fill="x", pady=(0, 8))
         inner = tk.Frame(card, bg=bg, padx=14, pady=10)
         inner.pack(fill="x")
@@ -1461,24 +1693,57 @@ class Settings:
         else:
             dot_c.create_oval(2, 2, 14, 14, outline="#b0b0ba", width=2)
 
-        tk.Label(row, text=f"{icon}  {title}", bg=bg, fg=self.FG,
+        if logo_name:
+            try:
+                photo = load_tk_image("assets", logo_name, size=(22, 22))
+                self._image_refs.append(photo)
+                tk.Label(row, image=photo, bg=bg).pack(side="left", padx=(0, 8))
+            except Exception:
+                tk.Label(row, text="G", bg=bg, fg="#4285f4",
+                         font=("Segoe UI Semibold", 10)).pack(side="left", padx=(0, 8))
+        elif icon:
+            tk.Label(row, text=icon, bg=bg, fg=self.FG2,
+                     font=("Segoe UI Semibold", 9), width=3).pack(side="left", padx=(0, 6))
+        tk.Label(row, text=title, bg=bg, fg=fg_title,
                  font=("Segoe UI Semibold", 10)).pack(side="left")
         tk.Label(inner, text=desc, bg=bg, fg=self.FG2,
                  font=("Segoe UI", 8)).pack(anchor="w", padx=24)
 
         def _select(e=None):
+            if disabled:
+                self.test_result.set("Privacy Mode uses local models only.")
+                return
             if self.backend_var.get() == val:
                 return
             self.backend_var.set(val)
             self._render_backend_cards()
+            telemetry.track("backend_selected", {"backend": val}, cfg, APP_VERSION)
+            if val == "google":
+                self._prompt_google_api_key()
         for w in [card, inner, row] + list(row.winfo_children()) + list(inner.winfo_children()):
             w.bind("<Button-1>", _select)
             if hasattr(w, 'configure'):
-                try: w.configure(cursor="hand2")
+                try: w.configure(cursor="arrow" if disabled else "hand2")
                 except: pass
+
+    def _prompt_google_api_key(self):
+        if (self.api_key_var.get() or "").strip():
+            return
+        self.test_result.set("Paste your Google Cloud API key, then click Test Key.")
+        if hasattr(self, "test_label") and self.test_label.winfo_exists():
+            self.test_label.configure(fg="#f97316")
+        if hasattr(self, "google_api_entry") and self.google_api_entry.winfo_exists():
+            self.win.after(80, lambda: (
+                self.google_api_entry.focus_set(),
+                self.google_api_entry.icursor(tk.END),
+            ))
 
     def _build_google_section(self, parent):
         self._section(parent, "Google API Key")
+        tk.Label(parent,
+                 text="Google Cloud requires your own API key. Transcribe does not include one.",
+                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 8),
+                 wraplength=460, justify="left").pack(anchor="w", padx=20, pady=(2, 6))
         kf = tk.Frame(parent, bg=self.CARD,
                       highlightthickness=1, highlightbackground=self.BORDER)
         kf.pack(fill="x", padx=20, pady=(4, 4))
@@ -1499,6 +1764,14 @@ class Settings:
         )
 
         tr = tk.Frame(parent, bg=self.BG); tr.pack(anchor="w", padx=20, pady=(0, 8))
+        key_btn = tk.Label(tr, text="Get API Key",
+                           bg="#efefef", fg=self.FG,
+                           font=("Segoe UI", 9), padx=12, pady=5, cursor="hand2")
+        key_btn.pack(side="left", padx=(0, 8))
+        key_btn.bind("<Button-1>", lambda e: webbrowser.open(GOOGLE_API_KEY_URL))
+        key_btn.bind("<Enter>",    lambda e: key_btn.configure(bg="#e0e0e8"))
+        key_btn.bind("<Leave>",    lambda e: key_btn.configure(bg="#efefef"))
+
         test_btn = tk.Label(tr, text="Test Key",
                             bg="#efefef", fg=self.FG,
                             font=("Segoe UI", 9), padx=12, pady=5, cursor="hand2")
@@ -1511,7 +1784,7 @@ class Settings:
         self.test_label.pack(side="left", padx=(10, 0))
 
     def _toggle_google_section(self):
-        if self.backend_var.get() == "google":
+        if self.backend_var.get() == "google" and not self.privacy_mode_var.get():
             self.google_section.pack(fill="x")
         else:
             self.google_section.pack_forget()
@@ -1617,6 +1890,45 @@ class Settings:
                      insertbackground=self.FG, relief="flat", width=8,
                      justify="right", font=("Segoe UI", 9)).pack(side="right")
 
+    def _build_history_section(self, parent):
+        box = tk.Frame(parent, bg=self.CARD, highlightthickness=1, highlightbackground=self.BORDER)
+        box.pack(fill="x", padx=20, pady=(4, 16))
+
+        row = tk.Frame(box, bg=self.CARD)
+        row.pack(fill="x", padx=14, pady=(10, 2))
+        self.history_check = tk.Checkbutton(row, variable=self.save_history_var,
+                                            bg=self.CARD, activebackground=self.CARD,
+                                            selectcolor="#f8f8fb", highlightthickness=0, bd=0,
+                                            cursor="hand2")
+        self.history_check.pack(side="left", padx=(0, 8))
+        tk.Label(row, text="Save transcription history",
+                 bg=self.CARD, fg=self.FG,
+                 font=("Segoe UI", 9)).pack(side="left")
+
+        tk.Label(box,
+                 text="Turn this off to keep future transcriptions out of History.",
+                 bg=self.CARD, fg=self.FG2, font=("Segoe UI", 8),
+                 wraplength=430, justify="left").pack(anchor="w", padx=42, pady=(0, 10))
+
+        clear = tk.Label(box, text="Clear Existing History",
+                         bg="#efefef", fg=self.FG, font=("Segoe UI", 9),
+                         padx=12, pady=5, cursor="hand2")
+        clear.pack(anchor="w", padx=42, pady=(0, 12))
+        clear.bind("<Button-1>", lambda e: self._clear_history_from_settings())
+        clear.bind("<Enter>", lambda e: clear.configure(bg="#e0e0e8"))
+        clear.bind("<Leave>", lambda e: clear.configure(bg="#efefef"))
+        self._refresh_privacy_controls()
+
+    def _clear_history_from_settings(self):
+        from tkinter import messagebox
+        if not messagebox.askyesno("Clear history", "Delete all transcription history?", parent=self.win):
+            return
+        hist.clear()
+        if self.app.history.win and self.app.history.win.winfo_exists():
+            self.app.history._selected_indices.clear()
+            self.app.history._build()
+        messagebox.showinfo("History cleared", "All saved transcription history was deleted.", parent=self.win)
+
     def _selected_device_index(self):
         return self._device_map.get(self.device_var.get())
 
@@ -1653,10 +1965,10 @@ class Settings:
         tip = tk.Frame(f, bg="#fffbeb", highlightthickness=1, highlightbackground="#fde68a")
         tip.pack(fill="x", padx=20, pady=(12, 4))
         tip_inner = tk.Frame(tip, bg="#fffbeb"); tip_inner.pack(fill="x", padx=12, pady=8)
-        tk.Label(tip_inner, text="🇦🇲  For Armenian:", bg="#fffbeb", fg="#92400e",
+        tk.Label(tip_inner, text="For Armenian:", bg="#fffbeb", fg="#92400e",
                  font=("Segoe UI Semibold", 9)).pack(side="left")
         tk.Label(tip_inner,
-                 text="  large-v3-turbo is the sweet spot (fast + accurate).  large-v3 for maximum quality.",
+                 text="  large-v3-turbo is the recommended local model.",
                  bg="#fffbeb", fg="#78350f", font=("Segoe UI", 9)).pack(side="left")
 
         self._section(f, "Whisper Models")
@@ -1664,7 +1976,7 @@ class Settings:
         self._model_cards_frame = mf
         self._render_model_cards()
 
-        self._section(f, "GPU-Accelerated  (Best Armenian Quality)")
+        self._section(f, "GPU-Accelerated")
         gf = tk.Frame(f, bg=self.BG); gf.pack(fill="x", padx=20, pady=(4, 16))
         self._nemo_card(gf)
 
@@ -1673,18 +1985,60 @@ class Settings:
         box = tk.Frame(f, bg=self.CARD, highlightthickness=1, highlightbackground=self.BORDER)
         box.pack(fill="x", padx=20, pady=(10, 16))
 
-        tk.Label(box, text="Google Cloud uses hosted speech recognition.",
+        tk.Label(box, text="Google Cloud Speech-to-Text",
                  bg=self.CARD, fg=self.FG, font=("Segoe UI Semibold", 11),
                  anchor="w").pack(fill="x", padx=14, pady=(12, 4))
         tk.Label(box,
-                 text="Local Whisper model choices are hidden while Google Cloud is selected.",
+                 text="Transcribe sends 16 kHz LINEAR16 audio to Google's Speech-to-Text v1 API. "
+                      "No local Whisper model is used or downloaded.",
                  bg=self.CARD, fg=self.FG2, font=("Segoe UI", 9),
                  anchor="w", justify="left", wraplength=440).pack(fill="x", padx=14, pady=(0, 12))
 
-        btn = tk.Label(box, text="Use Local Models",
+        details = [
+            ("Model", "Google auto-selects the recognition model from the request config."),
+            ("Why auto", "The app does not hard-code latest_long/latest_short so Armenian support stays broad."),
+            ("Language", "Auto-detect starts with Armenian plus English/Russian alternatives."),
+            ("Privacy", "Audio is sent to Google and billed to your Google Cloud project/API key."),
+        ]
+        for label, value in details:
+            row = tk.Frame(box, bg=self.CARD); row.pack(fill="x", padx=14, pady=(0, 6))
+            tk.Label(row, text=f"{label}: ", bg=self.CARD, fg=self.FG,
+                     font=("Segoe UI Semibold", 8), width=10, anchor="w").pack(side="left")
+            tk.Label(row, text=value, bg=self.CARD, fg=self.FG2,
+                     font=("Segoe UI", 8), wraplength=340, justify="left",
+                     anchor="w").pack(side="left", fill="x", expand=True)
+
+        if not (self.api_key_var.get() or "").strip():
+            warn = tk.Frame(box, bg="#fffbeb", highlightthickness=1, highlightbackground="#fde68a")
+            warn.pack(fill="x", padx=14, pady=(4, 10))
+            tk.Label(warn, text="API key needed before Google Cloud can be used.",
+                     bg="#fffbeb", fg="#92400e", font=("Segoe UI Semibold", 9),
+                     anchor="w").pack(fill="x", padx=10, pady=(8, 2))
+            tk.Label(warn, text="Open General, paste your Google Cloud key, then click Test Key.",
+                     bg="#fffbeb", fg="#78350f", font=("Segoe UI", 8),
+                     anchor="w", justify="left", wraplength=390).pack(fill="x", padx=10, pady=(0, 8))
+
+        btns = tk.Frame(box, bg=self.CARD); btns.pack(anchor="w", padx=14, pady=(0, 12))
+        key_btn = tk.Label(btns, text="Add API Key",
+                           bg=cfg["accent_color"], fg="#ffffff", font=("Segoe UI", 9),
+                           padx=12, pady=6, cursor="hand2")
+        key_btn.pack(side="left", padx=(0, 8))
+        key_btn.bind("<Button-1>", lambda e: (self._switch_tab(0), self._prompt_google_api_key()))
+        key_btn.bind("<Enter>", lambda e: key_btn.configure(bg=self._dim(cfg["accent_color"], 0.85)))
+        key_btn.bind("<Leave>", lambda e: key_btn.configure(bg=cfg["accent_color"]))
+
+        docs_btn = tk.Label(btns, text="Model Docs",
+                            bg="#efefef", fg=self.FG, font=("Segoe UI", 9),
+                            padx=12, pady=6, cursor="hand2")
+        docs_btn.pack(side="left", padx=(0, 8))
+        docs_btn.bind("<Button-1>", lambda e: webbrowser.open(GOOGLE_SPEECH_DOCS_URL))
+        docs_btn.bind("<Enter>", lambda e: docs_btn.configure(bg="#e0e0e8"))
+        docs_btn.bind("<Leave>", lambda e: docs_btn.configure(bg="#efefef"))
+
+        btn = tk.Label(btns, text="Use Local Models",
                        bg="#efefef", fg=self.FG, font=("Segoe UI", 9),
                        padx=12, pady=6, cursor="hand2")
-        btn.pack(anchor="w", padx=14, pady=(0, 12))
+        btn.pack(side="left")
         btn.bind("<Button-1>", lambda e: self._switch_to_local_models())
         btn.bind("<Enter>", lambda e: btn.configure(bg="#e0e0e8"))
         btn.bind("<Leave>", lambda e: btn.configure(bg="#efefef"))
@@ -1739,6 +2093,7 @@ class Settings:
         self._model_states[name] = "downloading"
         self._model_progress[name] = {"percent": 0, "downloaded": 0, "total": 0}
         self._render_model_cards()
+        telemetry.track("model_download_started", {"model": name}, cfg, APP_VERSION)
 
         def _on_progress(percent, downloaded, total):
             def _apply():
@@ -1773,14 +2128,59 @@ class Settings:
                 if state == "downloaded":
                     self.model_var.set(name)
                     self._model_progress[name] = {"percent": 100, "downloaded": 0, "total": 0}
+                    telemetry.track("model_download_completed", {"model": name}, cfg, APP_VERSION)
                     self.app.show_tray_hint(
                         "Model download complete",
                         f"{name} is ready to use in Transcribe.",
                     )
                 elif state == "failed":
+                    telemetry.track("model_download_failed", {"model": name}, cfg, APP_VERSION)
                     self.app.show_tray_hint(
                         "Model download failed",
                         f"Could not download {name}. Check your connection and try again.",
+                    )
+                if self.win and self.win.winfo_exists():
+                    self._render_model_cards()
+
+            self.app.overlay.call_soon(_apply)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _remove_model(self, name):
+        if self._model_states.get(name) in ("downloading", "removing"):
+            return
+        from tkinter import messagebox
+        if not messagebox.askyesno(
+            "Remove local model",
+            f"Remove the {name} model from this computer?\n\nYou can download it again later.",
+            parent=self.win,
+        ):
+            return
+        self._model_states[name] = "removing"
+        self._render_model_cards()
+
+        def _run():
+            ok = False
+            try:
+                self.app.recorder.unload_model(name)
+                ok = remove_whisper_model(name)
+            except Exception as e:
+                logger.warning("Could not remove model %s: %s", name, e)
+
+            def _apply():
+                if ok:
+                    self._model_states[name] = "missing"
+                    self._model_progress.pop(name, None)
+                    telemetry.track("model_removed", {"model": name}, cfg, APP_VERSION)
+                    self.app.show_tray_hint(
+                        "Model removed",
+                        f"{name} was removed from this computer.",
+                    )
+                else:
+                    self._model_states[name] = "downloaded" if model_downloaded(name) else "missing"
+                    self.app.show_tray_hint(
+                        "Model removal failed",
+                        f"Could not remove {name}. It may still be in use.",
                     )
                 if self.win and self.win.winfo_exists():
                     self._render_model_cards()
@@ -1824,6 +2224,7 @@ class Settings:
         state = self._model_state(name) if ram_ok else "locked"
         downloaded = state == "downloaded"
         selected = self.model_var.get() == name
+        remove_btn = None
 
         bg = self.SEL_BG if selected else (self.CARD if ram_ok else "#f9f9f9")
         bord = cfg["accent_color"] if selected else (self.BORDER if ram_ok else "#ebebeb")
@@ -1840,7 +2241,7 @@ class Settings:
         name_row = tk.Frame(left, bg=bg); name_row.pack(anchor="w")
         tk.Label(name_row, text=name, bg=bg, fg=fg,
                  font=("Segoe UI Semibold", 11)).pack(side="left")
-        if selected:
+        if selected and downloaded:
             tag, tag_fg = "  selected", cfg["accent_color"]
         elif not ram_ok:
             tag, tag_fg = "  not enough RAM", "#c8c8d0"
@@ -1851,10 +2252,14 @@ class Settings:
             percent = progress.get("percent")
             suffix = f" {percent}%" if percent is not None else ""
             tag, tag_fg = f"  downloading{suffix}", "#f97316"
+        elif state == "removing":
+            tag, tag_fg = "  removing", "#f97316"
         elif state == "failed":
             tag, tag_fg = "  download failed", "#ef4444"
         elif downloaded:
             tag, tag_fg = "  downloaded", "#22c55e"
+        elif selected:
+            tag, tag_fg = "  selected, not downloaded", "#f97316"
         else:
             tag, tag_fg = "  not downloaded", "#f97316"
         tk.Label(name_row, text=tag, bg=bg, fg=tag_fg,
@@ -1865,11 +2270,8 @@ class Settings:
 
         hy_label = info.get("armenian")
         if hy_label and ram_ok:
-            badge_bg = "#fef3c7" if hy_label != "Best Armenian accuracy" else "#dcfce7"
-            badge_fg = "#92400e" if hy_label != "Best Armenian accuracy" else "#166534"
-            if hy_label == "Recommended for Armenian":
-                badge_bg, badge_fg = "#dbeafe", "#1e40af"
-            tk.Label(left, text=f"🇦🇲  {hy_label}",
+            badge_bg, badge_fg = "#dbeafe", "#1e40af"
+            tk.Label(left, text=hy_label,
                      bg=badge_bg, fg=badge_fg,
                      font=("Segoe UI", 7), padx=6, pady=2).pack(anchor="w", pady=(3, 0))
 
@@ -1888,6 +2290,14 @@ class Settings:
                      font=("Segoe UI Semibold", 13)).pack()
             tk.Label(right, text="per clip", bg=bg, fg=fg2,
                      font=("Segoe UI", 7)).pack()
+            remove_btn = tk.Label(right, text="Remove",
+                                  bg="#fee2e2", fg="#991b1b",
+                                  font=("Segoe UI", 7), padx=8, pady=3,
+                                  cursor="hand2")
+            remove_btn.pack(pady=(4, 0))
+            remove_btn.bind("<Button-1>", lambda e, n=name: self._remove_model(n))
+            remove_btn.bind("<Enter>", lambda e: remove_btn.configure(bg="#fecaca"))
+            remove_btn.bind("<Leave>", lambda e: remove_btn.configure(bg="#fee2e2"))
         elif state == "downloading":
             progress = self._model_progress.get(name, {})
             percent = progress.get("percent")
@@ -1905,6 +2315,9 @@ class Settings:
                 detail = "Starting..."
             tk.Label(right, text=detail, bg=bg, fg=fg2,
                      font=("Segoe UI", 7)).pack()
+        elif state == "removing":
+            tk.Label(right, text="Removing...", bg=bg, fg="#f97316",
+                     font=("Segoe UI Semibold", 9)).pack()
         else:
             label = "Downloading..." if state == "downloading" else "Retry" if state == "failed" else "Download"
             btn_bg = "#e8eefc" if state == "downloading" else cfg["accent_color"]
@@ -1934,9 +2347,14 @@ class Settings:
             for w in [card, inner, left, right, name_row] + \
                      list(left.winfo_children()) + list(name_row.winfo_children()) + \
                      list(right.winfo_children()):
+                if w is remove_btn:
+                    continue
                 try: w.configure(cursor="hand2")
                 except: pass
                 w.bind("<Button-1>", _pick)
+            if remove_btn is not None:
+                remove_btn.configure(cursor="hand2")
+                remove_btn.bind("<Button-1>", lambda e, n=name: self._remove_model(n))
             inner.bind("<Enter>", lambda e: inner.configure(bg=self._tint(bg)))
             inner.bind("<Leave>", lambda e: inner.configure(bg=bg))
 
@@ -1960,13 +2378,287 @@ class Settings:
         tk.Label(name_row, text=badge_txt, bg=bg, fg=badge_fg,
                  font=("Segoe UI", 8)).pack(side="left")
 
-        tk.Label(left, text="Armenian best · 9.9% WER · GPU required",
+        tk.Label(left, text="Experimental GPU-only model · coming soon",
                  bg=bg, fg=fg2, font=("Segoe UI", 8)).pack(anchor="w")
 
         tk.Label(right, text="~2s",    bg=bg, fg=fg, font=("Segoe UI Semibold", 13)).pack()
         tk.Label(right, text="per clip", bg=bg, fg=fg2, font=("Segoe UI", 7)).pack()
         tk.Label(right, text="Coming soon" if gpu else "GPU required",
                  bg=bg, fg=fg2, font=("Segoe UI", 7)).pack()
+
+    # ── Tab: Actions ─────────────────────────────────────────────────────────
+
+    def _build_actions(self, f):
+        self._section(f, "Output Mode")
+        tk.Label(f,
+                 text="Transcribe only pastes the raw transcription. Action modes process it locally before copying and pasting.",
+                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 8),
+                 wraplength=460, justify="left").pack(anchor="w", padx=20, pady=(2, 6))
+
+        self._action_cards_frame = tk.Frame(f, bg=self.BG)
+        self._action_cards_frame.pack(fill="x", padx=20, pady=(4, 12))
+        self._render_action_cards()
+
+        self._translate_options = tk.Frame(f, bg=self.BG)
+        self._section(self._translate_options, "Translate To")
+        target_box = tk.Frame(self._translate_options, bg=self.CARD,
+                              highlightthickness=1, highlightbackground=self.BORDER)
+        target_box.pack(fill="x", padx=20, pady=(4, 10))
+        labels = [f"{name} ({code})" for code, name in actions.TRANSLATE_TARGETS.items()]
+        self._target_label_to_code = {
+            f"{name} ({code})": code for code, name in actions.TRANSLATE_TARGETS.items()
+        }
+        current = actions.TRANSLATE_TARGETS[self.translate_target_var.get()]
+        current_label = f"{current} ({self.translate_target_var.get()})"
+        self.translate_target_label_var = tk.StringVar(value=current_label)
+        menu = tk.OptionMenu(target_box, self.translate_target_label_var, *labels)
+        menu.configure(bg=self.CARD, fg=self.FG, activebackground="#f0f0f5",
+                       relief="flat", highlightthickness=0, font=("Segoe UI", 9))
+        menu.pack(fill="x", padx=12, pady=10)
+        tk.Label(self._translate_options,
+                 text="Translation stays local only when Argos Translate and the matching offline language pack are installed.",
+                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 8),
+                 wraplength=460, justify="left").pack(anchor="w", padx=20, pady=(0, 12))
+        self._sync_translate_options()
+
+        self._section(f, "Local Action Engine")
+        tk.Label(f,
+                 text="Built-in local actions work now. Aibuben local LLM slots are prepared for future downloadable CPU/GPU models.",
+                 bg=self.BG, fg=self.FG2, font=("Segoe UI", 8),
+                 wraplength=460, justify="left").pack(anchor="w", padx=20, pady=(2, 6))
+        self._action_model_cards_frame = tk.Frame(f, bg=self.BG)
+        self._action_model_cards_frame.pack(fill="x", padx=20, pady=(4, 16))
+        self._render_action_model_cards()
+
+    def _render_action_cards(self):
+        for w in self._action_cards_frame.winfo_children():
+            w.destroy()
+        for code, info in actions.ACTION_MODES.items():
+            self._action_card(self._action_cards_frame, code, info["label"], info["description"])
+
+    def _action_card(self, parent, code, title, desc):
+        sel = self.action_mode_var.get() == code
+        bg = self.SEL_BG if sel else self.CARD
+        bord = cfg["accent_color"] if sel else self.BORDER
+        card = tk.Frame(parent, bg=bord, padx=1, pady=1, cursor="hand2")
+        card.pack(fill="x", pady=(0, 8))
+        inner = tk.Frame(card, bg=bg, padx=14, pady=10)
+        inner.pack(fill="x")
+        row = tk.Frame(inner, bg=bg); row.pack(fill="x")
+        dot = tk.Canvas(row, width=16, height=16, bg=bg, highlightthickness=0)
+        dot.pack(side="left", padx=(0, 8))
+        if sel:
+            dot.create_oval(2, 2, 14, 14, outline=cfg["accent_color"], width=2)
+            dot.create_oval(5, 5, 11, 11, fill=cfg["accent_color"], outline="")
+        else:
+            dot.create_oval(2, 2, 14, 14, outline="#b0b0ba", width=2)
+        tk.Label(row, text=title, bg=bg, fg=self.FG,
+                 font=("Segoe UI Semibold", 10)).pack(side="left")
+        tk.Label(inner, text=desc, bg=bg, fg=self.FG2,
+                 font=("Segoe UI", 8), wraplength=420, justify="left").pack(anchor="w", padx=24)
+
+        def _select(_event=None):
+            if self.action_mode_var.get() == code:
+                return
+            self.action_mode_var.set(code)
+            self._render_action_cards()
+            self._sync_translate_options()
+        for w in [card, inner, row] + list(row.winfo_children()) + list(inner.winfo_children()):
+            w.bind("<Button-1>", _select)
+            try: w.configure(cursor="hand2")
+            except Exception: pass
+
+    def _sync_translate_options(self):
+        if not hasattr(self, "_translate_options"):
+            return
+        if self.action_mode_var.get() == actions.ACTION_TRANSLATE:
+            if not self._translate_options.winfo_ismapped():
+                self._translate_options.pack(fill="x", after=self._action_cards_frame)
+        else:
+            self._translate_options.pack_forget()
+
+    def _render_action_model_cards(self):
+        for w in self._action_model_cards_frame.winfo_children():
+            w.destroy()
+        for code, info in actions.ACTION_MODELS.items():
+            state = self._action_model_state(code, info)
+            self._action_model_card(
+                self._action_model_cards_frame,
+                code,
+                info["label"],
+                info["description"],
+                info["available"],
+                state,
+            )
+
+    def _action_model_state(self, code, info):
+        if code == "built_in":
+            return "ready"
+        if not info.get("available"):
+            return "coming_soon"
+        if self._action_model_states.get(code) in ("downloading", "failed", "removing"):
+            return self._action_model_states[code]
+        if code == local_llm.QWEN_TINY_ID:
+            state = "downloaded" if local_llm.model_downloaded(code) else "missing"
+            self._action_model_states[code] = state
+            return state
+        return "coming_soon"
+
+    def _download_action_model(self, code):
+        if code != local_llm.QWEN_TINY_ID or self._action_model_states.get(code) == "downloading":
+            return
+        self._action_model_states[code] = "downloading"
+        self._action_model_progress[code] = {"percent": 0, "downloaded": 0, "total": local_llm.QWEN_TINY_SIZE}
+        self._render_action_model_cards()
+        telemetry.track("model_download_started", {"model": code, "kind": "action_llm"}, cfg, APP_VERSION)
+
+        def _on_progress(percent, downloaded, total):
+            def _apply():
+                if not self.win or not self.win.winfo_exists():
+                    return
+                if self._action_model_states.get(code) != "downloading":
+                    return
+                self._action_model_progress[code] = {
+                    "percent": percent,
+                    "downloaded": downloaded,
+                    "total": total,
+                }
+                if self._active_tab == 2 and hasattr(self, "_action_model_cards_frame"):
+                    self._render_action_model_cards()
+
+            self.app.overlay.call_soon(_apply)
+
+        def _run():
+            try:
+                local_llm.download_model(code, on_progress=_on_progress)
+                state = "downloaded"
+            except Exception as e:
+                logger.warning("Could not download action model %s: %s", code, e)
+                state = "failed"
+
+            def _apply():
+                self._action_model_states[code] = state
+                if state == "downloaded":
+                    self.action_model_var.set(code)
+                    self._action_model_progress[code] = {"percent": 100, "downloaded": 0, "total": 0}
+                    telemetry.track("model_download_completed", {"model": code, "kind": "action_llm"}, cfg, APP_VERSION)
+                    self.app.show_tray_hint("Action model ready", "Qwen Tiny is ready for local actions.")
+                else:
+                    telemetry.track("model_download_failed", {"model": code, "kind": "action_llm"}, cfg, APP_VERSION)
+                    self.app.show_tray_hint("Action model download failed", "Could not download Qwen Tiny. Check your connection.")
+                if self.win and self.win.winfo_exists():
+                    self._render_action_model_cards()
+
+            self.app.overlay.call_soon(_apply)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _remove_action_model(self, code):
+        if code != local_llm.QWEN_TINY_ID or self._action_model_states.get(code) in ("downloading", "removing"):
+            return
+        from tkinter import messagebox
+        if not messagebox.askyesno(
+            "Remove action model",
+            "Remove Qwen Tiny from this computer?\n\nYou can download it again later.",
+            parent=self.win,
+        ):
+            return
+        self._action_model_states[code] = "removing"
+        self._render_action_model_cards()
+
+        def _run():
+            ok = False
+            try:
+                ok = local_llm.remove_model(code)
+            except Exception as e:
+                logger.warning("Could not remove action model %s: %s", code, e)
+
+            def _apply():
+                self._action_model_states[code] = "missing" if ok else (
+                    "downloaded" if local_llm.model_downloaded(code) else "missing"
+                )
+                self._action_model_progress.pop(code, None)
+                if self.action_model_var.get() == code:
+                    self.action_model_var.set("built_in")
+                if ok:
+                    telemetry.track("model_removed", {"model": code, "kind": "action_llm"}, cfg, APP_VERSION)
+                    self.app.show_tray_hint("Action model removed", "Qwen Tiny was removed from this computer.")
+                else:
+                    self.app.show_tray_hint("Action model removal failed", "Qwen Tiny could not be removed.")
+                if self.win and self.win.winfo_exists():
+                    self._render_action_model_cards()
+
+            self.app.overlay.call_soon(_apply)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _action_model_card(self, parent, code, title, desc, available, state):
+        sel = self.action_model_var.get() == code
+        usable = available and state in ("ready", "downloaded")
+        downloadable = available and state in ("missing", "failed")
+        bg = self.SEL_BG if sel else (self.CARD if available else "#f9f9f9")
+        bord = cfg["accent_color"] if sel else (self.BORDER if available else "#ebebeb")
+        card = tk.Frame(parent, bg=bord, padx=1, pady=1, cursor="hand2" if usable else "arrow")
+        card.pack(fill="x", pady=(0, 8))
+        inner = tk.Frame(card, bg=bg, padx=14, pady=10)
+        inner.pack(fill="x")
+        row = tk.Frame(inner, bg=bg); row.pack(fill="x")
+        tk.Label(row, text=title, bg=bg, fg=self.FG if available else self.FG2,
+                 font=("Segoe UI Semibold", 10)).pack(side="left")
+        tag_map = {
+            "ready": ("Ready", "#22c55e"),
+            "downloaded": ("Ready", "#22c55e"),
+            "missing": ("Not downloaded", "#f97316"),
+            "failed": ("Download failed", "#ef4444"),
+            "downloading": ("Downloading", "#f97316"),
+            "removing": ("Removing", "#f97316"),
+            "coming_soon": ("Coming soon", "#f97316"),
+        }
+        tag, tag_fg = tag_map.get(state, ("Coming soon", "#f97316"))
+        tk.Label(row, text=tag, bg=bg, fg=tag_fg,
+                 font=("Segoe UI", 8)).pack(side="right")
+        tk.Label(inner, text=desc, bg=bg, fg=self.FG2,
+                 font=("Segoe UI", 8), wraplength=420, justify="left").pack(anchor="w", pady=(4, 0))
+
+        if state == "downloading":
+            progress = self._action_model_progress.get(code, {})
+            percent = progress.get("percent")
+            downloaded = progress.get("downloaded", 0)
+            total = progress.get("total", 0)
+            self._progress_bar(inner, percent, bg)
+            detail = (
+                f"{self._format_bytes(downloaded)} / {self._format_bytes(total)}"
+                if total else "Starting..."
+            )
+            tk.Label(inner, text=detail, bg=bg, fg=self.FG2,
+                     font=("Segoe UI", 7)).pack(anchor="w", pady=(3, 0))
+        elif downloadable:
+            label = "Retry" if state == "failed" else "Download"
+            btn = tk.Label(inner, text=label, bg=cfg["accent_color"], fg="#ffffff",
+                           font=("Segoe UI Semibold", 9), padx=12, pady=5,
+                           cursor="hand2")
+            btn.pack(anchor="w", pady=(8, 0))
+            btn.bind("<Button-1>", lambda e, c=code: self._download_action_model(c))
+            btn.bind("<Enter>", lambda e: btn.configure(bg=self._dim(cfg["accent_color"], 0.85)))
+            btn.bind("<Leave>", lambda e: btn.configure(bg=cfg["accent_color"]))
+        elif state == "downloaded":
+            remove = tk.Label(inner, text="Remove", bg="#fee2e2", fg="#991b1b",
+                              font=("Segoe UI", 8), padx=10, pady=4,
+                              cursor="hand2")
+            remove.pack(anchor="w", pady=(8, 0))
+            remove.bind("<Button-1>", lambda e, c=code: self._remove_action_model(c))
+            remove.bind("<Enter>", lambda e: remove.configure(bg="#fecaca"))
+            remove.bind("<Leave>", lambda e: remove.configure(bg="#fee2e2"))
+
+        def _select(_event=None):
+            if not usable:
+                return
+            self.action_model_var.set(code)
+            self._render_action_model_cards()
+        for w in [card, inner, row] + list(row.winfo_children()):
+            w.bind("<Button-1>", _select)
+            try: w.configure(cursor="hand2" if usable else "arrow")
+            except Exception: pass
 
     # ── Tab: Language ─────────────────────────────────────────────────────────
 
@@ -2219,6 +2911,24 @@ class Settings:
             messagebox.showwarning("Recording setting not saved", str(e), parent=self.win)
             return
 
+        privacy_mode = bool(self.privacy_mode_var.get())
+        if privacy_mode:
+            self.backend_var.set("local")
+            self.save_history_var.set(False)
+            self.analytics_enabled_var.set(False)
+
+        if not privacy_mode and self.backend_var.get() == "google" and not (self.api_key_var.get() or "").strip():
+            from tkinter import messagebox
+            if self._active_tab != 0:
+                self._switch_tab(0)
+            self._prompt_google_api_key()
+            messagebox.showwarning(
+                "Google API key required",
+                "Google Cloud needs your own API key before it can be saved as the backend.",
+                parent=self.win,
+            )
+            return
+
         old_hk = cfg["hotkey"]
         new_hk = self._captured_hotkey or cfg["hotkey"]
         if old_hk != new_hk and not self.app._setup_hotkey(new_hk, remove_old=old_hk):
@@ -2230,6 +2940,16 @@ class Settings:
             )
             return
 
+        old_privacy_mode = bool(cfg.get("privacy_mode", False))
+        target_label = getattr(self, "translate_target_label_var", None)
+        if target_label is not None:
+            self.translate_target_var.set(
+                getattr(self, "_target_label_to_code", {}).get(
+                    target_label.get(),
+                    self.translate_target_var.get(),
+                )
+            )
+
         cfg["hotkey"]         = new_hk
         cfg["whisper_model"]  = self.model_var.get()
         cfg["language"]       = self.lang_var.get()
@@ -2237,11 +2957,30 @@ class Settings:
         cfg["backend"]        = self.backend_var.get()
         cfg["google_api_key"] = self.api_key_var.get().strip()
         cfg["initial_prompt"] = self._prompt_value
+        cfg["output_action"] = actions.normalize_action_mode(self.action_mode_var.get())
+        cfg["action_model"] = actions.normalize_action_model(self.action_model_var.get())
+        cfg["translate_target"] = actions.normalize_translate_target(self.translate_target_var.get())
         cfg["input_device_index"] = self._selected_device_index()
         cfg["silence_trigger_sec"] = silence_trigger
         cfg["min_speech_sec"] = min_speech
         cfg["max_speech_sec"] = max_speech
+        cfg["privacy_mode"] = privacy_mode
+        cfg["save_history"] = bool(self.save_history_var.get())
+        cfg["analytics_enabled"] = bool(self.analytics_enabled_var.get())
         save_config(cfg)
+        if privacy_mode and not old_privacy_mode:
+            hist.clear()
+        telemetry.track(
+            "settings_saved",
+            {
+                "backend": cfg["backend"],
+                "privacy_mode": cfg.get("privacy_mode", False),
+                "analytics_enabled": cfg.get("analytics_enabled", False),
+                "output_action": cfg.get("output_action", "transcribe_only"),
+            },
+            cfg,
+            APP_VERSION,
+        )
 
         if cfg["backend"] == "local":
             threading.Thread(
@@ -2264,6 +3003,7 @@ class Onboarding:
         self.root = root
         self.app  = app
         self.win  = None
+        self._image_refs = []
 
     def show(self):
         win = tk.Toplevel(self.root)
@@ -2400,6 +3140,7 @@ class Onboarding:
         key_entry = tk.Entry(key_box, bg=self.CARD, fg=self.FG,
                              insertbackground=self.FG, show="*",
                              font=("Segoe UI", 10), relief="flat", bd=10)
+        self._google_key_entry = key_entry
         key_entry.pack(fill="x")
         attach_placeholder_entry(
             key_entry,
@@ -2410,9 +3151,18 @@ class Onboarding:
             secret_char="*",
         )
         tk.Label(self._google_key_section,
-                 text="You can add or change this later in Settings.",
+                 text="Bring your own Google Cloud API key. Transcribe does not include one.",
                  bg=self.BG, fg=self.FG2, font=("Segoe UI", 8),
                  wraplength=480, justify="left").pack(anchor="w", pady=(0, 10))
+        key_actions = tk.Frame(self._google_key_section, bg=self.BG)
+        key_actions.pack(anchor="w", pady=(0, 10))
+        get_key = tk.Label(key_actions, text="Get API Key",
+                           bg="#efefef", fg=self.FG, font=("Segoe UI", 9),
+                           padx=12, pady=5, cursor="hand2")
+        get_key.pack(side="left")
+        get_key.bind("<Button-1>", lambda e: webbrowser.open(GOOGLE_API_KEY_URL))
+        get_key.bind("<Enter>", lambda e: get_key.configure(bg="#e0e0e8"))
+        get_key.bind("<Leave>", lambda e: get_key.configure(bg="#efefef"))
         self._sync_google_key_area()
 
         # Model
@@ -2430,11 +3180,12 @@ class Onboarding:
         self._google_model_note = tk.Frame(body, bg=self.CARD,
                                            highlightthickness=1, highlightbackground=self.BORDER)
         tk.Label(self._google_model_note,
-                 text="Google Cloud uses hosted speech recognition.",
+                 text="Google Cloud Speech-to-Text",
                  bg=self.CARD, fg=self.FG, font=("Segoe UI Semibold", 10),
                  anchor="w").pack(fill="x", padx=14, pady=(12, 4))
         tk.Label(self._google_model_note,
-                 text="No local Whisper model is selected or downloaded when Google Cloud is active.",
+                 text="Uses Google's Speech-to-Text v1 API with Google auto-selecting the recognition model. "
+                      "Audio is sent online and billed to your Google Cloud project.",
                  bg=self.CARD, fg=self.FG2, font=("Segoe UI", 8),
                  anchor="w", justify="left", wraplength=440).pack(fill="x", padx=14, pady=(0, 12))
         self._sync_model_area()
@@ -2482,10 +3233,11 @@ class Onboarding:
     def _render_backend_cards(self):
         for w in self._backend_cards_frame.winfo_children():
             w.destroy()
-        self._backend_card(self._backend_cards_frame, "local",  "💻  Local (Offline)",
-                           "Private, free, no internet needed")
-        self._backend_card(self._backend_cards_frame, "google", "☁  Google Cloud",
-                           "Best Armenian accuracy · 60 min/mo free")
+        self._image_refs = []
+        self._backend_card(self._backend_cards_frame, "local",  "Local (Offline)",
+                           "Private, free, no internet needed", icon="PC")
+        self._backend_card(self._backend_cards_frame, "google", "Google Cloud",
+                           "Online, bring your own API key", logo_name="google_logo.png")
 
     def _render_model_cards(self):
         for w in self._model_cards_frame.winfo_children():
@@ -2495,7 +3247,7 @@ class Onboarding:
         for code, label, desc, ram_ok in [
             ("tiny",  "Tiny",                "Fastest · 75 MB · lower accuracy",        model_ok("tiny")),
             ("base",  "Base  · recommended", "Balanced · 140 MB · solid for everyday",  model_ok("base")),
-            ("small", "Small",               "Best for Armenian · 460 MB · slower",     model_ok("small")),
+            ("small", "Small",               "Great quality · 460 MB · slower",         model_ok("small")),
         ]:
             self._model_card(self._model_cards_frame, code, label, desc, ram_ok)
 
@@ -2524,7 +3276,7 @@ class Onboarding:
             pill.bind("<Enter>", lambda e: pill.configure(bg="#f0f0f5"))
             pill.bind("<Leave>", lambda e: pill.configure(bg=self.CARD))
 
-    def _backend_card(self, parent, val, title, desc):
+    def _backend_card(self, parent, val, title, desc, icon=None, logo_name=None):
         sel  = self._backend.get() == val
         bg   = self.SEL_BG if sel else self.CARD
         bord = cfg["accent_color"] if sel else self.BORDER
@@ -2541,6 +3293,17 @@ class Onboarding:
             dot.create_oval(5, 5, 11, 11, fill=cfg["accent_color"], outline="")
         else:
             dot.create_oval(2, 2, 14, 14, outline="#b0b0ba", width=2)
+        if logo_name:
+            try:
+                photo = load_tk_image("assets", logo_name, size=(22, 22))
+                self._image_refs.append(photo)
+                tk.Label(row, image=photo, bg=bg).pack(side="left", padx=(0, 8))
+            except Exception:
+                tk.Label(row, text="G", bg=bg, fg="#4285f4",
+                         font=("Segoe UI Semibold", 10)).pack(side="left", padx=(0, 8))
+        elif icon:
+            tk.Label(row, text=icon, bg=bg, fg=self.FG2,
+                     font=("Segoe UI Semibold", 9), width=3).pack(side="left", padx=(0, 6))
         tk.Label(row, text=title, bg=bg, fg=self.FG,
                  font=("Segoe UI Semibold", 10)).pack(side="left")
         tk.Label(inner, text=desc, bg=bg, fg=self.FG2,
@@ -2685,6 +3448,20 @@ class Onboarding:
             messagebox.showwarning("Hotkey not saved", hotkey_error, parent=self.win)
             return
 
+        if self._backend.get() == "google" and not (self._api_key.get() or "").strip():
+            from tkinter import messagebox
+            self._sync_google_key_area()
+            try:
+                self._google_key_entry.focus_set()
+            except Exception:
+                pass
+            messagebox.showwarning(
+                "Google API key required",
+                "Google Cloud needs your own API key before it can be selected.",
+                parent=self.win,
+            )
+            return
+
         old_hk = cfg["hotkey"]
         old_model = cfg.get("whisper_model", "base")
         if old_hk != self._hotkey and not self.app._setup_hotkey(self._hotkey, remove_old=old_hk):
@@ -2740,6 +3517,16 @@ class App:
         self._setup_hotkey(cfg["hotkey"])
         keyboard.add_hotkey("enter", self._on_enter)
         keyboard.add_hotkey("esc",   self._on_escape)
+        telemetry.track(
+            "app_started",
+            {
+                "privacy_mode": cfg.get("privacy_mode", False),
+                "backend": cfg.get("backend", "local"),
+                "output_action": cfg.get("output_action", "transcribe_only"),
+            },
+            cfg,
+            APP_VERSION,
+        )
 
     def show_tray_hint(self, title, message):
         """Send a Windows tray balloon. Used post-onboarding so users know
@@ -2864,10 +3651,56 @@ class App:
                 self.overlay.call_soon(self.overlay.hide)
             return
 
-        hist.save_entry(text, lang, cfg["backend"])
+        action_mode = actions.normalize_action_mode(cfg.get("output_action"))
+        output_text = text
+        if action_mode != actions.ACTION_TRANSCRIBE_ONLY:
+            try:
+                output_text = actions.process(
+                    text,
+                    action_mode,
+                    source_lang=lang,
+                    target_lang=cfg.get("translate_target", "en"),
+                    model=cfg.get("action_model", "built_in"),
+                )
+                telemetry.track(
+                    "action_completed",
+                    {
+                        "action": action_mode,
+                        "model": cfg.get("action_model", "built_in"),
+                        "language": lang,
+                        "output_length_bucket": _bucket_count(len(output_text)),
+                    },
+                    cfg,
+                    APP_VERSION,
+                )
+            except actions.ActionError as e:
+                telemetry.track(
+                    "action_failed",
+                    {"action": action_mode, "reason": str(e)[:60]},
+                    cfg,
+                    APP_VERSION,
+                )
+                self.overlay.call_soon(self.overlay.show_error, str(e))
+                return
+
+        if cfg.get("save_history", True) and not cfg.get("privacy_mode", False):
+            hist.save_entry(output_text, lang, cfg["backend"])
+
+        telemetry.track(
+            "transcription_completed",
+            {
+                "backend": cfg.get("backend", "local"),
+                "language": lang,
+                "action": action_mode,
+                "input_length_bucket": _bucket_count(len(text)),
+                "output_length_bucket": _bucket_count(len(output_text)),
+            },
+            cfg,
+            APP_VERSION,
+        )
 
         time.sleep(0.35)
-        pyperclip.copy(text)
+        pyperclip.copy(output_text)
 
         pasted = False
         try:
@@ -2900,6 +3733,52 @@ def _parse_version(v):
         return tuple((parts + [0, 0, 0])[:3])
     except Exception:
         return (0, 0, 0)
+
+def _format_bytes(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "0 B"
+    units = ["B", "KB", "MB", "GB"]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+
+def _bucket_count(value):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return "0"
+    for limit in (25, 100, 250, 500, 1000, 2500):
+        if value <= limit:
+            return f"<= {limit}"
+    return "> 2500"
+
+def remember_pending_update(tag, body):
+    cfg["pending_update_version"] = tag or ""
+    cfg["pending_update_body"] = body or ""
+    cfg["previous_version"] = APP_VERSION
+    save_config(cfg)
+
+def clear_pending_update():
+    cfg["pending_update_version"] = ""
+    cfg["pending_update_body"] = ""
+    cfg["previous_version"] = ""
+    save_config(cfg)
+
+def consume_pending_update_notice():
+    pending = (cfg.get("pending_update_version") or "").strip()
+    if not pending:
+        return None
+    notice = {
+        "tag": pending,
+        "body": cfg.get("pending_update_body", ""),
+        "previous_version": cfg.get("previous_version", ""),
+        "success": _parse_version(APP_VERSION) >= _parse_version(pending),
+    }
+    clear_pending_update()
+    return notice
 
 def _trusted_update_url(url):
     try:
@@ -2937,7 +3816,8 @@ def _update_info_from_manifest(manifest, ignore_dismissed=False):
         "installer_url": installer.get("url"),
         "checksum_url": installer.get("sha256_url"),
         "checksum": installer.get("sha256", ""),
-        "body": manifest.get("notes", ""),
+        "body": manifest.get("notes", "") or manifest.get("changelog", ""),
+        "notes_url": manifest.get("notes_url", RELEASES_URL),
         "source": "manifest",
     }
 
@@ -2975,8 +3855,25 @@ def _update_info_from_release(data, ignore_dismissed=False):
         "checksum_url": checksum_url,
         "checksum": "",
         "body": data.get("body", "") or "",
+        "notes_url": data.get("html_url", RELEASES_URL),
         "source": "api",
     }
+
+def _enrich_update_notes(info):
+    if not info or info.get("body"):
+        return info
+    try:
+        resp = requests.get(RELEASES_API,
+                            headers={"Accept": "application/vnd.github+json"},
+                            timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("tag_name") == info.get("tag"):
+                info["body"] = data.get("body", "") or info.get("body", "")
+                info["notes_url"] = data.get("html_url", info.get("notes_url", RELEASES_URL))
+    except Exception as e:
+        logger.info("Could not load release notes for update: %s", e)
+    return info
 
 def fetch_update_info(ignore_dismissed=False):
     try:
@@ -2984,7 +3881,7 @@ def fetch_update_info(ignore_dismissed=False):
         if manifest_resp.status_code == 200:
             info = _update_info_from_manifest(manifest_resp.json(), ignore_dismissed=ignore_dismissed)
             if info:
-                return info
+                return _enrich_update_notes(info)
     except Exception as e:
         logger.info("Release manifest unavailable, falling back to API: %s", e)
 
@@ -3010,7 +3907,7 @@ def check_for_update(on_update_found, on_no_update=None, on_error=None, ignore_d
                 on_error(e)
     threading.Thread(target=_run, daemon=True).start()
 
-def show_changelog_window(root, tag, body):
+def show_changelog_window(root, tag, body, primary_label=None, primary_action=None):
     """Lightweight window listing what's new in a release. Body is GitHub markdown
     (we render as plain text — links visible as URLs)."""
     root.deiconify()
@@ -3038,7 +3935,7 @@ def show_changelog_window(root, tag, body):
     sb = tk.Scrollbar(body_frame, orient="vertical", command=txt.yview)
     sb.pack(side="right", fill="y")
     txt.configure(yscrollcommand=sb.set)
-    txt.insert("1.0", (body or "No release notes provided.").strip())
+    txt.insert("1.0", (body or "No release notes were included with this release.").strip())
     txt.configure(state="disabled")
 
     btns = tk.Frame(win, bg="#f5f5f7"); btns.pack(fill="x", padx=20, pady=(0, 16))
@@ -3048,6 +3945,18 @@ def show_changelog_window(root, tag, body):
     close.bind("<Button-1>", lambda e: win.destroy())
     close.bind("<Enter>", lambda e: close.configure(bg="#e0e0e8"))
     close.bind("<Leave>", lambda e: close.configure(bg="#efefef"))
+
+    if primary_label and primary_action:
+        def _primary(_event=None):
+            win.destroy()
+            primary_action()
+
+        primary = tk.Label(btns, text=primary_label, bg=cfg["accent_color"], fg="#ffffff",
+                           font=("Segoe UI Semibold", 10), padx=18, pady=7, cursor="hand2")
+        primary.pack(side="right", padx=(0, 8))
+        primary.bind("<Button-1>", _primary)
+        primary.bind("<Enter>", lambda e: primary.configure(bg="#2563eb"))
+        primary.bind("<Leave>", lambda e: primary.configure(bg=cfg["accent_color"]))
 
 def show_simple_window(root, title, message, primary_label=None, primary_action=None):
     root.deiconify()
@@ -3088,17 +3997,142 @@ def show_simple_window(root, title, message, primary_label=None, primary_action=
         primary.bind("<Enter>", lambda e: primary.configure(bg="#2563eb"))
         primary.bind("<Leave>", lambda e: primary.configure(bg=cfg["accent_color"]))
 
-def show_about_window(root):
+def show_update_progress_window(root, tag):
+    root.deiconify()
+    win = tk.Toplevel(root)
+    win.title(f"Updating to {tag}")
+    win.configure(bg="#f5f5f7")
+    W, H = 440, 210
+    sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
+    win.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
+    win.attributes("-topmost", True)
+    win.transient(root)
+    win.resizable(False, False)
+
+    tk.Label(win, text=f"Updating to {tag}", bg="#f5f5f7", fg="#1d1d1f",
+             font=("Segoe UI Semibold", 15)).pack(anchor="w", padx=22, pady=(20, 6))
+    message_var = tk.StringVar(value="Preparing download...")
+    percent_var = tk.StringVar(value="0%")
+    tk.Label(win, textvariable=message_var, bg="#f5f5f7", fg="#6e6e73",
+             font=("Segoe UI", 10), wraplength=390, justify="left"
+             ).pack(anchor="w", padx=22, pady=(0, 14))
+
+    bar = ttk.Progressbar(win, orient="horizontal", mode="determinate", maximum=100)
+    bar.pack(fill="x", padx=22, pady=(0, 8))
+    tk.Label(win, textvariable=percent_var, bg="#f5f5f7", fg="#6e6e73",
+             font=("Segoe UI", 9)).pack(anchor="e", padx=22)
+
+    return {"win": win, "bar": bar, "message": message_var, "percent": percent_var}
+
+def update_progress_window(ui, percent=None, message=None):
+    if not ui:
+        return
+    win = ui.get("win")
+    if not win or not win.winfo_exists():
+        return
+    if message is not None:
+        ui["message"].set(message)
+    if percent is not None:
+        percent = max(0, min(100, int(percent)))
+        ui["bar"]["value"] = percent
+        ui["percent"].set(f"{percent}%")
+
+def show_post_update_window(root, notice):
+    if notice.get("success"):
+        previous = notice.get("previous_version")
+        body = notice.get("body") or "No release notes were included with this release."
+        if previous:
+            body = f"Updated from v{previous} to v{APP_VERSION}.\n\n{body}"
+        else:
+            body = f"Updated to v{APP_VERSION}.\n\n{body}"
+        show_changelog_window(
+            root,
+            f"v{APP_VERSION}",
+            body,
+            primary_label="Open Releases",
+            primary_action=lambda: webbrowser.open(RELEASES_URL),
+        )
+        return
+
     show_simple_window(
         root,
-        "About Transcribe",
-        "Created by Aram Adamyan, Founder of Aibuben.xyz.",
-        primary_label="Open Aibuben.xyz",
-        primary_action=lambda: webbrowser.open(AIBUBEN_URL),
+        "Update did not complete",
+        f"Transcribe is still on v{APP_VERSION}. The installer did not finish, so the previous version stayed in place.",
+        primary_label="Open Releases",
+        primary_action=lambda: webbrowser.open(RELEASES_URL),
     )
 
+def show_about_window(root):
+    root.deiconify()
+    win = tk.Toplevel(root)
+    win.title("About Transcribe")
+    win.configure(bg="#f5f5f7")
+    W, H = 520, 440
+    sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
+    win.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
+    win.attributes("-topmost", True)
+    win.transient(root)
+    win.resizable(False, False)
+
+    tk.Label(win, text="About Transcribe", bg="#f5f5f7", fg="#1d1d1f",
+             font=("Segoe UI Semibold", 17)).pack(anchor="w", padx=24, pady=(22, 2))
+    tk.Label(win, text=f"Version {APP_VERSION}",
+             bg="#f5f5f7", fg="#6e6e73", font=("Segoe UI", 9)
+             ).pack(anchor="w", padx=24, pady=(0, 14))
+
+    box = tk.Frame(win, bg="#ffffff", highlightthickness=1, highlightbackground="#e2e2e7")
+    box.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+
+    sections = [
+        (
+            "Open source, privacy first",
+            "Transcribe is an open-source speech-to-text project built to keep your workflow private. "
+            "The aim is to run models locally whenever possible, let people choose the best model for "
+            "their computer, and make dictation work anywhere on the desktop."
+        ),
+        (
+            "Local models, practical control",
+            "You can use offline Whisper models, download or remove local models, and choose cloud "
+            "speech only when you explicitly bring your own Google Cloud API key."
+        ),
+        (
+            "Aibuben.xyz",
+            "Created by Aram Adamyan, Founder of Aibuben.xyz. Aibuben is an AI community for learning, "
+            "building, and sharing practical AI tools and ideas."
+        ),
+        (
+            "Contribute",
+            "Contributions, bug reports, feature ideas, and code improvements are welcome on GitHub."
+        ),
+    ]
+    for i, (title, text) in enumerate(sections):
+        tk.Label(box, text=title, bg="#ffffff", fg="#1d1d1f",
+                 font=("Segoe UI Semibold", 10)).pack(anchor="w", padx=16, pady=(14 if i == 0 else 10, 2))
+        tk.Label(box, text=text, bg="#ffffff", fg="#6e6e73",
+                 font=("Segoe UI", 9), wraplength=450, justify="left"
+                 ).pack(anchor="w", padx=16)
+
+    btns = tk.Frame(win, bg="#f5f5f7")
+    btns.pack(fill="x", padx=24, pady=(0, 20))
+
+    def _button(label, bg, fg, action, side="right", padx=(8, 0)):
+        btn = tk.Label(btns, text=label, bg=bg, fg=fg,
+                       font=("Segoe UI Semibold" if bg == cfg["accent_color"] else "Segoe UI", 10),
+                       padx=16, pady=7, cursor="hand2")
+        btn.pack(side=side, padx=padx)
+        btn.bind("<Button-1>", lambda e: action())
+        hover = "#2563eb" if bg == cfg["accent_color"] else "#e0e0e8"
+        btn.bind("<Enter>", lambda e: btn.configure(bg=hover))
+        btn.bind("<Leave>", lambda e: btn.configure(bg=bg))
+        return btn
+
+    _button("Close", "#efefef", "#1d1d1f", win.destroy)
+    _button("Open Aibuben.xyz", "#efefef", "#1d1d1f", lambda: webbrowser.open(AIBUBEN_URL))
+    _button("Open GitHub", cfg["accent_color"], "#ffffff", lambda: webbrowser.open(PROJECT_GITHUB_URL))
+
 def download_and_install_update(installer_url, checksum_url=None, expected_sha256=None,
-                                on_progress=None, on_done=None, on_error=None):
+                                on_progress=None, on_phase=None, before_launch=None,
+                                on_done=None, on_error=None):
     """Download installer to temp and launch it with silent flags. App exits when launched."""
     def _run():
         try:
@@ -3107,6 +4141,8 @@ def download_and_install_update(installer_url, checksum_url=None, expected_sha25
                 raise ValueError("Untrusted update URL")
             tmp = os.path.join(tempfile.gettempdir(), "TranscribeApp-Setup.exe")
             digest = hashlib.sha256()
+            if on_phase:
+                on_phase("Downloading installer")
             with requests.get(installer_url, stream=True, timeout=60) as r:
                 r.raise_for_status()
                 total = int(r.headers.get("Content-Length", 0))
@@ -3117,23 +4153,31 @@ def download_and_install_update(installer_url, checksum_url=None, expected_sha25
                             f.write(chunk)
                             digest.update(chunk)
                             got += len(chunk)
-                            if on_progress and total:
+                            if on_progress:
                                 on_progress(got, total)
             expected = (expected_sha256 or "").strip().lower()
             if checksum_url:
                 if not _trusted_update_url(checksum_url):
                     raise ValueError("Untrusted checksum URL")
+                if on_phase:
+                    on_phase("Verifying checksum")
                 check_resp = requests.get(checksum_url, timeout=15)
                 check_resp.raise_for_status()
                 expected = expected or _sha256_from_checksum_text(check_resp.text)
                 if not expected:
                     raise ValueError("Release checksum was unreadable")
             if expected:
+                if on_phase:
+                    on_phase("Verifying installer")
                 actual = digest.hexdigest()
                 if actual != expected:
                     raise ValueError("Downloaded installer checksum did not match the release checksum")
             # Launch installer; /SILENT shows progress bar, /CLOSEAPPLICATIONS handles us,
             # /RESTARTAPPLICATIONS re-launches us after install.
+            if before_launch:
+                before_launch()
+            if on_phase:
+                on_phase("Starting installer")
             subprocess.Popen([tmp, "/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"],
                              creationflags=0x00000010 if sys.platform == "win32" else 0)
             if on_done:
@@ -3166,6 +4210,10 @@ def run_tray(app: App):
         "installing": False,
         "checking": False,
         "last_check": 0.0,
+        "phase": "",
+        "progress_percent": 0,
+        "progress_ui": None,
+        "last_progress_bucket": -1,
     }
 
     def on_settings(icon, _): app.open_settings()
@@ -3199,30 +4247,114 @@ def run_tray(app: App):
         _update_state["body"] = ""
         icon.menu = _build_menu()
 
-    def on_install_update(icon, _):
+    def _set_install_progress(icon, percent=None, message=None, notify=False):
+        if percent is not None:
+            _update_state["progress_percent"] = max(0, min(100, int(percent)))
+        if message:
+            _update_state["phase"] = message
+        bucket = _update_state["progress_percent"] // 5
+        if bucket != _update_state["last_progress_bucket"] or message:
+            _update_state["last_progress_bucket"] = bucket
+            icon.menu = _build_menu()
+        app.overlay.call_soon(
+            update_progress_window,
+            _update_state.get("progress_ui"),
+            _update_state["progress_percent"],
+            _update_state.get("phase") or "Preparing update...",
+        )
+        if notify:
+            try:
+                icon.notify(_update_state.get("phase") or "Updating Transcribe", "Installing update")
+            except Exception:
+                pass
+
+    def _begin_install_update(icon):
         if _update_state["installing"]:
             return
         if _update_state["url"] and sys.platform == "win32":
             _update_state["installing"] = True
+            _update_state["phase"] = "Preparing update..."
+            _update_state["progress_percent"] = 0
+            _update_state["last_progress_bucket"] = -1
             icon.menu = _build_menu()
-            try: icon.notify("Downloading update… app will restart automatically.",
-                             "Installing update")
-            except Exception: pass
+            app.overlay.call_soon(
+                lambda: _update_state.update({
+                    "progress_ui": show_update_progress_window(app.overlay.root, _update_state["tag"])
+                })
+            )
+            try:
+                icon.notify("Downloading update. The app will restart automatically after install.",
+                            "Installing update")
+            except Exception:
+                pass
+
+            def _on_progress(got, total):
+                if total:
+                    percent = int((got / total) * 100)
+                    msg = f"Downloading update... {percent}% ({_format_bytes(got)} / {_format_bytes(total)})"
+                else:
+                    percent = _update_state["progress_percent"]
+                    msg = f"Downloading update... {_format_bytes(got)}"
+                notify = total and percent in (25, 50, 75, 100)
+                _set_install_progress(icon, percent, msg, notify=notify)
+
+            def _on_phase(message):
+                percent = 100 if message == "Starting installer" else _update_state["progress_percent"]
+                _set_install_progress(icon, percent, message, notify=message in ("Verifying installer", "Starting installer"))
+
+            def _before_launch():
+                remember_pending_update(_update_state["tag"], _update_state["body"])
+
             def _on_done():
-                try: icon.notify("Update is installing. Transcribe will restart.",
-                                 "Installing update")
-                except Exception: pass
+                _set_install_progress(icon, 100, "Installer is running. Transcribe will restart.", notify=True)
+
             def _on_error(e):
                 _update_state["installing"] = False
+                _update_state["phase"] = ""
+                _update_state["progress_percent"] = 0
+                clear_pending_update()
                 icon.menu = _build_menu()
                 try:
-                    icon.notify(f"Update failed: {e}. Opening downloads page.", "Update error")
-                except Exception: pass
-                webbrowser.open(RELEASES_URL)
+                    icon.notify(f"Update failed: {e}", "Update error")
+                except Exception:
+                    pass
+                app.overlay.call_soon(
+                    update_progress_window,
+                    _update_state.get("progress_ui"),
+                    0,
+                    f"Update failed: {e}",
+                )
+                app.overlay.call_soon(
+                    show_simple_window,
+                    app.overlay.root,
+                    "Update failed",
+                    f"Transcribe stayed on v{APP_VERSION}. No downloaded update was installed.\n\n{e}",
+                    "Open Releases",
+                    lambda: webbrowser.open(RELEASES_URL),
+                )
+
             download_and_install_update(_update_state["url"],
                                         checksum_url=_update_state["checksum_url"],
                                         expected_sha256=_update_state["checksum"],
+                                        on_progress=_on_progress,
+                                        on_phase=_on_phase,
+                                        before_launch=_before_launch,
                                         on_done=_on_done, on_error=_on_error)
+        else:
+            webbrowser.open(RELEASES_URL)
+
+    def on_install_update(icon, _):
+        if _update_state["installing"]:
+            return
+        if _update_state["url"] and sys.platform == "win32":
+            app.overlay.call_soon(
+                show_changelog_window,
+                app.overlay.root,
+                _update_state["tag"],
+                _update_state["body"],
+                "Install Update",
+                lambda: _begin_install_update(icon),
+            )
         else:
             webbrowser.open(RELEASES_URL)
 
@@ -3231,7 +4363,7 @@ def run_tray(app: App):
         _update_state["url"] = info.get("installer_url")
         _update_state["checksum_url"] = info.get("checksum_url")
         _update_state["checksum"] = info.get("checksum", "")
-        _update_state["body"] = info.get("body") or ""
+        _update_state["body"] = info.get("body") or f"Release notes: {info.get('notes_url', RELEASES_URL)}"
         _update_state["last_check"] = time.time()
         icon.menu = _build_menu()
         try:
@@ -3260,14 +4392,24 @@ def run_tray(app: App):
             _set_update_info(info)
             if manual:
                 can_install = bool(info.get("installer_url")) and sys.platform == "win32"
-                app.overlay.call_soon(
-                    show_simple_window,
-                    app.overlay.root,
-                    "Update available",
-                    f"Transcribe {info['tag']} is available. You are running v{APP_VERSION}.",
-                    "Install Update" if can_install else "Open Releases",
-                    (lambda: on_install_update(icon, None)) if can_install else (lambda: webbrowser.open(RELEASES_URL)),
-                )
+                if can_install:
+                    app.overlay.call_soon(
+                        show_changelog_window,
+                        app.overlay.root,
+                        info["tag"],
+                        _update_state["body"],
+                        "Install Update",
+                        lambda: _begin_install_update(icon),
+                    )
+                else:
+                    app.overlay.call_soon(
+                        show_simple_window,
+                        app.overlay.root,
+                        "Update available",
+                        f"Transcribe {info['tag']} is available. You are running v{APP_VERSION}.",
+                        "Open Releases",
+                        lambda: webbrowser.open(RELEASES_URL),
+                    )
 
         def _none():
             _update_state["checking"] = False
@@ -3322,8 +4464,11 @@ def run_tray(app: App):
             pystray.Menu.SEPARATOR,
         ]
         if _update_state["installing"]:
+            phase = _update_state.get("phase") or "Installing update"
+            percent = _update_state.get("progress_percent", 0)
+            label = f"{phase} ({percent}%)" if percent else phase
             items += [
-                pystray.MenuItem("⬇  Installing update…", None, enabled=False),
+                pystray.MenuItem(label, None, enabled=False),
                 pystray.Menu.SEPARATOR,
             ]
         elif _update_state["checking"]:
@@ -3396,6 +4541,7 @@ def main():
     overlay = Overlay()
     _apply_taskbar_icon(overlay.root)
     app     = App(overlay)
+    post_update_notice = consume_pending_update_notice()
 
     def _on_ipc(action):
         if action == "show_settings":
@@ -3410,6 +4556,8 @@ def main():
         overlay.root.after(400, lambda: Onboarding(overlay.root, app).show())
     elif launch_action == "show_settings":
         overlay.call_soon(app.settings.open)
+    if post_update_notice:
+        overlay.root.after(900, lambda n=post_update_notice: show_post_update_window(overlay.root, n))
     overlay.run()
 
 if __name__ == "__main__":
