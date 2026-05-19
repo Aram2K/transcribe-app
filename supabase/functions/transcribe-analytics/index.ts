@@ -122,11 +122,15 @@ Deno.serve(async (req: Request) => {
   }
 
   const supabase = createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false } })
-  const { error } = await supabase.schema('analytics').from('analytics_events').insert(rows)
+  // We call a SECURITY DEFINER RPC in the public schema instead of writing
+  // to `analytics.analytics_events` directly. That avoids needing the
+  // `analytics` schema to be added to PostgREST's exposed-schemas list
+  // and avoids granting service_role rights on the analytics schema.
+  const { data, error } = await supabase.rpc('record_analytics_events', { events: rows })
   if (error) {
     console.error('analytics insert failed', error)
     return new Response(JSON.stringify({ error: 'insert_failed' }), { status: 500, headers: corsHeaders })
   }
 
-  return new Response(JSON.stringify({ inserted: rows.length }), { headers: corsHeaders })
+  return new Response(JSON.stringify({ inserted: data ?? rows.length }), { headers: corsHeaders })
 })
