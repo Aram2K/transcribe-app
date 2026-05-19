@@ -17,7 +17,7 @@ import telemetry
 
 # ── Version ───────────────────────────────────────────────────────────────────
 
-APP_VERSION = "1.5.30"
+APP_VERSION = "1.5.31"
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
@@ -4680,17 +4680,14 @@ def run_tray(app: App):
             webbrowser.open(RELEASES_URL)
 
     def on_install_update(icon, _):
+        # One-click install: start the download immediately, with no
+        # confirmation dialog. Users who want to read the release notes
+        # first can use the "What's new in vX.Y.Z…" tray item, which
+        # opens the changelog with an Install Update button inside.
         if _update_state["installing"]:
             return
         if _update_state["url"] and sys.platform == "win32":
-            app.overlay.call_soon(
-                show_changelog_window,
-                app.overlay.root,
-                _update_state["tag"],
-                _update_state["body"],
-                "Install Update",
-                lambda: _begin_install_update(icon),
-            )
+            _begin_install_update(icon)
         else:
             webbrowser.open(RELEASES_URL)
 
