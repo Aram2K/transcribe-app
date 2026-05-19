@@ -11,12 +11,13 @@ from faster_whisper import WhisperModel
 import storage
 import history as hist
 import actions
+import action_api
 import local_llm
 import telemetry
 
 # ── Version ───────────────────────────────────────────────────────────────────
 
-APP_VERSION = "1.5.29"
+APP_VERSION = "1.5.30"
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
@@ -24,6 +25,12 @@ RELEASES_MANIFEST_URL = "https://github.com/Aram2K/transcribe-app/releases/lates
 AIBUBEN_URL = "https://aibuben.xyz"
 GOOGLE_API_KEY_URL = "https://console.cloud.google.com/apis/credentials"
 GOOGLE_SPEECH_DOCS_URL = "https://cloud.google.com/speech-to-text/docs/reference/rest/v1/RecognitionConfig"
+
+ACTION_API_SIGNUP_URLS = {
+    action_api.PROVIDER_OPENAI:    "https://platform.openai.com/api-keys",
+    action_api.PROVIDER_GEMINI:    "https://aistudio.google.com/apikey",
+    action_api.PROVIDER_ANTHROPIC: "https://console.anthropic.com/settings/keys",
+}
 
 SINGLE_INSTANCE_PORT = 47823   # localhost-only IPC for "open on second launch"
 
@@ -40,6 +47,7 @@ logger = logging.getLogger("transcribe")
 CONFIG_PATH = str(storage.path_for("config.json"))
 LEGACY_CONFIG_PATH = "config.json"
 ANALYTICS_CONSENT_PATH = storage.path_for("analytics_consent.accepted")
+ANALYTICS_DECLINED_PATH = storage.path_for("analytics_consent.declined")
 DEFAULT = {
     "hotkey":        "alt+r",
     "whisper_model": "base",
@@ -63,7 +71,7 @@ DEFAULT = {
     "max_speech_sec": 25.0,
     "privacy_mode": False,
     "save_history": True,
-    "analytics_enabled": False,
+    "analytics_enabled": True,
     "analytics_consent_applied": False,
     "analytics_endpoint": "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-analytics",
     "onboarding_done": False,
@@ -97,7 +105,9 @@ def load_config():
     if loaded.get("privacy_mode"):
         loaded["backend"] = "local"
         loaded["save_history"] = False
-        loaded["analytics_enabled"] = False
+        # Note: analytics_enabled is NOT forced off by Privacy Mode. Telemetry
+        # never includes audio/transcripts/keys/paths (see telemetry._sanitize),
+        # so it stays opt-out and independent of Privacy Mode.
         if actions.ACTION_MODELS.get(actions.normalize_action_model(loaded.get("action_model")), {}).get("kind") == "cloud":
             loaded["action_model"] = actions.RULE_BASED_ID
     loaded["action_model"] = actions.normalize_action_model(loaded.get("action_model"))
@@ -115,13 +125,18 @@ def load_config():
         loaded["action_api_key"] = storage.read_secret(storage.ACTION_API_KEY_SECRET)
 
     if ANALYTICS_CONSENT_PATH.exists() and not loaded.get("analytics_consent_applied"):
-        loaded["analytics_enabled"] = not bool(loaded.get("privacy_mode"))
+        # Installer wizard was seen — record it. If the user explicitly
+        # opted out during install we honour that here; otherwise we keep
+        # the default (True). After this first run the Settings toggle is
+        # the source of truth.
+        if ANALYTICS_DECLINED_PATH.exists():
+            loaded["analytics_enabled"] = False
         loaded["analytics_consent_applied"] = True
         disk = {**loaded, "google_api_key": "", "action_api_key": ""}
         try:
             storage.atomic_write_json(CONFIG_PATH, disk)
         except OSError as e:
-            logger.warning("Could not apply installer analytics consent: %s", e)
+            logger.warning("Could not record installer analytics consent: %s", e)
 
     return loaded
 
@@ -130,7 +145,7 @@ def save_config(c):
     if disk.get("privacy_mode"):
         disk["backend"] = "local"
         disk["save_history"] = False
-        disk["analytics_enabled"] = False
+        # analytics_enabled is intentionally NOT forced off by Privacy Mode.
         if actions.ACTION_MODELS.get(actions.normalize_action_model(disk.get("action_model")), {}).get("kind") == "cloud":
             disk["action_model"] = actions.RULE_BASED_ID
     key = (disk.get("google_api_key") or "").strip()
@@ -1590,6 +1605,22 @@ class Settings:
             except Exception:
                 pass
 
+    def _scroll_to(self, widget):
+        """Scroll the settings canvas so `widget` is in view.
+
+        Used when a UI flow lands the user on a field they need to fill
+        in (e.g. selecting Google Cloud should scroll the API key entry
+        into view)."""
+        try:
+            if not widget or not widget.winfo_exists():
+                return
+            self._scroll_frame.update_idletasks()
+            y = widget.winfo_y()
+            total = max(1, self._scroll_frame.winfo_height())
+            self._canvas.yview_moveto(max(0.0, min(1.0, y / total)))
+        except Exception:
+            pass
+
     # ── Tab: General ──────────────────────────────────────────────────────────
 
     def _build_general(self, f):
@@ -1644,7 +1675,7 @@ class Settings:
                                               selectcolor="#f8f8fb", highlightthickness=0, bd=0,
                                               cursor="hand2")
         self.analytics_check.pack(side="left", padx=(0, 8))
-        tk.Label(analytics_row, text="Share anonymous usage analytics",
+        tk.Label(analytics_row, text="Share anonymous usage analytics (recommended)",
                  bg=self.CARD, fg=self.FG, font=("Segoe UI", 9)).pack(side="left")
 
         tk.Label(box,
@@ -1659,7 +1690,8 @@ class Settings:
             if actions.ACTION_MODELS.get(actions.normalize_action_model(self.action_model_var.get()), {}).get("kind") == "cloud":
                 self.action_model_var.set(actions.RULE_BASED_ID)
             self.save_history_var.set(False)
-            self.analytics_enabled_var.set(False)
+            # analytics_enabled is left untouched — Privacy Mode no longer
+            # toggles it. Users can manage analytics independently.
             self.test_result.set("Privacy Mode uses local models only.")
         self._refresh_privacy_controls()
         if hasattr(self, "_backend_cards_frame") and self._backend_cards_frame.winfo_exists():
@@ -1671,8 +1703,8 @@ class Settings:
 
     def _refresh_privacy_controls(self):
         private = bool(self.privacy_mode_var.get())
-        if hasattr(self, "analytics_check") and self.analytics_check.winfo_exists():
-            self.analytics_check.configure(state="disabled" if private else "normal")
+        # Analytics checkbox stays editable regardless of Privacy Mode —
+        # see _privacy_toggled. Only History is gated by Privacy Mode here.
         if hasattr(self, "history_check") and self.history_check.winfo_exists():
             self.history_check.configure(state="disabled" if private else "normal")
 
@@ -1760,6 +1792,10 @@ class Settings:
             telemetry.track("backend_selected", {"backend": val}, cfg, APP_VERSION)
             if val == "google":
                 self._prompt_google_api_key()
+                # Bring the Google API key entry into view so the user
+                # doesn't have to scroll to find it.
+                if hasattr(self, "google_section") and self.google_section.winfo_exists():
+                    self.win.after(40, lambda: self._scroll_to(self.google_section))
         for w in [card, inner, row] + list(row.winfo_children()) + list(inner.winfo_children()):
             w.bind("<Button-1>", _select)
             if hasattr(w, 'configure'):
@@ -1785,8 +1821,20 @@ class Settings:
                  bg=self.BG, fg=self.FG2, font=("Segoe UI", 8),
                  wraplength=460, justify="left").pack(anchor="w", padx=20, pady=(2, 6))
         kf = tk.Frame(parent, bg=self.CARD,
-                      highlightthickness=1, highlightbackground=self.BORDER)
+                      highlightthickness=2, highlightbackground=self.BORDER)
         kf.pack(fill="x", padx=20, pady=(4, 4))
+        self._google_key_frame = kf
+
+        def _refresh_google_border(*_):
+            try:
+                if not kf.winfo_exists():
+                    return
+                empty = not (self.api_key_var.get() or "").strip()
+                kf.configure(highlightbackground="#fde68a" if empty else self.BORDER)
+            except Exception:
+                pass
+        self.api_key_var.trace_add("write", _refresh_google_border)
+        self.win.after(40, _refresh_google_border)
         entry_row = tk.Frame(kf, bg=self.CARD); entry_row.pack(fill="x")
         self.google_api_entry = tk.Entry(entry_row,
                                          bg=self.CARD, fg=self.FG,
@@ -2063,7 +2111,14 @@ class Settings:
                            bg=cfg["accent_color"], fg="#ffffff", font=("Segoe UI", 9),
                            padx=12, pady=6, cursor="hand2")
         key_btn.pack(side="left", padx=(0, 8))
-        key_btn.bind("<Button-1>", lambda e: (self._switch_tab(0), self._prompt_google_api_key()))
+        def _go_add_google_key(_e=None):
+            self._switch_tab(0)
+            self._prompt_google_api_key()
+            # Give the General tab a moment to lay out, then scroll to
+            # the API key entry so the user can see where to paste it.
+            if hasattr(self, "google_section"):
+                self.win.after(60, lambda: self._scroll_to(self.google_section))
+        key_btn.bind("<Button-1>", _go_add_google_key)
         key_btn.bind("<Enter>", lambda e: key_btn.configure(bg=self._dim(cfg["accent_color"], 0.85)))
         key_btn.bind("<Leave>", lambda e: key_btn.configure(bg=cfg["accent_color"]))
 
@@ -2085,7 +2140,17 @@ class Settings:
 
     def _switch_to_local_models(self):
         self.backend_var.set("local")
-        self._switch_tab(1)
+        # _switch_tab early-returns when already on the same tab, which
+        # leaves the old Google notice on screen even though the backend
+        # changed. Force a rebuild here when we're already on the Model
+        # tab so the user sees the Whisper picker.
+        if self._active_tab == 1:
+            for w in self._scroll_frame.winfo_children():
+                w.destroy()
+            self._build_model(self._scroll_frame)
+            self._canvas.yview_moveto(0)
+        else:
+            self._switch_tab(1)
 
     def _ensure_model_state_scan(self):
         if self._model_scan_running:
@@ -2472,12 +2537,10 @@ class Settings:
                  wraplength=460, justify="left").pack(anchor="w", padx=20, pady=(2, 6))
         self._action_model_cards_frame = tk.Frame(f, bg=self.BG)
         self._action_model_cards_frame.pack(fill="x", padx=20, pady=(4, 16))
+        # Per-card live UI state for the inline cloud API config panel:
+        # status text + colour for the Test Key result line.
+        self._action_api_status = {}
         self._render_action_model_cards()
-
-        self._action_api_options = tk.Frame(f, bg=self.BG)
-        self._section(self._action_api_options, "Action API Key")
-        self._build_action_api_section(self._action_api_options)
-        self._sync_action_api_options()
 
     def _render_action_cards(self):
         for w in self._action_cards_frame.winfo_children():
@@ -2526,53 +2589,58 @@ class Settings:
         else:
             self._translate_options.pack_forget()
 
-    def _build_action_api_section(self, parent):
-        self._action_api_title = tk.StringVar(value="")
-        self._action_api_desc = tk.StringVar(value="")
-        box = tk.Frame(parent, bg=self.CARD, highlightthickness=1, highlightbackground=self.BORDER)
-        box.pack(fill="x", padx=20, pady=(4, 14))
-        tk.Label(box, textvariable=self._action_api_title, bg=self.CARD, fg=self.FG,
-                 font=("Segoe UI Semibold", 10)).pack(anchor="w", padx=14, pady=(12, 2))
-        tk.Label(box, textvariable=self._action_api_desc, bg=self.CARD, fg=self.FG2,
-                 font=("Segoe UI", 8), wraplength=400, justify="left").pack(anchor="w", padx=14, pady=(0, 10))
-
-        for label, var, placeholder, secret in [
-            ("API Key", self.action_api_key_var, "Paste your action API key here", True),
-            ("Base URL", self.action_api_base_url_var, "Provider default", False),
-            ("Model", self.action_api_model_var, "Provider default", False),
-        ]:
-            tk.Label(box, text=label.upper(), bg=self.CARD, fg=self.FG2,
-                     font=("Segoe UI", 7)).pack(anchor="w", padx=14)
-            entry = tk.Entry(box, bg=self.CARD, fg=self.FG, insertbackground=self.FG,
-                             show="*" if secret else "", font=("Segoe UI", 9),
-                             relief="flat", bd=8)
-            entry.pack(fill="x", padx=14, pady=(2, 8 if label != "Model" else 12))
-            attach_placeholder_entry(
-                entry,
-                var,
-                placeholder,
-                self.FG,
-                "#a0a0aa",
-                secret_char="*" if secret else "",
-            )
-
     def _sync_action_api_options(self):
-        if not hasattr(self, "_action_api_options"):
+        """Compat shim: the cloud API config now lives inline inside each
+        cloud action card, so syncing just means re-rendering the cards."""
+        if hasattr(self, "_action_model_cards_frame") and self._action_model_cards_frame.winfo_exists():
+            self._render_action_model_cards()
+
+    def _test_action_api_key(self, code):
+        """Send a tiny real request through `action_api.run_action` to
+        confirm the API Key / Base URL / Model the user just typed actually
+        work. Updates the per-card status entry, then triggers a re-render
+        so the new status shows up."""
+        api_info = actions.ACTION_API_MODELS.get(code)
+        if not api_info:
             return
-        model = actions.normalize_action_model(self.action_model_var.get())
-        info = actions.ACTION_MODELS.get(model, {})
-        if info.get("kind") == "cloud" and not self.privacy_mode_var.get():
-            api_info = actions.ACTION_API_MODELS[model]
-            self._action_api_title.set(api_info["label"])
-            self._action_api_desc.set(api_info["description"])
-            if not (self.action_api_base_url_var.get() or "").strip():
-                self.action_api_base_url_var.set(api_info["default_base_url"])
-            if not (self.action_api_model_var.get() or "").strip():
-                self.action_api_model_var.set(api_info["default_model"])
-            if not self._action_api_options.winfo_ismapped():
-                self._action_api_options.pack(fill="x", after=self._action_model_cards_frame)
-        else:
-            self._action_api_options.pack_forget()
+        key = (self.action_api_key_var.get() or "").strip()
+        if not key:
+            self._action_api_status[code] = ("Add a key first.", "#f97316")
+            self._render_action_model_cards()
+            return
+        base_url = (self.action_api_base_url_var.get() or "").strip() or api_info["default_base_url"]
+        model_name = (self.action_api_model_var.get() or "").strip() or api_info["default_model"]
+        self._action_api_status[code] = ("Testing…", self.FG2)
+        self._render_action_model_cards()
+
+        def _run():
+            try:
+                action_api.run_action(
+                    "ok",
+                    actions.ACTION_WRITE_EMAIL,
+                    {
+                        "action_api_provider": api_info["provider"],
+                        "action_api_key": key,
+                        "action_api_base_url": base_url,
+                        "action_api_model": model_name,
+                        "privacy_mode": False,
+                    },
+                )
+                result = ("✓ Key works!", "#22c55e")
+            except action_api.ActionAPIError as e:
+                result = (f"✗ {e}"[:90], "#ef4444")
+            except Exception as e:  # network errors, etc.
+                result = (f"✗ {e}"[:90], "#ef4444")
+
+            def _apply():
+                if not self.win or not self.win.winfo_exists():
+                    return
+                self._action_api_status[code] = result
+                if self._active_tab == 2 and hasattr(self, "_action_model_cards_frame"):
+                    self._render_action_model_cards()
+            self.app.overlay.call_soon(_apply)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _render_action_model_cards(self):
         for w in self._action_model_cards_frame.winfo_children():
@@ -2587,8 +2655,8 @@ class Settings:
                 info["available"],
                 state,
             )
-        if hasattr(self, "_action_api_options"):
-            self._sync_action_api_options()
+        # Inline API config now lives inside the selected card itself, so
+        # the old separate-section sync is no longer needed here.
 
     def _action_model_state(self, code, info):
         if code == actions.RULE_BASED_ID:
@@ -2698,6 +2766,8 @@ class Settings:
         sel = self.action_model_var.get() == code
         usable = available and state in ("ready", "downloaded", "api_key", "api_ready")
         downloadable = available and state in ("missing", "failed")
+        info = actions.ACTION_MODELS.get(code, {})
+        is_cloud = info.get("kind") == "cloud"
         bg = self.SEL_BG if sel else (self.CARD if available else "#f9f9f9")
         bord = cfg["accent_color"] if sel else (self.BORDER if available else "#ebebeb")
         card = tk.Frame(parent, bg=bord, padx=1, pady=1, cursor="hand2" if usable else "arrow")
@@ -2724,6 +2794,13 @@ class Settings:
                  font=("Segoe UI", 8)).pack(side="right")
         tk.Label(inner, text=desc, bg=bg, fg=self.FG2,
                  font=("Segoe UI", 8), wraplength=420, justify="left").pack(anchor="w", pady=(4, 0))
+
+        # Helpful hint for local LLM cards that need a download before they
+        # become selectable, so clicking the card body doesn't feel broken.
+        if info.get("kind") == "local_llm" and state == "missing":
+            tk.Label(inner, text="Click Download below to install this model first.",
+                     bg=bg, fg="#92400e", font=("Segoe UI", 7),
+                     wraplength=420, justify="left").pack(anchor="w", pady=(2, 0))
 
         if state == "downloading":
             progress = self._action_model_progress.get(code, {})
@@ -2755,20 +2832,112 @@ class Settings:
             remove.bind("<Enter>", lambda e: remove.configure(bg="#fecaca"))
             remove.bind("<Leave>", lambda e: remove.configure(bg="#fee2e2"))
 
+        # Inline API configuration panel — appears INSIDE the selected
+        # cloud card so users don't have to scroll to a separate section.
+        if sel and is_cloud and not self.privacy_mode_var.get():
+            self._build_inline_api_panel(inner, code, bg)
+
         def _select(_event=None):
             if not usable:
                 return
             self.action_model_var.set(code)
             if actions.ACTION_MODELS.get(code, {}).get("kind") == "cloud":
                 api_info = actions.ACTION_API_MODELS[code]
-                self.action_api_base_url_var.set(api_info["default_base_url"])
-                self.action_api_model_var.set(api_info["default_model"])
+                if not (self.action_api_base_url_var.get() or "").strip():
+                    self.action_api_base_url_var.set(api_info["default_base_url"])
+                if not (self.action_api_model_var.get() or "").strip():
+                    self.action_api_model_var.set(api_info["default_model"])
             self._render_action_model_cards()
-            self._sync_action_api_options()
-        for w in [card, inner, row] + list(row.winfo_children()):
+        # Bind select only on the title row/dot — not on the API entries —
+        # so typing inside the inline panel doesn't accidentally re-render
+        # the card mid-keystroke.
+        for w in [card, row] + list(row.winfo_children()):
             w.bind("<Button-1>", _select)
             try: w.configure(cursor="hand2" if usable else "arrow")
             except Exception: pass
+
+    def _build_inline_api_panel(self, parent, code, bg):
+        """Render the API Key / Base URL / Model fields + Test Key
+        button INSIDE the given cloud action card frame."""
+        api_info = actions.ACTION_API_MODELS[code]
+        provider = api_info["provider"]
+        default_base = api_info["default_base_url"]
+        default_model = api_info["default_model"]
+        signup_url = ACTION_API_SIGNUP_URLS.get(provider)
+
+        panel = tk.Frame(parent, bg=bg)
+        panel.pack(fill="x", pady=(10, 0))
+        tk.Frame(panel, bg=self.BORDER, height=1).pack(fill="x", pady=(0, 8))
+
+        # ── API Key + Test Key + Get key link ──
+        tk.Label(panel, text="API KEY", bg=bg, fg=self.FG2,
+                 font=("Segoe UI", 7)).pack(anchor="w")
+        key_row = tk.Frame(panel, bg=bg)
+        key_row.pack(fill="x", pady=(2, 4))
+        key_entry = tk.Entry(key_row, bg="#ffffff", fg=self.FG,
+                             insertbackground=self.FG, show="*",
+                             font=("Segoe UI", 9), relief="flat", bd=8,
+                             highlightthickness=1, highlightbackground=self.BORDER)
+        key_entry.pack(side="left", fill="x", expand=True)
+        attach_placeholder_entry(
+            key_entry, self.action_api_key_var,
+            "Paste your action API key here",
+            self.FG, "#a0a0aa", secret_char="*",
+        )
+        test_btn = tk.Label(key_row, text="Test Key", bg="#efefef", fg=self.FG,
+                            font=("Segoe UI Semibold", 8), padx=10, pady=5,
+                            cursor="hand2")
+        test_btn.pack(side="left", padx=(8, 0))
+        test_btn.bind("<Button-1>", lambda _e, c=code: self._test_action_api_key(c))
+        test_btn.bind("<Enter>", lambda _e: test_btn.configure(bg="#e0e0e8"))
+        test_btn.bind("<Leave>", lambda _e: test_btn.configure(bg="#efefef"))
+
+        if signup_url:
+            link = tk.Label(panel, text=f"Don't have one? Get your {api_info['label']} key →",
+                            bg=bg, fg="#2563eb", font=("Segoe UI", 8, "underline"),
+                            cursor="hand2")
+            link.pack(anchor="w", pady=(0, 4))
+            link.bind("<Button-1>", lambda _e, u=signup_url: webbrowser.open(u))
+
+        status = self._action_api_status.get(code)
+        if status:
+            status_text, status_fg = status
+            tk.Label(panel, text=status_text, bg=bg, fg=status_fg,
+                     font=("Segoe UI", 8)).pack(anchor="w", pady=(2, 4))
+
+        # ── Base URL ──
+        tk.Label(panel, text="BASE URL", bg=bg, fg=self.FG2,
+                 font=("Segoe UI", 7)).pack(anchor="w", pady=(4, 0))
+        base_entry = tk.Entry(panel, bg="#ffffff", fg=self.FG,
+                              insertbackground=self.FG, font=("Segoe UI", 9),
+                              relief="flat", bd=8,
+                              highlightthickness=1, highlightbackground=self.BORDER)
+        base_entry.pack(fill="x", pady=(2, 2))
+        attach_placeholder_entry(
+            base_entry, self.action_api_base_url_var,
+            default_base, self.FG, "#a0a0aa",
+        )
+        tk.Label(panel,
+                 text=f"The provider's endpoint URL. Leave blank to use the default: {default_base}",
+                 bg=bg, fg=self.FG2, font=("Segoe UI", 7),
+                 wraplength=420, justify="left").pack(anchor="w", pady=(0, 4))
+
+        # ── Model ──
+        tk.Label(panel, text="MODEL", bg=bg, fg=self.FG2,
+                 font=("Segoe UI", 7)).pack(anchor="w", pady=(4, 0))
+        model_entry = tk.Entry(panel, bg="#ffffff", fg=self.FG,
+                               insertbackground=self.FG, font=("Segoe UI", 9),
+                               relief="flat", bd=8,
+                               highlightthickness=1, highlightbackground=self.BORDER)
+        model_entry.pack(fill="x", pady=(2, 2))
+        attach_placeholder_entry(
+            model_entry, self.action_api_model_var,
+            default_model, self.FG, "#a0a0aa",
+        )
+        tk.Label(panel,
+                 text=f"The model name your provider expects. Leave blank for the default: {default_model}",
+                 bg=bg, fg=self.FG2, font=("Segoe UI", 7),
+                 wraplength=420, justify="left").pack(anchor="w", pady=(0, 4))
 
     # ── Tab: Language ─────────────────────────────────────────────────────────
 
@@ -3025,7 +3194,7 @@ class Settings:
         if privacy_mode:
             self.backend_var.set("local")
             self.save_history_var.set(False)
-            self.analytics_enabled_var.set(False)
+            # analytics_enabled is left to the user's choice in the checkbox.
             if actions.ACTION_MODELS.get(actions.normalize_action_model(self.action_model_var.get()), {}).get("kind") == "cloud":
                 self.action_model_var.set(actions.RULE_BASED_ID)
 
@@ -3051,6 +3220,10 @@ class Settings:
             if self._active_tab != 2:
                 self._switch_tab(2)
             self._sync_action_api_options()
+            # Scroll the Actions tab so the inline API panel inside the
+            # selected card is in view when the warning is dismissed.
+            if hasattr(self, "_action_model_cards_frame") and self._action_model_cards_frame.winfo_exists():
+                self.win.after(60, lambda: self._scroll_to(self._action_model_cards_frame))
             messagebox.showwarning(
                 "Action API key required",
                 "Cloud action modes need your own API key before they can be saved.",

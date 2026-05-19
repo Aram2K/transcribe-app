@@ -89,19 +89,29 @@ begin
     False,
     False
   );
-  AnalyticsPage.Add('Accept anonymous usage analytics');
-  AnalyticsPage.Values[0] := False;
+  AnalyticsPage.Add('Share anonymous usage analytics (recommended)');
+  AnalyticsPage.Values[0] := True;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ConsentDir: string;
 begin
-  if (CurStep = ssPostInstall) and (not WizardSilent) and AnalyticsPage.Values[0] then
+  if (CurStep = ssPostInstall) and (not WizardSilent) then
   begin
     ConsentDir := ExpandConstant('{userappdata}\Transcribe');
     ForceDirectories(ConsentDir);
+    // Always write the marker once the wizard has been seen; the app uses
+    // it only to set analytics_consent_applied. The user's actual choice
+    // is reflected by the default analytics_enabled value and the in-app
+    // Settings toggle.
     SaveStringToFile(ConsentDir + '\analytics_consent.accepted', 'accepted', False);
+    if not AnalyticsPage.Values[0] then
+    begin
+      // User opted out during install: write a declined marker so the
+      // app can honour it on first launch.
+      SaveStringToFile(ConsentDir + '\analytics_consent.declined', 'declined', False);
+    end;
   end;
 end;
 
