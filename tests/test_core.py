@@ -198,7 +198,10 @@ class TestConfig(unittest.TestCase):
         finally:
             m.CONFIG_PATH = orig
 
-    def test_privacy_mode_forces_local_no_history_no_analytics(self):
+    def test_privacy_mode_forces_local_no_history_keeps_analytics(self):
+        # Privacy Mode forces backend=local and disables history, but it
+        # intentionally leaves analytics_enabled untouched — the user
+        # controls that independently via the Settings checkbox.
         import main as m
         import actions
         orig = m.CONFIG_PATH
@@ -215,12 +218,15 @@ class TestConfig(unittest.TestCase):
             c = load_config()
             self.assertEqual(c["backend"], "local")
             self.assertFalse(c["save_history"])
-            self.assertFalse(c["analytics_enabled"])
+            self.assertTrue(c["analytics_enabled"])  # NOT forced off anymore
             self.assertEqual(c["action_model"], actions.RULE_BASED_ID)
         finally:
             m.CONFIG_PATH = orig
 
-    def test_installer_analytics_consent_marker_enables_once(self):
+    def test_installer_analytics_consent_marker_records_consent_applied(self):
+        # The .accepted marker just flags consent as recorded; the actual
+        # analytics_enabled state comes from the DEFAULT (True) or any
+        # user override. Privacy Mode no longer affects this path.
         import main as m
         orig = m.CONFIG_PATH
         m.CONFIG_PATH = self._cfg_path
@@ -238,6 +244,27 @@ class TestConfig(unittest.TestCase):
                 marker.unlink()
             except OSError:
                 pass
+            m.CONFIG_PATH = orig
+
+    def test_installer_analytics_declined_marker_disables_default(self):
+        # If the installer wrote a .declined marker (user unchecked the
+        # consent checkbox), load_config should honour it on first launch.
+        import main as m
+        orig = m.CONFIG_PATH
+        m.CONFIG_PATH = self._cfg_path
+        accepted = m.ANALYTICS_CONSENT_PATH
+        declined = m.ANALYTICS_DECLINED_PATH
+        accepted.parent.mkdir(parents=True, exist_ok=True)
+        accepted.write_text("accepted", encoding="ascii")
+        declined.write_text("declined", encoding="ascii")
+        try:
+            c = load_config()
+            self.assertFalse(c["analytics_enabled"])
+            self.assertTrue(c["analytics_consent_applied"])
+        finally:
+            for p in (accepted, declined):
+                try: p.unlink()
+                except OSError: pass
             m.CONFIG_PATH = orig
 
 

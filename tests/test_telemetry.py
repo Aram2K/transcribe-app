@@ -5,11 +5,30 @@ import telemetry
 
 
 class TestTelemetry(unittest.TestCase):
-    def test_privacy_mode_disables_analytics(self):
+    def test_privacy_mode_does_not_disable_analytics(self):
+        # Analytics is independent of Privacy Mode — the sanitizer already
+        # strips all sensitive props, so privacy-mode users can still
+        # share usage events when they want to.
         config = {
             "analytics_enabled": True,
             "privacy_mode": True,
             "analytics_endpoint": "https://example.com/events",
+        }
+        self.assertTrue(telemetry.enabled(config))
+
+    def test_analytics_disabled_when_checkbox_off(self):
+        config = {
+            "analytics_enabled": False,
+            "privacy_mode": False,
+            "analytics_endpoint": "https://example.com/events",
+        }
+        self.assertFalse(telemetry.enabled(config))
+
+    def test_analytics_disabled_without_endpoint(self):
+        config = {
+            "analytics_enabled": True,
+            "privacy_mode": False,
+            "analytics_endpoint": "",
         }
         self.assertFalse(telemetry.enabled(config))
 

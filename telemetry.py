@@ -63,9 +63,11 @@ _flush_running = False
 
 
 def enabled(config):
+    # Analytics are independent of Privacy Mode. The sanitizer in
+    # `_sanitize` already strips audio/transcripts/keys/paths, so events
+    # carry only metadata about feature usage.
     return (
         bool(config.get("analytics_enabled"))
-        and not bool(config.get("privacy_mode"))
         and bool(config.get("analytics_endpoint"))
     )
 
