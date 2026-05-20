@@ -17,7 +17,7 @@ import telemetry
 
 # ── Version ───────────────────────────────────────────────────────────────────
 
-APP_VERSION = "1.5.31"
+APP_VERSION = "1.5.32"
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
@@ -4236,6 +4236,81 @@ def check_for_update(on_update_found, on_no_update=None, on_error=None, ignore_d
                 on_error(e)
     threading.Thread(target=_run, daemon=True).start()
 
+_MARKDOWN_INLINE_RE = None  # lazily compiled
+
+
+def _render_markdown_into_text(txt, body):
+    """Render a small subset of GitHub-flavoured markdown into a Tk Text
+    widget so the release-notes dialog shows formatted text + clickable
+    links instead of raw asterisks and backticks."""
+    import re
+    global _MARKDOWN_INLINE_RE
+    if _MARKDOWN_INLINE_RE is None:
+        _MARKDOWN_INLINE_RE = re.compile(
+            r'(\*\*([^*\n]+)\*\*|`([^`\n]+)`|https?://[^\s)\]]+)'
+        )
+
+    txt.tag_configure("h2", font=("Segoe UI Semibold", 13),
+                      foreground="#1d1d1f", spacing1=10, spacing3=4)
+    txt.tag_configure("h3", font=("Segoe UI Semibold", 11),
+                      foreground="#1d1d1f", spacing1=8, spacing3=2)
+    txt.tag_configure("bold", font=("Segoe UI", 10, "bold"))
+    txt.tag_configure("code", font=("Consolas", 9),
+                      background="#f3f4f6", foreground="#5b21b6")
+    txt.tag_configure("bullet", lmargin1=10, lmargin2=24, spacing1=2)
+    txt.tag_configure("link", foreground="#2563eb", underline=1)
+
+    txt.tag_bind("link", "<Enter>", lambda _e: txt.configure(cursor="hand2"))
+    txt.tag_bind("link", "<Leave>", lambda _e: txt.configure(cursor=""))
+
+    def _open_link(event):
+        idx = txt.index(f"@{event.x},{event.y}")
+        ranges = txt.tag_ranges("link")
+        for i in range(0, len(ranges), 2):
+            start, end = ranges[i], ranges[i + 1]
+            if txt.compare(start, "<=", idx) and txt.compare(idx, "<", end):
+                webbrowser.open(txt.get(start, end))
+                return
+    txt.tag_bind("link", "<Button-1>", _open_link)
+
+    def _insert_inline(line, base_tags=()):
+        pos = 0
+        for m in _MARKDOWN_INLINE_RE.finditer(line):
+            if m.start() > pos:
+                txt.insert("end", line[pos:m.start()], base_tags)
+            token = m.group(0)
+            if token.startswith("**"):
+                txt.insert("end", m.group(2), base_tags + ("bold",))
+            elif token.startswith("`"):
+                txt.insert("end", m.group(3), base_tags + ("code",))
+            else:
+                # Strip common trailing punctuation that isn't really part
+                # of the URL (e.g. "see https://x.com.").
+                url = token.rstrip(".,;:!?")
+                trailing = token[len(url):]
+                txt.insert("end", url, base_tags + ("link",))
+                if trailing:
+                    txt.insert("end", trailing, base_tags)
+            pos = m.end()
+        if pos < len(line):
+            txt.insert("end", line[pos:], base_tags)
+
+    for raw_line in (body or "No release notes were included with this release.").splitlines():
+        if raw_line.startswith("## "):
+            txt.insert("end", raw_line[3:].strip() + "\n", ("h2",))
+        elif raw_line.startswith("### "):
+            txt.insert("end", raw_line[4:].strip() + "\n", ("h3",))
+        elif raw_line.startswith("# "):
+            txt.insert("end", raw_line[2:].strip() + "\n", ("h2",))
+        elif raw_line.startswith("- "):
+            txt.insert("end", "•  ", ("bullet",))
+            _insert_inline(raw_line[2:], base_tags=("bullet",))
+            txt.insert("end", "\n", ("bullet",))
+        else:
+            _insert_inline(raw_line)
+            txt.insert("end", "\n")
+
+
 def show_changelog_window(root, tag, body, primary_label=None, primary_action=None):
     """Lightweight window listing what's new in a release. Body is GitHub markdown
     (we render as plain text — links visible as URLs)."""
@@ -4292,7 +4367,7 @@ def show_changelog_window(root, tag, body, primary_label=None, primary_action=No
                   yscrollcommand=sb.set)
     txt.pack(side="left", fill="both", expand=True)
     sb.configure(command=txt.yview)
-    txt.insert("1.0", (body or "No release notes were included with this release.").strip())
+    _render_markdown_into_text(txt, (body or "").strip())
     txt.configure(state="disabled")
 
 def show_simple_window(root, title, message, primary_label=None, primary_action=None):

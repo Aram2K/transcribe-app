@@ -289,6 +289,12 @@ jobs:
             echo "- **Windows installer**: \`TranscribeApp-Windows-Setup.exe\`"
             echo "- **Windows portable**: \`TranscribeApp-Windows.zip\`"
             echo "- **macOS**: \`TranscribeApp-Mac.dmg\` — on first launch right-click → **Open** to bypass Gatekeeper (the app is ad-hoc signed, not notarized)."
+            echo
+            echo "### About"
+            echo "Created by Aram Adamyan, founder of Aibuben — an AI community for learning, building, and sharing practical AI tools."
+            echo "- Explore other tools and projects: https://aibuben.xyz/products"
+            echo "- Aibuben homepage: https://aibuben.xyz"
+            echo "- Project repository: https://github.com/${GITHUB_REPOSITORY}"
           } > release_notes.md
           echo "--- release_notes.md ---"
           cat release_notes.md
