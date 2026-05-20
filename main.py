@@ -4254,19 +4254,13 @@ def show_changelog_window(root, tag, body, primary_label=None, primary_action=No
              bg="#f5f5f7", fg="#6e6e73", font=("Segoe UI", 9)
              ).pack(anchor="w", padx=20, pady=(0, 10))
 
-    body_frame = tk.Frame(win, bg="#ffffff",
-                          highlightthickness=1, highlightbackground="#e2e2e7")
-    body_frame.pack(fill="both", expand=True, padx=20, pady=(0, 12))
-    txt = tk.Text(body_frame, bg="#ffffff", fg="#1d1d1f", relief="flat",
-                  font=("Segoe UI", 10), padx=12, pady=10, wrap="word")
-    txt.pack(fill="both", expand=True)
-    sb = tk.Scrollbar(body_frame, orient="vertical", command=txt.yview)
-    sb.pack(side="right", fill="y")
-    txt.configure(yscrollcommand=sb.set)
-    txt.insert("1.0", (body or "No release notes were included with this release.").strip())
-    txt.configure(state="disabled")
-
-    btns = tk.Frame(win, bg="#f5f5f7"); btns.pack(fill="x", padx=20, pady=(0, 16))
+    # Pack the buttons FIRST with side="bottom" so they're anchored to
+    # the bottom edge before the body_frame expands. Without this, when
+    # the release notes are long, the body's expand=True pushes the
+    # button row off the bottom of the window and the user thinks the
+    # dialog is broken.
+    btns = tk.Frame(win, bg="#f5f5f7")
+    btns.pack(side="bottom", fill="x", padx=20, pady=(0, 16))
     close = tk.Label(btns, text="Close", bg="#efefef", fg="#1d1d1f",
                      font=("Segoe UI", 10), padx=18, pady=7, cursor="hand2")
     close.pack(side="right")
@@ -4285,6 +4279,21 @@ def show_changelog_window(root, tag, body, primary_label=None, primary_action=No
         primary.bind("<Button-1>", _primary)
         primary.bind("<Enter>", lambda e: primary.configure(bg="#2563eb"))
         primary.bind("<Leave>", lambda e: primary.configure(bg=cfg["accent_color"]))
+
+    body_frame = tk.Frame(win, bg="#ffffff",
+                          highlightthickness=1, highlightbackground="#e2e2e7")
+    body_frame.pack(fill="both", expand=True, padx=20, pady=(0, 12))
+    # Scrollbar packs first (side=right) so the Text doesn't consume the
+    # full width and leave the scrollbar with zero space.
+    sb = tk.Scrollbar(body_frame, orient="vertical")
+    sb.pack(side="right", fill="y")
+    txt = tk.Text(body_frame, bg="#ffffff", fg="#1d1d1f", relief="flat",
+                  font=("Segoe UI", 10), padx=12, pady=10, wrap="word",
+                  yscrollcommand=sb.set)
+    txt.pack(side="left", fill="both", expand=True)
+    sb.configure(command=txt.yview)
+    txt.insert("1.0", (body or "No release notes were included with this release.").strip())
+    txt.configure(state="disabled")
 
 def show_simple_window(root, title, message, primary_label=None, primary_action=None):
     root.deiconify()
