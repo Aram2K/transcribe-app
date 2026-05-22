@@ -17,7 +17,7 @@ import telemetry
 
 # ── Version ───────────────────────────────────────────────────────────────────
 
-APP_VERSION = "1.5.32"
+APP_VERSION = "1.5.33"
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
@@ -3966,8 +3966,43 @@ class App:
     def _stop(self):
         self.recorder.stop_recording()
         self.overlay.call_soon(self.overlay.set_state, TRANSCRIBING)
-        text, lang = self.recorder.transcribe()
+
+        # Watchdog: faster-whisper's model.transcribe() has no timeout. On
+        # certain audio inputs (especially long Armenian utterances with
+        # the temperature-fallback retry chain), it can hang for many
+        # minutes on CPU. Run it in a worker thread and give up if it
+        # exceeds TRANSCRIBE_TIMEOUT_SEC so the overlay isn't stuck on
+        # "Finalising…" forever.
+        TRANSCRIBE_TIMEOUT_SEC = 120
+        _result = {}
+        def _do_transcribe():
+            try:
+                _result["text"], _result["lang"] = self.recorder.transcribe()
+            except Exception as e:  # noqa: BLE001 — surface any failure to UI
+                _result["exc"] = e
+        t = threading.Thread(target=_do_transcribe, daemon=True)
+        t.start()
+        t.join(timeout=TRANSCRIBE_TIMEOUT_SEC)
+
         self.is_rec = False
+
+        if t.is_alive():
+            telemetry.track(
+                "action_failed",
+                {"action": "transcribe", "reason": f"timeout_{TRANSCRIBE_TIMEOUT_SEC}s"},
+                cfg, APP_VERSION,
+            )
+            self.overlay.call_soon(
+                self.overlay.show_error,
+                f"Transcription timed out after {TRANSCRIBE_TIMEOUT_SEC}s — try a shorter clip or a smaller model.",
+            )
+            return
+        if "exc" in _result:
+            self.overlay.call_soon(self.overlay.show_error, str(_result["exc"])[:80])
+            return
+
+        text = _result.get("text", "")
+        lang = _result.get("lang", "")
 
         if not text:
             if lang and lang.startswith("!"):
@@ -4477,7 +4512,7 @@ def show_about_window(root):
     win = tk.Toplevel(root)
     win.title("About Transcribe")
     win.configure(bg="#f5f5f7")
-    W, H = 520, 440
+    W, H = 540, 560
     sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
     win.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
     win.transient(root)
@@ -4489,8 +4524,16 @@ def show_about_window(root):
              bg="#f5f5f7", fg="#6e6e73", font=("Segoe UI", 9)
              ).pack(anchor="w", padx=24, pady=(0, 14))
 
+    # Pack the buttons row FIRST at side="bottom" so it reserves its
+    # space at the bottom of the window before the content box claims
+    # the rest. Previously the box was packed with expand=True before
+    # the buttons, which pushed the button row off-screen when the
+    # content was tall enough to fill the window.
+    btns = tk.Frame(win, bg="#f5f5f7")
+    btns.pack(side="bottom", fill="x", padx=24, pady=(0, 20))
+
     box = tk.Frame(win, bg="#ffffff", highlightthickness=1, highlightbackground="#e2e2e7")
-    box.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+    box.pack(fill="both", expand=True, padx=24, pady=(0, 12))
 
     sections = [
         (
@@ -4518,11 +4561,8 @@ def show_about_window(root):
         tk.Label(box, text=title, bg="#ffffff", fg="#1d1d1f",
                  font=("Segoe UI Semibold", 10)).pack(anchor="w", padx=16, pady=(14 if i == 0 else 10, 2))
         tk.Label(box, text=text, bg="#ffffff", fg="#6e6e73",
-                 font=("Segoe UI", 9), wraplength=450, justify="left"
-                 ).pack(anchor="w", padx=16)
-
-    btns = tk.Frame(win, bg="#f5f5f7")
-    btns.pack(fill="x", padx=24, pady=(0, 20))
+                 font=("Segoe UI", 9), wraplength=460, justify="left"
+                 ).pack(anchor="w", padx=16, pady=(0, 6))
 
     def _button(label, bg, fg, action, side="right", padx=(8, 0)):
         btn = tk.Label(btns, text=label, bg=bg, fg=fg,
