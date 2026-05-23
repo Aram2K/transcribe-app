@@ -11,6 +11,7 @@ pip install pyinstaller --quiet
 
 Write-Host "Building .exe..." -ForegroundColor Cyan
 pyinstaller `
+    --noconfirm `
     --onedir `
     --windowed `
     --name "TranscribeApp" `

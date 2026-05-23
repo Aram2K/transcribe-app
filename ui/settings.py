@@ -14,7 +14,6 @@ import history as hist
 import telemetry
 import action_api
 import actions
-from main import MODELS, LANG_NAMES, APP_VERSION, PROJECT_GITHUB_URL
 
 class DownloadProgressSignal(QObject):
     progress = Signal(str, int, int, int) # model_name, percent, downloaded, total
@@ -57,7 +56,7 @@ class Settings(QDialog):
 
     def _scan_model_statuses(self):
         # Scan whisper models
-        from main import model_downloaded
+        from main import model_downloaded, MODELS
         for name in MODELS:
             self._model_states[name] = "downloaded" if model_downloaded(name) else "missing"
             
@@ -95,6 +94,7 @@ class Settings(QDialog):
 
     # ── TAB 1: General Settings ──────────────────────────────────────────────
     def _create_general_tab(self):
+        from main import LANG_NAMES
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -156,6 +156,7 @@ class Settings(QDialog):
 
     # ── TAB 2: Local Whisper Models ──────────────────────────────────────────
     def _create_models_tab(self):
+        from main import MODELS
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -658,6 +659,7 @@ class Settings(QDialog):
 
     # ── TAB 5: About & Updates ───────────────────────────────────────────────
     def _create_about_tab(self):
+        from main import APP_VERSION
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -697,6 +699,7 @@ class Settings(QDialog):
         return tab
 
     def _check_for_updates(self):
+        from main import APP_VERSION
         self.btn_update.setText("Checking...")
         self.btn_update.setEnabled(False)
         
@@ -800,6 +803,7 @@ class Settings(QDialog):
             self._update_whisper_card_ui(model_name)
 
     def _on_download_finished(self, model_name, state):
+        from main import PROJECT_GITHUB_URL
         if model_name == "update":
             self.btn_update.setEnabled(True)
             self.btn_update.setText("Check for Updates")
