@@ -1,0 +1,595 @@
+# Modern Meeting Dictation Workspace in PySide6
+
+import os
+import time
+import json
+import re
+import threading
+
+from PySide6.QtCore import Qt, QTimer, Signal, QObject
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, 
+    QLineEdit, QTextEdit, QFrame, QMessageBox, QSplitter, QProgressBar
+)
+from PySide6.QtGui import QFont, QColor
+import storage
+import actions
+import telemetry
+
+class MeetingProcessingSignal(QObject):
+    finished = Signal(str, str) # notes, error_msg
+
+class MeetingsWindow(QDialog):
+    STATE_IDLE = "idle"
+    STATE_RECORDING = "recording"
+    STATE_PROCESSING = "processing"
+    STATE_DONE = "done"
+
+    def __init__(self, parent=None, main_app=None):
+        super().__init__(parent)
+        self.app = main_app
+        
+        self.setWindowTitle("Record Meeting")
+        self.setMinimumSize(780, 620)
+        self.resize(800, 650)
+        
+        # Apply global styling
+        if self.app and hasattr(self.app, "style_content"):
+            self.setStyleSheet(self.app.style_content)
+            
+        self.state = self.STATE_IDLE
+        self._chunks = []
+        self._chunks_lock = threading.Lock()
+        self._record_started_at = None
+        self._meeting_dir = None
+        self._chunks_path = None
+        self._final_notes = ""
+        self._final_transcript = ""
+        
+        # Test stubs variables for backwards compatibility
+        self._summary_var = ""
+        self._transcript_var = ""
+        
+        # Signals for thread-safe processing
+        self.proc_signals = MeetingProcessingSignal()
+        self.proc_signals.finished.connect(self._on_processing_finished)
+        
+        # Timer for duration and visualizer ticking
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(50) # 20 FPS updates
+
+
+        self._build_ui()
+        self._populate_audio_devices()
+
+    def _build_ui(self):
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(20, 20, 20, 20)
+        self.main_layout.setSpacing(14)
+
+        # ── Stack/Dynamic UI Containers based on State ──
+        self.container = QStackedWidget(self)
+        
+        # 1. Idle Page: Setup Meeting details
+        self.page_idle = QWidget()
+        self._build_page_idle()
+        self.container.addWidget(self.page_idle)
+        
+        # 2. Recording Page: Live notes & transcripts
+        self.page_recording = QWidget()
+        self._build_page_recording()
+        self.container.addWidget(self.page_recording)
+        
+        # 3. Processing Page: Loading summaries
+        self.page_processing = QWidget()
+        self._build_page_processing()
+        self.container.addWidget(self.page_processing)
+        
+        # 4. Done Page: View final summaries & notes
+        self.page_done = QWidget()
+        self._build_page_done()
+        self.container.addWidget(self.page_done)
+
+        self.main_layout.addWidget(self.container)
+        self.container.setCurrentIndex(0)
+
+    # ── Idle View: Inputs & setup ──
+    def _build_page_idle(self):
+        lay = QVBoxLayout(self.page_idle)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(14)
+        
+        title = QLabel("Record Meeting", self.page_idle)
+        title.setObjectName("titleLabel")
+        lay.addWidget(title)
+        
+        desc = QLabel("Capture any Zoom, Google Meet, or conference call. Transcribe App will record system loopback audio and generate beautiful AI-summarized minutes.", self.page_idle)
+        desc.setObjectName("subtitleLabel")
+        desc.setWordWrap(True)
+        lay.addWidget(desc)
+
+        # Title Card
+        meta_frame = QFrame(self.page_idle)
+        meta_frame.setObjectName("cardFrame")
+        m_lay = QVBoxLayout(meta_frame)
+        m_lay.setContentsMargins(18, 18, 18, 18)
+        m_lay.setSpacing(12)
+        
+        m_lay.addWidget(QLabel("Meeting Title", meta_frame))
+        self.input_title = QLineEdit(meta_frame)
+        self.input_title.setPlaceholderText("Product Sync / Sprint Review")
+        m_lay.addWidget(self.input_title)
+        
+        m_lay.addWidget(QLabel("Attendees (Comma separated)", meta_frame))
+        self.input_attendees = QLineEdit(meta_frame)
+        self.input_attendees.setPlaceholderText("Aram Adamyan, Anna Sargsyan, David")
+        m_lay.addWidget(self.input_attendees)
+        lay.addWidget(meta_frame)
+
+        # Devices Picker Card
+        dev_frame = QFrame(self.page_idle)
+        dev_frame.setObjectName("cardFrame")
+        d_lay = QVBoxLayout(dev_frame)
+        d_lay.setContentsMargins(18, 18, 18, 18)
+        d_lay.setSpacing(12)
+        
+        d_lay.addWidget(QLabel("Select Loopback Audio Input (Captures other callers)", dev_frame))
+        self.combo_device = QComboBox(dev_frame)
+        d_lay.addWidget(self.combo_device)
+        lay.addWidget(dev_frame)
+
+        # Start button row
+        btn_lay = QHBoxLayout()
+        btn_lay.addStretch()
+        
+        btn_start = QPushButton("Start Meeting", self.page_idle)
+        btn_start.setObjectName("primaryButton")
+        btn_start.setMinimumHeight(40)
+        btn_start.clicked.connect(self._start_meeting)
+        btn_lay.addWidget(btn_start)
+        lay.addLayout(btn_lay)
+
+    # ── Recording View: Dual Note Editor ──
+    def _build_page_recording(self):
+        lay = QVBoxLayout(self.page_recording)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
+
+        # Active Rec banner
+        rec_banner = QFrame(self.page_recording)
+        rec_banner.setStyleSheet("background-color: #3b1818; border: 1px solid #ef4444; border-radius: 8px;")
+        rb_lay = QHBoxLayout(rec_banner)
+        rb_lay.setContentsMargins(12, 8, 12, 8)
+        
+        self.lbl_rec_timer = QLabel("REC  ·  00:00  ·  Recording system audio...", rec_banner)
+        self.lbl_rec_timer.setStyleSheet("color: #ef4444; font-weight: bold; font-size: 13px;")
+        rb_lay.addWidget(self.lbl_rec_timer)
+        rb_lay.addStretch()
+        lay.addWidget(rec_banner)
+
+        # Split Pane Workspace
+        splitter = QSplitter(Qt.Horizontal, self.page_recording)
+        splitter.setStyleSheet("QSplitter::handle { background-color: #27272a; width: 2px; }")
+        
+        # Left Pane: Live transcript chunks
+        trans_frame = QFrame(splitter)
+        trans_frame.setObjectName("cardFrame")
+        t_lay = QVBoxLayout(trans_frame)
+        t_lay.addWidget(QLabel("Live Transcription", trans_frame))
+        self.live_trans_log = QTextEdit(trans_frame)
+        self.live_trans_log.setReadOnly(True)
+        self.live_trans_log.setStyleSheet("background-color: #121214;")
+        t_lay.addWidget(self.live_trans_log)
+        splitter.addWidget(trans_frame)
+
+        # Right Pane: User's typed notes
+        notes_frame = QFrame(splitter)
+        notes_frame.setObjectName("cardFrame")
+        n_lay = QVBoxLayout(notes_frame)
+        n_lay.addWidget(QLabel("Your Notes (type bullets during meeting)", notes_frame))
+        self.input_live_notes = QTextEdit(notes_frame)
+        self.input_live_notes.setPlaceholderText("- Decided to use PySide6 for desktop client\n- Aram to finalize setup instructions\n- Sprint ends on Monday")
+        self.input_live_notes.setStyleSheet("background-color: #121214;")
+        n_lay.addWidget(self.input_live_notes)
+        splitter.addWidget(notes_frame)
+        
+        splitter.setSizes([380, 380])
+        lay.addWidget(splitter)
+
+        # Bottom Recording Control row
+        btn_lay = QHBoxLayout()
+        btn_lay.addStretch()
+        
+        btn_stop = QPushButton("Stop & Generate Notes", self.page_recording)
+        btn_stop.setObjectName("primaryButton")
+        btn_stop.setStyleSheet("background-color: #ef4444; border-color: #dc2626;")
+        btn_stop.clicked.connect(self._stop_meeting)
+        btn_lay.addWidget(btn_stop)
+        lay.addLayout(btn_lay)
+
+    # ── Processing View: Loading spinner overlay ──
+    def _build_page_processing(self):
+        lay = QVBoxLayout(self.page_processing)
+        lay.setAlignment(Qt.AlignCenter)
+        lay.setSpacing(20)
+        
+        lbl_proc = QLabel("Generating AI Meeting Notes...", self.page_processing)
+        lbl_proc.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        lbl_proc.setAlignment(Qt.AlignCenter)
+        lay.addWidget(lbl_proc)
+
+        pbar = QProgressBar(self.page_processing)
+        pbar.setRange(0, 0) # Infinite spinner progress bar style
+        pbar.setFixedWidth(300)
+        lay.addWidget(pbar)
+
+        desc = QLabel("Processing transcript chunks and applying context rules through your configured AI action engine.\nThis can take 10-40 seconds depending on meeting length.", self.page_processing)
+        desc.setObjectName("subtitleLabel")
+        desc.setAlignment(Qt.AlignCenter)
+        desc.setWordWrap(True)
+        lay.addWidget(desc)
+
+    # ── Done View: Notes preview & export ──
+    def _build_page_done(self):
+        lay = QVBoxLayout(self.page_done)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+        
+        title_row = QHBoxLayout()
+        self.lbl_done_title = QLabel("Meeting Notes Generated!", self.page_done)
+        self.lbl_done_title.setObjectName("titleLabel")
+        title_row.addWidget(self.lbl_done_title)
+        
+        title_row.addStretch()
+        
+        btn_copy = QPushButton("Copy Markdown", self.page_done)
+        btn_copy.clicked.connect(self._copy_markdown)
+        title_row.addWidget(btn_copy)
+        
+        btn_save = QPushButton("Save to File", self.page_done)
+        btn_save.clicked.connect(self._save_to_file)
+        title_row.addWidget(btn_save)
+        
+        btn_reset = QPushButton("Reset", self.page_done)
+        btn_reset.setObjectName("primaryButton")
+        btn_reset.clicked.connect(self._reset)
+        title_row.addWidget(btn_reset)
+        
+        lay.addLayout(title_row)
+
+        # Split preview between Notes & full transcript
+        splitter = QSplitter(Qt.Horizontal, self.page_done)
+        splitter.setStyleSheet("QSplitter::handle { background-color: #27272a; width: 2px; }")
+
+        # Left: Generated summary & action items
+        summary_frame = QFrame(splitter)
+        summary_frame.setObjectName("cardFrame")
+        s_lay = QVBoxLayout(summary_frame)
+        s_lay.addWidget(QLabel("AI Summary & Action Items", summary_frame))
+        self.txt_summary = QTextEdit(summary_frame)
+        self.txt_summary.setStyleSheet("background-color: #121214;")
+        s_lay.addWidget(self.txt_summary)
+        splitter.addWidget(summary_frame)
+
+        # Right: Clean Full Transcript
+        trans_frame = QFrame(splitter)
+        trans_frame.setObjectName("cardFrame")
+        t_lay = QVBoxLayout(trans_frame)
+        t_lay.addWidget(QLabel("Full Meeting Transcript", trans_frame))
+        self.txt_transcript = QTextEdit(trans_frame)
+        self.txt_transcript.setReadOnly(True)
+        self.txt_transcript.setStyleSheet("background-color: #121214;")
+        t_lay.addWidget(self.txt_transcript)
+        splitter.addWidget(trans_frame)
+
+        splitter.setSizes([460, 300])
+        lay.addWidget(splitter)
+
+    # ── Audio Device Scan ──
+    def _populate_audio_devices(self):
+        self.combo_device.clear()
+        if not self.app or not self.app.recorder:
+            self.combo_device.addItem("Default Input Microphone", "default")
+            return
+            
+        p = self.app.recorder.audio
+        info = p.get_host_api_info_by_index(0)
+        num_devices = info.get('deviceCount', 0)
+        
+        # Scan devices and add standard + WASAPI loopbacks on Windows
+        loopback_idx = None
+        has_default_mic = False
+        
+        for i in range(num_devices):
+            try:
+                dev = p.get_device_info_by_host_api_device_index(0, i)
+                if dev.get('maxInputChannels', 0) > 0:
+                    name = dev.get('name', 'Device')
+                    self.combo_device.addItem(name, str(i))
+                    
+                    # Highlight default recommendation loopback
+                    if "[Loopback]" in name and loopback_idx is None:
+                        loopback_idx = self.combo_device.count() - 1
+            except Exception:
+                pass
+                
+        # Set recommendation
+        if loopback_idx is not None:
+            self.combo_device.setCurrentIndex(loopback_idx)
+        else:
+            self.combo_device.setCurrentIndex(0)
+
+    # ── State Machine Triggers ──
+    def _start_meeting(self):
+        if not self.app or not self.app.recorder:
+            return
+            
+        self.state = self.STATE_RECORDING
+        self._chunks = []
+        self.live_trans_log.clear()
+        self.input_live_notes.clear()
+        
+        self._meeting_title = self.input_title.text().strip() or "Untitled Meeting"
+        self._meeting_attendees = self.input_attendees.text().strip()
+        
+        # Capture configurations
+        device_idx = self.combo_device.currentData()
+        self.app.cfg["input_device_index"] = device_idx
+        self.app.save_config()
+
+        # Build local timestamp folder for auto-save recovery
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self._meeting_dir = storage.path_for("meetings") / timestamp
+        self._meeting_dir.mkdir(parents=True, exist_ok=True)
+        self._chunks_path = self._meeting_dir / "chunks.jsonl"
+
+        # Configure AudioRecorder callbacks safely
+        self.app.recorder.on_chunk_complete = self._on_chunk_transcribed
+        self.app.recorder.on_levels = self._on_audio_levels
+        
+        # Start recording
+        self._record_started_at = time.time()
+        self.app.recorder.start_recording()
+        
+        # Swap view tab
+        self.container.setCurrentIndex(1)
+        telemetry.track("meeting_recording_started", {}, self.app.cfg, APP_VERSION)
+
+    def _on_chunk_transcribed(self, idx, text, lang):
+        if self.state != self.STATE_RECORDING:
+            return
+            
+        # Log to in-memory cache
+        chunk = {
+            "index": idx,
+            "text": text,
+            "language": lang,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        with self._chunks_lock:
+            self._chunks.append(chunk)
+            
+        # Recoverable write to JSONL log
+        try:
+            with open(self._chunks_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+        # Thread-safe log text trigger
+        self.live_trans_log.append(f"[{time.strftime('%H:%M:%S')}]  {text}")
+
+    def _on_audio_levels(self, levels):
+        pass # Optional viz level capture if visual painting needed
+
+    def _tick(self):
+        if self.state != self.STATE_RECORDING or not self._record_started_at:
+            return
+            
+        dur = int(time.time() - self._record_started_at)
+        m, s = divmod(dur, 60)
+        h, m = divmod(m, 60)
+        dur_str = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+        
+        self.lbl_rec_timer.setText(f"REC  ·  {dur_str}  ·  Capturing active conversation chunks...")
+
+    def _stop_meeting(self):
+        if not self.app or self.state != self.STATE_RECORDING:
+            return
+            
+        self.state = self.STATE_PROCESSING
+        self.container.setCurrentIndex(2)
+        
+        # Stop recording
+        self.app.recorder.stop_recording()
+        
+        # Retrieve notes text in-meeting notepad
+        self._user_notes = self.input_live_notes.toPlainText().strip()
+        
+        # Remove recording callbacks
+        self.app.recorder.on_chunk_complete = None
+        self.app.recorder.on_levels = None
+
+        # Start LLM summaries generator thread safely
+        threading.Thread(target=self._process_meeting_notes, daemon=True).start()
+
+    def _process_meeting_notes(self):
+        try:
+            # 1. Wait briefly to drain active audio queue and transcription threads
+            text, detected_lang = self.app.recorder.transcribe()
+            
+            # Combine transcript chunk lists
+            full_chunks_text = []
+            with self._chunks_lock:
+                for c in self._chunks:
+                    full_chunks_text.append(c.get("text", ""))
+            
+            if text and text not in full_chunks_text:
+                full_chunks_text.append(text)
+                
+            self._final_transcript = "\n\n".join(full_chunks_text).strip()
+            
+            if not self._final_transcript:
+                self.proc_signals.finished.emit("", "No transcription recorded. The meeting is empty.")
+                return
+
+            # Add custom note bullet context if present
+            note_context = self._final_transcript
+            if self._user_notes:
+                note_context += f"\n\nAdditional visual meeting notes provided by attendee:\n{self._user_notes}"
+
+            # 2. Run summarizer logic via Action engine processor
+            engine = self.app.cfg.get("action_model", "rule_based")
+            notes = actions.process(
+                note_context, 
+                actions.ACTION_MEETING_NOTES,
+                source_lang=detected_lang, 
+                target_lang="en", 
+                model=engine, 
+                config=self.app.cfg
+            )
+            
+            # 3. Save finalized artifacts to timestamp directory
+            try:
+                with open(self._meeting_dir / "transcript.txt", "w", encoding="utf-8") as f:
+                    f.write(self._final_transcript)
+                with open(self._meeting_dir / "notes.md", "w", encoding="utf-8") as f:
+                    f.write(notes)
+                with open(self._meeting_dir / "meta.json", "w", encoding="utf-8") as f:
+                    json.dump({
+                        "title": self._meeting_title,
+                        "attendees": self._meeting_attendees,
+                        "duration_sec": int(time.time() - self._record_started_at) if self._record_started_at else 0,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                    }, f)
+            except OSError:
+                pass
+                
+            self.proc_signals.finished.emit(notes, "")
+        except Exception as e:
+            self.proc_signals.finished.emit("", str(e))
+
+    def _on_processing_finished(self, notes, error_msg):
+        if error_msg:
+            QMessageBox.critical(self, "AI Summary Error", f"Could not generate meeting notes: {error_msg}")
+            self._reset()
+            return
+            
+        self.state = self.STATE_DONE
+        self._final_notes = notes
+        
+        self.lbl_done_title.setText(self._meeting_title or "Meeting Notes")
+        self.txt_summary.setPlainText(notes)
+        self.txt_transcript.setPlainText(self._final_transcript)
+        
+        self.container.setCurrentIndex(3)
+        telemetry.track("meeting_notes_completed", {}, self.app.cfg, APP_VERSION)
+
+    def _copy_markdown(self):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self._final_notes)
+        QMessageBox.information(self, "Copied", "AI Meeting notes copied to clipboard in Markdown formatting.")
+
+    def _save_to_file(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Meeting Notes",
+            os.path.expanduser(f"~/Documents/{self._meeting_title.replace(' ', '_')}_Notes.md"),
+            "Markdown Files (*.md)"
+        )
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(self._final_notes)
+                QMessageBox.information(self, "Saved", f"Successfully saved meeting notes to {os.path.basename(path)}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save notes: {e}")
+
+    def _reset(self):
+        self.state = self.STATE_IDLE
+        self.input_title.clear()
+        self.input_attendees.clear()
+        self.combo_device.setCurrentIndex(0)
+        self.container.setCurrentIndex(0)
+
+    def _abort(self):
+        if self.app and self.app.recorder:
+            self.app.recorder.stop_recording()
+            self.app.recorder.on_chunk_complete = None
+            self.app.recorder.on_levels = None
+        self._reset()
+
+    def closeEvent(self, event):
+        if self.state == self.STATE_RECORDING:
+            reply = QMessageBox.question(
+                self, "Stop recording?",
+                "A meeting is being recorded. Closing the window will stop the recording and discard it. Stop and discard?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self._abort()
+                event.accept()
+            else:
+                event.ignore()
+        else:
+            event.accept()
+
+    def _build_transcript_with_markers(self, chunks):
+        parts = []
+        for i, chunk in enumerate(chunks):
+            text = chunk.get("text", "").strip()
+            if not text:
+                continue
+            if i > 0 and chunk.get("silence_before", 0) >= 1.4:
+                text = f"[speaker change] {text}"
+            parts.append(text)
+        return " ".join(parts)
+
+    def _build_llm_input(self, transcript):
+        if not self._meeting_title and not self._meeting_attendees and not self._user_notes:
+            return transcript
+        parts = []
+        if self._meeting_title:
+            parts.append(f"Meeting Title: {self._meeting_title}")
+        if self._meeting_attendees:
+            parts.append(f"Attendees: {self._meeting_attendees}")
+        if self._user_notes:
+            parts.append(f"User Notes:\n{self._user_notes}")
+        parts.append(f"Transcript:\n{transcript}")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _strip_markdown(md):
+        lines = []
+        for line in (md or "").splitlines():
+            line = re.sub(r"^#+\s+", "", line)
+            if line.strip().startswith("- [ ]") or line.strip().startswith("- "):
+                line = re.sub(r"^\s*-\s*(\[\s*\])?\s*", "• ", line)
+            line = line.replace("**", "")
+            line = line.replace("`", "")
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _format_share(self, format_type):
+        summary = self._summary_var or ""
+        title = self._meeting_title or "Meeting"
+        
+        if format_type == "markdown":
+            return summary
+            
+        if format_type == "email":
+            clean_body = self._strip_markdown(summary)
+            return (
+                f"Subject: {title} — Notes\n\n"
+                "Hi,\n\n"
+                f"{clean_body}\n\n"
+                "Best,"
+            )
+            
+        if format_type == "slack":
+            slack = re.sub(r"^#+\s+(.*)$", r"*\1*", summary, flags=re.MULTILINE)
+            slack = slack.replace("**", "*")
+            return f"*{title} — Notes*\n\n{slack}"
+            
+        return summary
+
