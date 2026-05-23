@@ -1,0 +1,406 @@
+# Modern Onboarding Walkthrough Wizard in PySide6
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, 
+    QComboBox, QCheckBox, QStackedWidget, QWidget, QLineEdit, QMessageBox, QFrame
+)
+from PySide6.QtGui import QFont, QColor
+import local_llm
+
+class Onboarding(QDialog):
+    def __init__(self, main_app=None):
+        super().__init__()
+        self.app = main_app
+        
+        self.setWindowTitle("Welcome to Transcribe")
+        self.setFixedSize(520, 680)
+        
+        # Apply style sheet
+        if self.app and hasattr(self.app, "style_content"):
+            self.setStyleSheet(self.app.style_content)
+            
+        self.current_page = 0
+        self.capturing = False
+        
+        # Onboarding State Config
+        self.hotkey_val = self.app.cfg.get("hotkey", "alt+r") if self.app else "alt+r"
+        self.lang_val = self.app.cfg.get("language", "auto") if self.app else "auto"
+        self.backend_val = self.app.cfg.get("backend", "local") if self.app else "local"
+        self.model_val = self.app.cfg.get("whisper_model", "base") if self.app else "base"
+        self.google_key_val = self.app.cfg.get("google_api_key", "") if self.app else ""
+        self.analytics_val = bool(self.app.cfg.get("analytics_enabled", True)) if self.app else True
+        
+        self._build_ui()
+
+    def _build_ui(self):
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(24, 24, 24, 24)
+        self.main_layout.setSpacing(16)
+
+        # ── Title & Progress Indicator ──
+        self.step_label = QLabel("STEP 1 OF 3", self)
+        self.step_label.setObjectName("subtitleLabel")
+        self.step_label.setStyleSheet("color: #3b82f6; font-weight: bold; font-size: 11px;")
+        self.main_layout.addWidget(self.step_label)
+
+        # ── Stacked pages ──
+        self.stack = QStackedWidget(self)
+        self._create_pages()
+        self.main_layout.addWidget(self.stack)
+
+        # ── Bottom Action Bar ──
+        action_layout = QHBoxLayout()
+        
+        self.btn_back = QPushButton("Back", self)
+        self.btn_back.clicked.connect(self._back)
+        self.btn_back.setEnabled(False) # Step 1 starts disabled
+        
+        self.btn_next = QPushButton("Next", self)
+        self.btn_next.setObjectName("primaryButton")
+        self.btn_next.clicked.connect(self._next)
+        
+        action_layout.addWidget(self.btn_back)
+        action_layout.addStretch()
+        action_layout.addWidget(self.btn_next)
+        
+        self.main_layout.addLayout(action_layout)
+
+    def _create_pages(self):
+        # Page 0: Welcome & Hotkey setup
+        self.page_welcome = QWidget()
+        layout_wel = QVBoxLayout(self.page_welcome)
+        layout_wel.setContentsMargins(0, 0, 0, 0)
+        layout_wel.setSpacing(16)
+        
+        welcome_title = QLabel("Welcome to Transcribe", self.page_welcome)
+        welcome_title.setObjectName("titleLabel")
+        welcome_title.setAlignment(Qt.AlignCenter)
+        layout_wel.addWidget(welcome_title)
+        
+        welcome_desc = QLabel(
+            "Transcribe is an always-on assistant that lives in your system tray.\n"
+            "Press your hotkey, speak naturally, and your words appear instantly\n"
+            "at your active typing cursor.",
+            self.page_welcome
+        )
+        welcome_desc.setAlignment(Qt.AlignCenter)
+        welcome_desc.setWordWrap(True)
+        welcome_desc.setObjectName("subtitleLabel")
+        layout_wel.addWidget(welcome_desc)
+
+        # Card container for Hotkey configuration
+        hotkey_card = QFrame(self.page_welcome)
+        hotkey_card.setObjectName("cardFrame")
+        layout_card = QVBoxLayout(hotkey_card)
+        layout_card.setContentsMargins(20, 20, 20, 20)
+        layout_card.setSpacing(12)
+        
+        card_title = QLabel("1. Setup Dictation Hotkey", hotkey_card)
+        card_title.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        layout_card.addWidget(card_title)
+        
+        card_desc = QLabel(
+            "Click the button below and press any key combination (e.g., Alt+R) "
+            "to set your dictation trigger.",
+            hotkey_card
+        )
+        card_desc.setObjectName("subtitleLabel")
+        card_desc.setWordWrap(True)
+        layout_card.addWidget(card_desc)
+        
+        self.btn_hotkey = QPushButton(self.hotkey_val.upper(), hotkey_card)
+        self.btn_hotkey.clicked.connect(self._toggle_capture)
+        self.btn_hotkey.setStyleSheet("font-size: 15px; font-weight: bold; min-height: 40px; border-color: #3b82f6;")
+        layout_card.addWidget(self.btn_hotkey)
+        
+        layout_wel.addWidget(hotkey_card)
+        layout_wel.addStretch()
+        self.stack.addWidget(self.page_welcome)
+
+        # Page 1: Language Selection
+        self.page_lang = QWidget()
+        layout_lang = QVBoxLayout(self.page_lang)
+        layout_lang.setContentsMargins(0, 0, 0, 0)
+        layout_lang.setSpacing(16)
+        
+        lang_title = QLabel("Choose Language", self.page_lang)
+        lang_title.setObjectName("titleLabel")
+        lang_title.setAlignment(Qt.AlignCenter)
+        layout_lang.addWidget(lang_title)
+        
+        lang_desc = QLabel(
+            "Select your spoken language. Auto-detect will analyze the first few seconds "
+            "of speech, which is perfect for multilingual dictation.",
+            self.page_lang
+        )
+        lang_desc.setAlignment(Qt.AlignCenter)
+        lang_desc.setWordWrap(True)
+        lang_desc.setObjectName("subtitleLabel")
+        layout_lang.addWidget(lang_desc)
+        
+        lang_card = QFrame(self.page_lang)
+        lang_card.setObjectName("cardFrame")
+        layout_lcard = QVBoxLayout(lang_card)
+        layout_lcard.setContentsMargins(20, 20, 20, 20)
+        layout_lcard.setSpacing(12)
+        
+        lcard_label = QLabel("2. Select Your Primary Language", lang_card)
+        lcard_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        layout_lcard.addWidget(lcard_label)
+        
+        self.combo_lang = QComboBox(lang_card)
+        langs = [
+            ("auto", "Auto-detect"),
+            ("multi", "Multilingual"),
+            ("hy", "Armenian"),
+            ("en", "English"),
+            ("ru", "Russian"),
+            ("fr", "French"),
+            ("de", "German"),
+            ("es", "Spanish"),
+            ("ar", "Arabic")
+        ]
+        for val, label in langs:
+            self.combo_lang.addItem(label, val)
+        # Select matching item
+        idx = self.combo_lang.findData(self.lang_val)
+        if idx >= 0:
+            self.combo_lang.setCurrentIndex(idx)
+        layout_lcard.addWidget(self.combo_lang)
+        
+        layout_lang.addWidget(lang_card)
+        layout_lang.addStretch()
+        self.stack.addWidget(self.page_lang)
+
+        # Page 2: Engine Backend & AI Settings
+        self.page_engine = QWidget()
+        layout_eng = QVBoxLayout(self.page_engine)
+        layout_eng.setContentsMargins(0, 0, 0, 0)
+        layout_eng.setSpacing(16)
+        
+        eng_title = QLabel("Choose Dictation Backend", self.page_engine)
+        eng_title.setObjectName("titleLabel")
+        eng_title.setAlignment(Qt.AlignCenter)
+        layout_eng.addWidget(eng_title)
+        
+        # Local Backend Option Card
+        self.local_card = QFrame(self.page_engine)
+        self.local_card.setObjectName("cardFrame")
+        self.local_card.setFrameShape(QFrame.StyledPanel)
+        self.local_card.setStyleSheet("QFrame#cardFrame { border-color: #3b82f6; }") # default selection highlight
+        layout_l = QVBoxLayout(self.local_card)
+        layout_l.setContentsMargins(16, 16, 16, 16)
+        layout_l.setSpacing(8)
+        
+        self.btn_sel_local = QPushButton("Local Offline AI (Whisper)", self.local_card)
+        self.btn_sel_local.setObjectName("primaryButton")
+        self.btn_sel_local.clicked.connect(lambda: self._set_backend("local"))
+        layout_l.addWidget(self.btn_sel_local)
+        
+        local_desc = QLabel(
+            "Transcribe offline entirely on this machine. "
+            "Ensures 100% privacy with zero network delays.",
+            self.local_card
+        )
+        local_desc.setObjectName("subtitleLabel")
+        local_desc.setWordWrap(True)
+        layout_l.addWidget(local_desc)
+        
+        layout_eng.addWidget(self.local_card)
+        
+        # Cloud Backend Option Card
+        self.cloud_card = QFrame(self.page_engine)
+        self.cloud_card.setObjectName("cardFrame")
+        layout_c = QVBoxLayout(self.cloud_card)
+        layout_c.setContentsMargins(16, 16, 16, 16)
+        layout_c.setSpacing(8)
+        
+        self.btn_sel_cloud = QPushButton("Google Cloud Engine", self.cloud_card)
+        self.btn_sel_cloud.clicked.connect(lambda: self._set_backend("google"))
+        layout_c.addWidget(self.btn_sel_cloud)
+        
+        cloud_desc = QLabel(
+            "Ideal for low-end laptops. Leverages Google Cloud Speech-to-Text "
+            "for superior accuracy (specifically for Armenian). Requires a free API Key.",
+            self.cloud_card
+        )
+        cloud_desc.setObjectName("subtitleLabel")
+        cloud_desc.setWordWrap(True)
+        layout_c.addWidget(cloud_desc)
+        
+        layout_eng.addWidget(self.cloud_card)
+        
+        # Google API Input Box (Hidden initially)
+        self.google_input_frame = QFrame(self.page_engine)
+        self.google_input_frame.setVisible(False)
+        layout_gi = QVBoxLayout(self.google_input_frame)
+        layout_gi.setContentsMargins(0, 0, 0, 0)
+        layout_gi.setSpacing(6)
+        
+        layout_gi.addWidget(QLabel("Paste Google Cloud API Key:", self.google_input_frame))
+        self.google_key_input = QLineEdit(self.google_input_frame)
+        self.google_key_input.setPlaceholderText("AIzaSy...")
+        self.google_key_input.setText(self.google_key_val)
+        layout_gi.addWidget(self.google_key_input)
+        layout_eng.addWidget(self.google_input_frame)
+
+        # Telemetry Consent
+        self.chk_telemetry = QCheckBox("Share anonymous usage metrics to improve Armenian AI models", self.page_engine)
+        self.chk_telemetry.setChecked(self.analytics_val)
+        layout_eng.addWidget(self.chk_telemetry)
+
+        layout_eng.addStretch()
+        self.stack.addWidget(self.page_engine)
+
+    def _toggle_capture(self):
+        if self.capturing:
+            self.capturing = False
+            self.btn_hotkey.setText(self.hotkey_val.upper())
+            self.btn_hotkey.setStyleSheet("font-size: 15px; font-weight: bold; min-height: 40px; border-color: #3b82f6;")
+        else:
+            self.capturing = True
+            self.btn_hotkey.setText("PRESS ANY HOTKEY COMBINATION...")
+            self.btn_hotkey.setStyleSheet("font-size: 15px; font-weight: bold; min-height: 40px; border-color: #ef4444; color: #ef4444;")
+            self.setFocus() # Pull focus away from button so keyPressEvent captures correctly
+
+    def keyPressEvent(self, event):
+        if not self.capturing:
+            super().keyPressEvent(event)
+            return
+
+        key = event.key()
+        
+        # Disallow simple single keys unless they are modifiers + something
+        if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
+            return
+            
+        mods = []
+        qt_mods = event.modifiers()
+        if qt_mods & Qt.ControlModifier:
+            mods.append("ctrl")
+        if qt_mods & Qt.AltModifier:
+            mods.append("alt")
+        if qt_mods & Qt.ShiftModifier:
+            mods.append("shift")
+        if qt_mods & Qt.MetaModifier:
+            mods.append("win")
+
+        # Map special key codes
+        KEY_MAP = {
+            Qt.Key_Space: "space",
+            Qt.Key_Tab: "tab",
+            Qt.Key_Enter: "enter",
+            Qt.Key_Return: "enter",
+            Qt.Key_Escape: "esc",
+            Qt.Key_Backspace: "backspace",
+            Qt.Key_Delete: "delete",
+            Qt.Key_Insert: "insert",
+            Qt.Key_Home: "home",
+            Qt.Key_End: "end",
+            Qt.Key_PageUp: "page up",
+            Qt.Key_PageDown: "page down",
+            Qt.Key_Up: "up",
+            Qt.Key_Down: "down",
+            Qt.Key_Left: "left",
+            Qt.Key_Right: "right",
+            Qt.Key_F1: "f1", Qt.Key_F2: "f2", Qt.Key_F3: "f3", Qt.Key_F4: "f4",
+            Qt.Key_F5: "f5", Qt.Key_F6: "f6", Qt.Key_F7: "f7", Qt.Key_F8: "f8",
+            Qt.Key_F9: "f9", Qt.Key_F10: "f10", Qt.Key_F11: "f11", Qt.Key_F12: "f12",
+        }
+        
+        key_str = ""
+        if key in KEY_MAP:
+            key_str = KEY_MAP[key]
+        elif 48 <= key <= 90: # A-Z and 0-9
+            key_str = chr(key).lower()
+        else:
+            return # ignore weird keys
+
+        if not mods:
+            # Require at least one modifier key
+            QMessageBox.warning(self, "Invalid Hotkey", "Dictation hotkeys require at least one modifier key (e.g. Alt or Ctrl).")
+            return
+            
+        self.hotkey_val = "+".join(mods + [key_str])
+        self._toggle_capture()
+
+    def _set_backend(self, backend):
+        self.backend_val = backend
+        if backend == "local":
+            self.local_card.setStyleSheet("QFrame#cardFrame { border-color: #3b82f6; }")
+            self.cloud_card.setStyleSheet("QFrame#cardFrame { border-color: #27272a; }")
+            self.google_input_frame.setVisible(False)
+            self.btn_sel_local.setObjectName("primaryButton")
+            self.btn_sel_cloud.setObjectName("")
+        else:
+            self.local_card.setStyleSheet("QFrame#cardFrame { border-color: #27272a; }")
+            self.cloud_card.setStyleSheet("QFrame#cardFrame { border-color: #3b82f6; }")
+            self.google_input_frame.setVisible(True)
+            self.btn_sel_local.setObjectName("")
+            self.btn_sel_cloud.setObjectName("primaryButton")
+        
+        # Force redraw QSS styling
+        self.btn_sel_local.style().unpolish(self.btn_sel_local)
+        self.btn_sel_local.style().polish(self.btn_sel_local)
+        self.btn_sel_cloud.style().unpolish(self.btn_sel_cloud)
+        self.btn_sel_cloud.style().polish(self.btn_sel_cloud)
+        self.local_card.style().unpolish(self.local_card)
+        self.local_card.style().polish(self.local_card)
+        self.cloud_card.style().unpolish(self.cloud_card)
+        self.cloud_card.style().polish(self.cloud_card)
+
+    def _back(self):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.stack.setCurrentIndex(self.current_page)
+            self.step_label.setText(f"STEP {self.current_page + 1} OF 3")
+            self.btn_next.setText("Next")
+            
+            if self.current_page == 0:
+                self.btn_back.setEnabled(False)
+
+    def _next(self):
+        if self.current_page < 2:
+            self.current_page += 1
+            self.stack.setCurrentIndex(self.current_page)
+            self.step_label.setText(f"STEP {self.current_page + 1} OF 3")
+            self.btn_back.setEnabled(True)
+            
+            if self.current_page == 2:
+                self.btn_next.setText("Get Started")
+        else:
+            self._save_onboarding()
+
+    def _save_onboarding(self):
+        # Capture configurations
+        self.lang_val = self.combo_lang.currentData()
+        self.google_key_val = self.google_key_input.text().strip()
+        self.analytics_val = self.chk_telemetry.isChecked()
+        
+        if self.backend_val == "google" and not self.google_key_val:
+            reply = QMessageBox.question(
+                self, "Missing API Key",
+                "You selected Google Cloud but didn't provide an API key.\n\n"
+                "Do you want to go back and add it, or default to offline Local AI?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            )
+            if reply == QMessageBox.Yes:
+                return
+            else:
+                self._set_backend("local")
+                return
+
+        # Save to main app configuration
+        if self.app:
+            self.app.cfg["hotkey"] = self.hotkey_val
+            self.app.cfg["language"] = self.lang_val
+            self.app.cfg["backend"] = self.backend_val
+            self.app.cfg["google_api_key"] = self.google_key_val
+            self.app.cfg["analytics_enabled"] = self.analytics_val
+            self.app.cfg["onboarding_done"] = True
+            
+            self.app.save_config()
+            self.app.apply_tray_bindings()
+            
+        self.accept()

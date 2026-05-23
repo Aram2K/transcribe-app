@@ -14,3 +14,5 @@ Pillow
 psutil
 requests
 llama-cpp-python
+PySide6
+
