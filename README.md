@@ -87,7 +87,47 @@ It was built especially for **Armenian speakers** who need accurate, native-scri
     Press Esc    →  cancel without pasting
 ```
 
-Right-click the **tray icon** for History, Settings, or Quit.
+Right-click the **tray icon** for History, Settings, Record Meeting, or Quit.
+
+---
+
+## Record meetings 🎙
+
+Capture a Google Meet, Zoom, or any conference call and automatically get back a transcript, a short summary, and a checkbox list of action items.
+
+```
+1.  Tray icon → Record Meeting…
+2.  Pick your audio source, click Start meeting
+3.  Talk normally; the live transcript scrolls as chunks are processed
+4.  Click Stop & generate notes → wait 10-60s while the AI engine runs
+5.  Read / Copy / Open folder — everything is saved to disk
+```
+
+Each meeting is stored in `%APPDATA%\Transcribe\meetings\<timestamp>\` with:
+- `chunks.jsonl` — every transcribed chunk as it arrived (crash-recoverable)
+- `transcript.txt` — full transcript
+- `notes.md` — Summary + Key decisions + Action items + Open questions
+- `meta.json` — duration, chunk count, language
+
+### Capturing the *other* participants' audio
+
+By default the meeting recorder captures your microphone. To also capture what the other people in the meeting are saying, you need to pick a **system loopback input**:
+
+- **Windows:** the app bundles `pyaudiowpatch`, so any **`[Loopback]` entry** in the device picker captures system audio directly. No setup needed.
+- **macOS:** install [BlackHole](https://existential.audio/blackhole/) (free), route Google Meet / Zoom output through it, then select the BlackHole input in the meeting picker.
+- **Linux:** use PulseAudio's monitor source (`pactl load-module module-loopback`) and select the monitor device.
+
+### Notes quality
+
+The summary and action items use whatever action engine you've configured in **Settings → Actions**:
+
+| Engine | Notes quality | Cost |
+|---|---|---|
+| **Rule-based** (default) | Basic extractive summary + keyword-based action items | Free |
+| **Local Qwen** (1.5B/3B/7B) | Good summarisation, no network required | Free (one-time download) |
+| **OpenAI / Gemini / Anthropic** | Best quality | Pennies per meeting |
+
+For 1-hour+ meetings, a cloud engine is recommended because local Qwen has a smaller context window.
 
 ---
 

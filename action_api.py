@@ -31,6 +31,20 @@ class ActionAPIError(RuntimeError):
     pass
 
 
+def _max_tokens_for(mode):
+    """Approximate completion budget per action mode.
+
+    Meeting notes need the most room because the prompt expects four
+    sections of structured output. Standalone summaries are short."""
+    if mode == "meeting_notes":
+        return 1200
+    if mode == "summarize":
+        return 400
+    if mode == "write_email":
+        return 360
+    return 240
+
+
 def normalize_provider(provider):
     return provider if provider in PROVIDERS else PROVIDER_OPENAI
 
@@ -47,6 +61,22 @@ def build_messages(text, mode, source_lang="auto", target_lang="en"):
         instruction = "Extract a clear Markdown todo checklist. Output only '- [ ]' checklist items."
     elif mode == "translate":
         instruction = f"Translate from {source_lang or 'auto'} to {target_lang}. Output only the translation."
+    elif mode == "summarize":
+        instruction = (
+            "Summarize this text in 3-5 sentences capturing the main points. "
+            "Output only the summary — no preamble, no headings."
+        )
+    elif mode == "meeting_notes":
+        instruction = (
+            "You are summarising a meeting transcript. Produce well-formed Markdown "
+            "with EXACTLY these four sections, in this order, even if a section is empty:\n\n"
+            "## Summary\nA 2-4 sentence overview of what was discussed.\n\n"
+            "## Key decisions\nBullet list of concrete decisions made. Skip if none.\n\n"
+            "## Action items\nMarkdown checkbox list `- [ ] task` — include owner names "
+            "and due dates if mentioned. Skip if none.\n\n"
+            "## Open questions\nBullet list of unresolved questions raised. Skip if none.\n\n"
+            "Be specific. Do not invent decisions or owners that aren't in the transcript."
+        )
     else:
         instruction = "Rewrite this text clearly while preserving meaning. Output only the result."
     return [
@@ -78,7 +108,7 @@ def _run_openai_compatible(text, mode, config, source_lang, target_lang, key):
         "model": model,
         "messages": build_messages(text, mode, source_lang, target_lang),
         "temperature": 0.1,
-        "max_tokens": 360 if mode == "write_email" else 240,
+        "max_tokens": _max_tokens_for(mode),
     }
     resp = requests.post(
         f"{base_url}/chat/completions",
@@ -126,7 +156,7 @@ def _run_anthropic(text, mode, config, source_lang, target_lang, key):
             "system": system,
             "messages": [{"role": "user", "content": user}],
             "temperature": 0.1,
-            "max_tokens": 360 if mode == "write_email" else 240,
+            "max_tokens": _max_tokens_for(mode),
         },
         timeout=45,
     )

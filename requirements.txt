@@ -1,5 +1,10 @@
 faster-whisper
-pyaudio
+pyaudio; sys_platform != "win32"
+# pyaudiowpatch is a Windows-only PyAudio fork that adds WASAPI loopback
+# (so the meeting recorder can capture system audio in addition to the mic).
+# It includes PyAudio as a dependency so the regular `import pyaudio` keeps
+# working everywhere — main.py prefers `pyaudiowpatch` when available.
+pyaudiowpatch; sys_platform == "win32"
 numpy
 keyboard
 pyperclip

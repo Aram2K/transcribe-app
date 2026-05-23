@@ -154,6 +154,13 @@ def download_model(model_id=QWEN_TINY_ID, on_progress=None):
     return dest
 
 
+_MAX_TOKENS_BY_MODE = {
+    "meeting_notes": 1200,
+    "summarize": 400,
+    "write_email": 360,
+}
+
+
 def run_action(text, mode, source_lang="auto", target_lang="en", model_id=QWEN_TINY_ID):
     text = (text or "").strip()
     if not text:
@@ -164,7 +171,7 @@ def run_action(text, mode, source_lang="auto", target_lang="en", model_id=QWEN_T
         messages=messages,
         temperature=0.1,
         top_p=0.9,
-        max_tokens=360 if mode == "write_email" else 240,
+        max_tokens=_MAX_TOKENS_BY_MODE.get(mode, 240),
         repeat_penalty=1.08,
     )
     return _extract_text(result)
@@ -230,6 +237,20 @@ def _messages_for(mode, text, source_lang, target_lang):
         instruction = (
             f"Translate the user's text from {source_lang or 'auto'} to {target_lang}. "
             "Preserve meaning and output only the translation."
+        )
+    elif mode == "summarize":
+        instruction = (
+            "Summarize the user's text in 3-5 sentences. "
+            "Capture the main points only. Output the summary directly — no preamble."
+        )
+    elif mode == "meeting_notes":
+        instruction = (
+            "You are summarising a meeting transcript. Produce well-formed Markdown "
+            "with EXACTLY four sections in this order:\n"
+            "## Summary\n## Key decisions\n## Action items\n## Open questions\n"
+            "Summary: 2-4 sentences. Key decisions: bullet list. Action items: "
+            "Markdown checkboxes `- [ ] task` with owners/dates if mentioned. "
+            "Open questions: bullet list. Be specific. Do not invent facts."
         )
     else:
         instruction = "Rewrite the user's text clearly while preserving meaning. Output only the result."

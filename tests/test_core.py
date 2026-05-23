@@ -291,6 +291,25 @@ class TestStorage(unittest.TestCase):
             self.assertTrue(os.path.exists(legacy))
             self.assertEqual(storage.read_json(target, {}), {"ok": True})
 
+    def test_append_jsonl_and_read_jsonl_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "chunks.jsonl")
+            for i, text in enumerate(["one", "two", "three"]):
+                self.assertTrue(storage.append_jsonl(path, {"idx": i, "text": text}))
+            records = storage.read_jsonl(path)
+            self.assertEqual([r["text"] for r in records], ["one", "two", "three"])
+            self.assertEqual([r["idx"] for r in records], [0, 1, 2])
+
+    def test_read_jsonl_skips_malformed_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "chunks.jsonl")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"idx": 0, "text": "good"}\n')
+                fh.write('not-json\n')
+                fh.write('{"idx": 1, "text": "also good"}\n')
+            records = storage.read_jsonl(path)
+            self.assertEqual([r["text"] for r in records], ["good", "also good"])
+
 
 class TestUpdaterHelpers(unittest.TestCase):
     def test_trusted_update_url_only_allows_github_https(self):
