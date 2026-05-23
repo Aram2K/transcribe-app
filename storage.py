@@ -12,6 +12,7 @@ APP_DIR_NAME = "Transcribe"
 SECRET_SERVICE = "TranscribeApp"
 GOOGLE_API_KEY_SECRET = "google_api_key"
 ACTION_API_KEY_SECRET = "action_api_key"
+MEETINGS_DIR_NAME = "meetings"
 
 
 def app_data_dir():
@@ -36,6 +37,68 @@ def app_data_dir():
 
 def path_for(filename):
     return app_data_dir() / filename
+
+
+def meetings_dir():
+    """Root directory for per-meeting subfolders (one per recording)."""
+    d = app_data_dir() / MEETINGS_DIR_NAME
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def new_meeting_dir(timestamp_iso):
+    """Return a fresh per-meeting directory keyed by an ISO-8601 UTC stamp.
+
+    The colons that ISO timestamps contain aren't legal in Windows folder
+    names, so we replace them with dashes."""
+    safe_stamp = timestamp_iso.replace(":", "-")
+    d = meetings_dir() / safe_stamp
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def append_jsonl(path, record):
+    """Atomically append a JSON record as one line to `path`. Used by the
+    meeting recorder to durably persist each chunk as it completes, so a
+    crash never loses already-transcribed segments."""
+    p = Path(path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False)
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def read_jsonl(path):
+    """Read a JSONL file produced by `append_jsonl` into a list. Skips
+    malformed lines rather than failing — chunk recovery should be robust
+    even if the last write was partial."""
+    out = []
+    p = Path(path)
+    if not p.exists():
+        return out
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except (ValueError, TypeError):
+                    continue
+    except OSError:
+        pass
+    return out
 
 
 def migrate_legacy_file(legacy_path, target_path):

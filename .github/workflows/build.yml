@@ -33,7 +33,8 @@ jobs:
                   for k,v in attrs.items(): setattr(m,k,v)
               sys.modules[name] = m
               return m
-          _stub("pyaudio",{"PyAudio":MagicMock,"paInt16":8})
+          _stub("pyaudio",{"PyAudio":MagicMock,"paInt16":8,"paFloat32":1})
+          _stub("pyaudiowpatch",{"PyAudio":MagicMock,"paInt16":8,"paFloat32":1})
           _stub("pystray",{"Icon":MagicMock,"Menu":MagicMock,"MenuItem":MagicMock})
           _pkb=_stub("pynput.keyboard",{"Controller":MagicMock,"Key":MagicMock})
           _pm=_stub("pynput.mouse",{"Listener":MagicMock,"Button":MagicMock})
@@ -117,11 +118,13 @@ jobs:
             --hidden-import huggingface_hub `
             --hidden-import llama_cpp `
             --hidden-import tokenizers `
+            --hidden-import pyaudiowpatch `
             --collect-all faster_whisper `
             --collect-all ctranslate2 `
             --collect-all llama_cpp `
             --collect-all pystray `
             --collect-all pynput `
+            --collect-all pyaudiowpatch `
             --exclude-module torch `
             --exclude-module openai `
             --exclude-module numba `

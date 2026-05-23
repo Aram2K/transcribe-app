@@ -8,6 +8,8 @@ ACTION_TRANSCRIBE_ONLY = "transcribe_only"
 ACTION_WRITE_EMAIL = "write_email"
 ACTION_MAKE_TODO = "make_todo_list"
 ACTION_TRANSLATE = "translate"
+ACTION_SUMMARIZE = "summarize"
+ACTION_MEETING_NOTES = "meeting_notes"
 
 RULE_BASED_ID = "rule_based"
 API_OPENAI_ID = "api_openai_compatible"
@@ -117,8 +119,18 @@ class ActionError(RuntimeError):
     pass
 
 
+_ACTION_MODE_WHITELIST = {
+    ACTION_TRANSCRIBE_ONLY, ACTION_WRITE_EMAIL, ACTION_MAKE_TODO,
+    ACTION_TRANSLATE, ACTION_SUMMARIZE, ACTION_MEETING_NOTES,
+}
+
+
 def normalize_action_mode(mode):
-    return mode if mode in ACTION_MODES else ACTION_TRANSCRIBE_ONLY
+    # Meeting / summarize are valid action modes even though they don't
+    # appear in ACTION_MODES (which only lists the modes shown in Settings).
+    if mode in _ACTION_MODE_WHITELIST:
+        return mode
+    return ACTION_TRANSCRIBE_ONLY
 
 
 def normalize_action_model(model):
@@ -159,6 +171,10 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
         return _write_email(text)
     if mode == ACTION_MAKE_TODO:
         return _make_todo_list(text)
+    if mode == ACTION_SUMMARIZE:
+        return _summarize_extractive(text)
+    if mode == ACTION_MEETING_NOTES:
+        return _meeting_notes_extractive(text)
     if mode == ACTION_TRANSLATE:
         try:
             return _translate_local(text, source_lang, target_lang)
@@ -259,3 +275,88 @@ def _translate_local(text, source_lang, target_lang):
             f"Missing local translation pack for {from_lang.code} -> {target_code}."
         )
     return translation.translate(text).strip()
+
+
+# ── Extractive fallbacks (no LLM) ────────────────────────────────────────────
+#
+# These are *intentionally* simple. They guarantee a useful-ish meeting
+# summary even when the user has not configured an LLM yet. The UI shows
+# a "Configure an LLM in Settings for AI-quality notes" hint alongside.
+
+_ACTION_HINT_RE = re.compile(
+    r"\b("
+    r"todo|to-?do|action item|let'?s|"
+    r"(?:i|we|you|they|he|she|[A-Z][a-z]+)\s+(?:should|will|need to|needs to|must|has to|have to)|"
+    r"i'?ll|we'?ll|you'?ll|need to|please|don'?t forget|remember to|"
+    r"can you|could you|will do|"
+    r"by (?:tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|eod|end of day)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _split_sentences(text):
+    sentences = re.split(r"(?<=[.!?])\s+", (text or "").strip())
+    return [s.strip() for s in sentences if s.strip()]
+
+
+def _summarize_extractive(text, max_sentences=5):
+    sentences = _split_sentences(text)
+    if not sentences:
+        return ""
+    if len(sentences) <= max_sentences:
+        return " ".join(sentences)
+    # Score by length (longer sentences carry more information) and
+    # take the first sentence and last sentence so the summary keeps
+    # context + conclusion. Then fill in middle by score.
+    scored = sorted(
+        enumerate(sentences[1:-1], start=1),
+        key=lambda pair: len(pair[1]),
+        reverse=True,
+    )
+    keep_idx = {0, len(sentences) - 1}
+    for idx, _ in scored:
+        if len(keep_idx) >= max_sentences:
+            break
+        keep_idx.add(idx)
+    return " ".join(sentences[i] for i in sorted(keep_idx))
+
+
+def _extract_action_items_heuristic(text):
+    items = []
+    seen = set()
+    for sentence in _split_sentences(text):
+        if not _ACTION_HINT_RE.search(sentence):
+            continue
+        cleaned = re.sub(
+            r"^\s*(so |then |and |but |okay,? |well,? )",
+            "",
+            sentence,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned = cleaned.rstrip(".!?")
+        if cleaned and cleaned.lower() not in seen:
+            seen.add(cleaned.lower())
+            items.append(cleaned)
+    return items
+
+
+def _meeting_notes_extractive(text):
+    """Best-effort notes when no LLM is available.
+
+    Output mirrors the structure of the LLM prompt so downstream code can
+    treat both kinds of output the same way."""
+    summary = _summarize_extractive(text)
+    action_items = _extract_action_items_heuristic(text)
+    parts = []
+    parts.append("## Summary")
+    parts.append(summary or "(no transcript content)")
+    parts.append("")
+    parts.append("## Action items")
+    if action_items:
+        for item in action_items[:12]:
+            parts.append(f"- [ ] {_clean_sentence(item)}")
+    else:
+        parts.append("_No obvious action items detected. Consider configuring a "
+                     "cloud or local LLM in Settings → Actions for richer notes._")
+    return "\n".join(parts)
