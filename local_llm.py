@@ -244,13 +244,17 @@ def _messages_for(mode, text, source_lang, target_lang):
             "Capture the main points only. Output the summary directly — no preamble."
         )
     elif mode == "meeting_notes":
+        # Tighter version of the cloud prompt — smaller local models follow
+        # short, direct instructions better than long bullet-point checklists.
         instruction = (
-            "You are summarising a meeting transcript. Produce well-formed Markdown "
-            "with EXACTLY four sections in this order:\n"
-            "## Summary\n## Key decisions\n## Action items\n## Open questions\n"
-            "Summary: 2-4 sentences. Key decisions: bullet list. Action items: "
-            "Markdown checkboxes `- [ ] task` with owners/dates if mentioned. "
-            "Open questions: bullet list. Be specific. Do not invent facts."
+            "Summarise this meeting transcript into Markdown with EXACTLY these sections:\n"
+            "## Summary  (2-4 sentences, third person, no 'I will')\n"
+            "## Key decisions  (bullets; skip if none)\n"
+            "## Action items  (- [ ] task (Owner: name) — derive owner from "
+            "'I'll'/'name should'/etc.)\n"
+            "## Open questions  (bullets; skip if none)\n\n"
+            "Preserve names exactly (incl. Armenian/Russian). Don't invent facts. "
+            "If `[speaker change]` markers appear, use them to attribute who said what."
         )
     else:
         instruction = "Rewrite the user's text clearly while preserving meaning. Output only the result."

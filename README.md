@@ -97,11 +97,22 @@ Capture a Google Meet, Zoom, or any conference call and automatically get back a
 
 ```
 1.  Tray icon → Record Meeting…
-2.  Pick your audio source, click Start meeting
-3.  Talk normally; the live transcript scrolls as chunks are processed
-4.  Click Stop & generate notes → wait 10-60s while the AI engine runs
-5.  Read / Copy / Open folder — everything is saved to disk
+2.  (Optional) Add the meeting title + attendee names — these anchor
+    action-item ownership in the final notes
+3.  Pick your audio source, click Start meeting
+4.  A red REC banner with a pulsing dot, live timer, and audio-level
+    meter makes it obvious the recording is on. The window pins itself
+    on top and the tray icon turns red — you won't miss it.
+5.  Type your own bullet points in the right-hand "Your notes" pane
+    while you listen. They'll be merged into the AI summary.
+6.  Click Stop & generate notes → wait 10-60s while the AI engine runs
+7.  Read / Copy as Markdown / Copy as email / Copy as Slack / Save to
+    file — everything is also stored on disk
 ```
+
+The AI notes follow a research-backed structure (Microsoft Research, 2023): `## Summary` in third person, `## Key decisions`, `## Action items` as `- [ ] task (Owner: name)` checkboxes, `## Open questions`. When you provide an attendee list, owner attribution kicks in: phrases like *"I'll draft the spec"* and *"Aram should review it"* get attributed to the right person.
+
+Long silence gaps (>1.4s) are tagged as `[speaker change]` in the transcript so the LLM can attribute who said what — a lightweight diarization signal that needs no extra ML dependency.
 
 Each meeting is stored in `%APPDATA%\Transcribe\meetings\<timestamp>\` with:
 - `chunks.jsonl` — every transcribed chunk as it arrived (crash-recoverable)

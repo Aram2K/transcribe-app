@@ -1,4 +1,4 @@
-import sys, threading, time, json, math, wave, io, struct, webbrowser, socket, queue, logging, hashlib, datetime, shutil, os
+import sys, threading, time, json, math, wave, io, struct, webbrowser, socket, queue, logging, hashlib, datetime, shutil, os, re
 import tkinter as tk
 from tkinter import ttk
 from pathlib import Path
@@ -28,7 +28,7 @@ import telemetry
 
 # ── Version ───────────────────────────────────────────────────────────────────
 
-APP_VERSION = "1.5.34"
+APP_VERSION = "1.5.35"
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
@@ -495,6 +495,7 @@ class AudioRecorder:
         self._session_lang    = None   # cached detected language for this recording
         self._chunk_threads   = []     # active background chunk threads
         self._chunk_errors    = []
+        self._chunk_silence_before = {}  # idx → silence (sec) before the chunk
         self._record_error    = ""
 
     def load_model(self, name=None):
@@ -518,6 +519,7 @@ class AudioRecorder:
             self._chunk_idx        = 0
             self._samples_in_chunk = 0
             self._chunk_errors     = []
+            self._chunk_silence_before = {}  # idx → silence (sec) before the chunk
         self._session_lang  = None   # reset on each new recording
         self._chunk_threads = []     # reset thread list each session
         self._record_error  = ""
@@ -598,6 +600,11 @@ class AudioRecorder:
                         idx = self._chunk_idx
                         self._chunk_idx   += 1
                         self._chunk_frames = []
+                        # Record the silence gap that preceded this chunk —
+                        # meeting mode uses long gaps as a lightweight
+                        # speaker-change hint, which the LLM then resolves
+                        # against the attendee list.
+                        self._chunk_silence_before[idx] = float(silence_sec)
                     vad_buf     = []
                     speech_sec  = 0.0
                     silence_sec = 0.0
@@ -3897,15 +3904,31 @@ class MeetingsWindow:
         self._recorder = None
         self._record_started_at = None
         self._duration_label_var = None
+        self._timer_var = None
         self._chunks = []          # in-memory cache mirrored from JSONL
         self._chunks_lock = threading.Lock()
         self._meeting_dir = None
         self._chunks_path = None
         self._transcript_var = None
         self._summary_var = None
-        self._actions_var = None
         self._lang_hint = "en"
         self._tick_after_id = None
+        self._pulse_after_id = None
+        self._pulse_phase = 0
+        # Meeting context (captured pre-meeting, used post-meeting)
+        self._meeting_title = ""
+        self._meeting_attendees = ""  # comma-separated names
+        self._user_notes = ""         # captured from in-meeting notepad
+        # Visual feedback during recording
+        self._rec_canvas = None
+        self._level_canvas = None
+        self._levels = [0.0] * 24
+        self._user_notes_widget = None
+        # Tk StringVars used in the idle screen
+        self._title_var = None
+        self._attendees_var = None
+        # Pre-saved tray-icon image so we can restore after recording
+        self._original_tray_icon = None
 
     def open(self):
         if self.win and self.win.winfo_exists():
@@ -3972,10 +3995,44 @@ class MeetingsWindow:
                  bg=self.BG, fg=self.FG2, font=("Segoe UI", 10),
                  wraplength=620, justify="left").pack(anchor="w", padx=24, pady=(0, 12))
 
+        # ── Meeting context (title + attendees) ──────────────────────────
+        # These names become anchors when the LLM attributes action items
+        # to owners. Eventually filled automatically from Google Calendar
+        # OAuth — see ROADMAP — but for now the user types them.
+        self._section(self.win, "Meeting context (optional, improves the notes)")
+        ctx = tk.Frame(self.win, bg=self.CARD, highlightthickness=1,
+                       highlightbackground=self.BORDER)
+        ctx.pack(fill="x", padx=24, pady=(0, 8))
+
+        tk.Label(ctx, text="TITLE", bg=self.CARD, fg=self.FG2,
+                 font=("Segoe UI", 7)).pack(anchor="w", padx=12, pady=(10, 2))
+        self._title_var = tk.StringVar(value=self._meeting_title or "")
+        title_entry = tk.Entry(ctx, textvariable=self._title_var,
+                               bg=self.CARD, fg=self.FG, insertbackground=self.FG,
+                               font=("Segoe UI", 10), relief="flat", bd=8,
+                               highlightthickness=1, highlightbackground=self.BORDER)
+        title_entry.pack(fill="x", padx=12, pady=(0, 8))
+
+        tk.Label(ctx, text="ATTENDEES (comma-separated names)",
+                 bg=self.CARD, fg=self.FG2, font=("Segoe UI", 7)
+                 ).pack(anchor="w", padx=12, pady=(2, 2))
+        self._attendees_var = tk.StringVar(value=self._meeting_attendees or "")
+        att_entry = tk.Entry(ctx, textvariable=self._attendees_var,
+                             bg=self.CARD, fg=self.FG, insertbackground=self.FG,
+                             font=("Segoe UI", 10), relief="flat", bd=8,
+                             highlightthickness=1, highlightbackground=self.BORDER)
+        att_entry.pack(fill="x", padx=12, pady=(0, 12))
+        tk.Label(ctx, text=("Example: 'Aram, Sara, John'. Action items in the final notes "
+                            "will be attributed to these people when the transcript "
+                            "indicates who committed."),
+                 bg=self.CARD, fg=self.FG2, font=("Segoe UI", 8),
+                 wraplength=620, justify="left").pack(anchor="w", padx=12, pady=(0, 12))
+
+        # ── Audio source ─────────────────────────────────────────────────
         self._section(self.win, "Audio source")
         device_card = tk.Frame(self.win, bg=self.CARD, highlightthickness=1,
                                highlightbackground=self.BORDER)
-        device_card.pack(fill="x", padx=24, pady=(0, 8))
+        device_card.pack(fill="x", padx=24, pady=(0, 6))
 
         devices = list_input_devices_with_loopback(self.app.recorder)
         labels = [d["label"] for d in devices]
@@ -3994,13 +4051,12 @@ class MeetingsWindow:
 
         tk.Label(self.win,
                  text=("To capture all participants in Google Meet / Zoom, choose a "
-                       "loopback device. On Windows install/enable 'Stereo Mix' or pick a "
-                       "[Loopback] entry. On macOS install BlackHole and route the meeting "
-                       "audio through it. Otherwise only your microphone is captured."),
+                       "[Loopback] entry (Windows, bundled) or BlackHole on macOS. "
+                       "Otherwise only your microphone is captured."),
                  bg=self.BG, fg=self.FG2, font=("Segoe UI", 8),
-                 wraplength=620, justify="left").pack(anchor="w", padx=24, pady=(0, 14))
+                 wraplength=620, justify="left").pack(anchor="w", padx=24, pady=(0, 10))
 
-        self._section(self.win, "Output")
+        # ── Engine status ────────────────────────────────────────────────
         info = tk.Frame(self.win, bg=self.CARD, highlightthickness=1,
                         highlightbackground=self.BORDER)
         info.pack(fill="x", padx=24, pady=(0, 12))
@@ -4009,6 +4065,7 @@ class MeetingsWindow:
                  font=("Segoe UI", 9), wraplength=620, justify="left",
                  anchor="w").pack(fill="x", padx=14, pady=(10, 10))
 
+        # ── Bottom buttons ───────────────────────────────────────────────
         btn_row = tk.Frame(self.win, bg=self.BG)
         btn_row.pack(side="bottom", fill="x", padx=24, pady=(0, 22))
 
@@ -4050,33 +4107,92 @@ class MeetingsWindow:
                 "OpenAI / Gemini / Anthropic / local Qwen in Settings → Actions.")
 
     def _render_recording(self):
-        tk.Label(self.win, text="● Recording meeting", bg=self.BG, fg="#ef4444",
-                 font=("Segoe UI Semibold", 16)).pack(anchor="w", padx=24, pady=(22, 2))
-        sub = tk.StringVar(value="Started just now")
-        tk.Label(self.win, textvariable=sub, bg=self.BG, fg=self.FG2,
-                 font=("Segoe UI", 10)).pack(anchor="w", padx=24, pady=(0, 6))
-        self._duration_label_var = sub
+        # ── Banner header — pulsing red REC + big timer ──────────────────
+        # The whole point: when the meeting is being recorded, the window
+        # should look UNMISTAKABLY different from any other state in the
+        # app. A solid red strip across the top + pulsing dot + huge timer
+        # answers "is it actually recording?" at a glance.
+        banner = tk.Frame(self.win, bg="#fef2f2", highlightthickness=1,
+                          highlightbackground="#fca5a5")
+        banner.pack(fill="x")
+        banner_inner = tk.Frame(banner, bg="#fef2f2")
+        banner_inner.pack(fill="x", padx=20, pady=14)
 
-        tk.Frame(self.win, bg=self.BG, height=4).pack(fill="x")
+        # Animated pulsing red dot (left side)
+        self._rec_canvas = tk.Canvas(banner_inner, width=22, height=22,
+                                     bg="#fef2f2", highlightthickness=0)
+        self._rec_canvas.pack(side="left", padx=(0, 12))
 
-        # Live transcript area
-        live_card = tk.Frame(self.win, bg=self.CARD, highlightthickness=1,
+        text_col = tk.Frame(banner_inner, bg="#fef2f2")
+        text_col.pack(side="left", fill="x", expand=True)
+        tk.Label(text_col, text="RECORDING MEETING", bg="#fef2f2", fg="#991b1b",
+                 font=("Segoe UI Semibold", 14)).pack(anchor="w")
+
+        title_line = self._meeting_title.strip() or "(untitled meeting)"
+        tk.Label(text_col, text=title_line, bg="#fef2f2", fg="#7f1d1d",
+                 font=("Segoe UI", 10)).pack(anchor="w")
+
+        # Big timer (right side of banner)
+        self._timer_var = tk.StringVar(value="0:00")
+        tk.Label(banner_inner, textvariable=self._timer_var,
+                 bg="#fef2f2", fg="#991b1b",
+                 font=("Consolas", 28, "bold")).pack(side="right")
+
+        # ── Audio level meter ────────────────────────────────────────────
+        meter_card = tk.Frame(self.win, bg=self.CARD, highlightthickness=1,
+                              highlightbackground=self.BORDER)
+        meter_card.pack(fill="x", padx=24, pady=(12, 8))
+        tk.Label(meter_card, text="INPUT LEVEL", bg=self.CARD, fg=self.FG2,
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=14, pady=(8, 2))
+        self._level_canvas = tk.Canvas(meter_card, height=44, bg=self.CARD,
+                                       highlightthickness=0)
+        self._level_canvas.pack(fill="x", padx=14, pady=(0, 10))
+
+        # ── Two-column main area: live transcript + user notepad ─────────
+        cols = tk.Frame(self.win, bg=self.BG)
+        cols.pack(fill="both", expand=True, padx=24, pady=(0, 8))
+
+        # Left: live transcript (read-only, auto-scroll)
+        live_card = tk.Frame(cols, bg=self.CARD, highlightthickness=1,
                              highlightbackground=self.BORDER)
-        live_card.pack(fill="both", expand=True, padx=24, pady=(8, 8))
-        tk.Label(live_card, text="LIVE TRANSCRIPT", bg=self.CARD, fg=self.FG2,
-                 font=("Segoe UI", 8)).pack(anchor="w", padx=14, pady=(10, 4))
-        scroll_frame = tk.Frame(live_card, bg=self.CARD)
-        scroll_frame.pack(fill="both", expand=True, padx=14, pady=(0, 12))
-        self._live_text = tk.Text(scroll_frame, bg=self.CARD, fg=self.FG,
+        live_card.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        tk.Label(live_card, text="LIVE TRANSCRIPT (auto)",
+                 bg=self.CARD, fg=self.FG2, font=("Segoe UI", 8)
+                 ).pack(anchor="w", padx=10, pady=(8, 2))
+        live_scroll = tk.Frame(live_card, bg=self.CARD)
+        live_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._live_text = tk.Text(live_scroll, bg=self.CARD, fg=self.FG,
                                   font=("Segoe UI", 10), relief="flat",
-                                  wrap="word", padx=4, pady=4)
+                                  wrap="word", padx=4, pady=4, height=8)
         self._live_text.pack(side="left", fill="both", expand=True)
-        sb = tk.Scrollbar(scroll_frame, orient="vertical", command=self._live_text.yview)
-        sb.pack(side="right", fill="y")
-        self._live_text.configure(yscrollcommand=sb.set, state="disabled")
+        sb1 = tk.Scrollbar(live_scroll, orient="vertical", command=self._live_text.yview)
+        sb1.pack(side="right", fill="y")
+        self._live_text.configure(yscrollcommand=sb1.set, state="disabled")
 
+        # Right: editable user notepad (Granola-style hybrid notes).
+        # Anything typed here is merged with the AI summary at meeting end.
+        notes_card = tk.Frame(cols, bg=self.CARD, highlightthickness=1,
+                              highlightbackground=self.BORDER)
+        notes_card.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        tk.Label(notes_card, text="YOUR NOTES (typed by you — merged into final notes)",
+                 bg=self.CARD, fg="#2563eb", font=("Segoe UI Semibold", 8)
+                 ).pack(anchor="w", padx=10, pady=(8, 2))
+        notes_scroll = tk.Frame(notes_card, bg=self.CARD)
+        notes_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._user_notes_widget = tk.Text(notes_scroll, bg="#f8fafc", fg=self.FG,
+                                          insertbackground=self.FG,
+                                          font=("Segoe UI", 10), relief="flat",
+                                          wrap="word", padx=6, pady=6, height=8)
+        self._user_notes_widget.pack(side="left", fill="both", expand=True)
+        if self._user_notes:
+            self._user_notes_widget.insert("1.0", self._user_notes)
+        sb2 = tk.Scrollbar(notes_scroll, orient="vertical", command=self._user_notes_widget.yview)
+        sb2.pack(side="right", fill="y")
+        self._user_notes_widget.configure(yscrollcommand=sb2.set)
+
+        # ── Bottom buttons ───────────────────────────────────────────────
         btn_row = tk.Frame(self.win, bg=self.BG)
-        btn_row.pack(side="bottom", fill="x", padx=24, pady=(0, 22))
+        btn_row.pack(side="bottom", fill="x", padx=24, pady=(0, 18))
 
         stop = tk.Label(btn_row, text="■ Stop & generate notes",
                         bg=cfg["accent_color"], fg="#ffffff",
@@ -4098,22 +4214,109 @@ class MeetingsWindow:
         # the user clicked Stop then re-opened the window mid-recording)
         self._refresh_live_text()
         self._tick_duration()
+        self._draw_pulse(self._pulse_phase)
+        self._draw_level_meter()
 
     def _tick_duration(self):
         if self.state != self.STATE_RECORDING:
             return
         if not self.win or not self.win.winfo_exists():
             return
-        if self._duration_label_var and self._record_started_at:
+        if self._record_started_at:
             secs = int(time.time() - self._record_started_at)
             h, rem = divmod(secs, 3600)
             m, s = divmod(rem, 60)
             txt = f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
-            self._duration_label_var.set(f"Recording · {txt}")
+            if self._timer_var is not None:
+                self._timer_var.set(txt)
+            # Also keep the window title in sync so it shows in the
+            # taskbar / Alt-Tab even when the window is minimised.
+            try:
+                title = self._meeting_title.strip() or "Meeting"
+                self.win.title(f"● REC · {txt} · {title}")
+            except Exception:
+                pass
         try:
             self._tick_after_id = self.win.after(1000, self._tick_duration)
         except Exception:
             self._tick_after_id = None
+
+    def _draw_pulse(self, phase):
+        """Pulsing red dot animation. Runs 60 ticks/sec but updates every
+        ~80 ms; the wave makes the dot 'breathe' so the user has a clear
+        signal that recording is live, not a frozen frame."""
+        if self.state != self.STATE_RECORDING:
+            return
+        c = self._rec_canvas
+        if not c or not c.winfo_exists():
+            return
+        try:
+            c.delete("all")
+            # phase ∈ [0..1] maps to a radius pulse
+            p = (math.sin(phase * math.pi * 2) + 1) / 2  # 0..1
+            r_min, r_max = 5, 10
+            r = r_min + (r_max - r_min) * p
+            # outer halo (low alpha simulated via lighter colour)
+            halo = int(220 + 35 * (1 - p))   # 220..255 — fades inward
+            halo_color = f"#fe{halo:02x}{halo:02x}"
+            c.create_oval(11 - r - 3, 11 - r - 3, 11 + r + 3, 11 + r + 3,
+                          fill=halo_color, outline="")
+            # core dot
+            c.create_oval(11 - r, 11 - r, 11 + r, 11 + r,
+                          fill="#dc2626", outline="")
+        except Exception:
+            pass
+        self._pulse_phase = (phase + 0.04) % 1.0
+        try:
+            self._pulse_after_id = self.win.after(80, lambda: self._draw_pulse(self._pulse_phase))
+        except Exception:
+            self._pulse_after_id = None
+
+    def _on_levels(self, levels):
+        """Bridge from AudioRecorder.on_levels — store the last frame so
+        the level meter draws it on the next tick."""
+        try:
+            # Smooth the values a bit so the bars don't strobe.
+            if not levels:
+                return
+            n = len(self._levels)
+            if len(levels) >= n:
+                src = levels[-n:]
+            else:
+                src = [0.0] * (n - len(levels)) + list(levels)
+            self._levels = [0.7 * old + 0.3 * new for old, new in zip(self._levels, src)]
+            if self.win and self.win.winfo_exists():
+                self.win.after(0, self._draw_level_meter)
+        except Exception:
+            pass
+
+    def _draw_level_meter(self):
+        c = self._level_canvas
+        if not c or not c.winfo_exists():
+            return
+        try:
+            c.delete("all")
+            w = c.winfo_width() or 600
+            h = c.winfo_height() or 44
+            bars = len(self._levels)
+            bar_w = max(2, int((w - 4) / bars - 2))
+            x = 4
+            cy = h // 2
+            for v in self._levels:
+                v = max(0.0, min(1.0, float(v)))
+                bh = max(2, int(v * (h - 6)))
+                # Green for quiet, amber for medium, red for clipping
+                if v < 0.4:
+                    fill = "#22c55e"
+                elif v < 0.8:
+                    fill = "#f59e0b"
+                else:
+                    fill = "#ef4444"
+                c.create_rectangle(x, cy - bh // 2, x + bar_w, cy + bh // 2,
+                                   fill=fill, outline="")
+                x += bar_w + 2
+        except Exception:
+            pass
 
     def _render_processing(self):
         tk.Label(self.win, text="Generating notes…", bg=self.BG, fg=self.FG,
@@ -4133,18 +4336,22 @@ class MeetingsWindow:
                  ).pack(anchor="w", padx=24)
 
     def _render_done(self):
+        # Reset window title now that recording is over
+        try:
+            self.win.title("Meeting notes")
+        except Exception:
+            pass
+
         title = tk.Frame(self.win, bg=self.BG)
         title.pack(fill="x", padx=24, pady=(22, 2))
-        tk.Label(title, text="Meeting notes", bg=self.BG, fg=self.FG,
-                 font=("Segoe UI Semibold", 17)).pack(side="left")
+        head_text = "Meeting notes"
+        if self._meeting_title.strip():
+            head_text = f"Meeting notes · {self._meeting_title.strip()}"
+        tk.Label(title, text=head_text, bg=self.BG, fg=self.FG,
+                 font=("Segoe UI Semibold", 17), wraplength=580,
+                 justify="left").pack(side="left", anchor="w")
 
-        duration_label = self._duration_label_var.get() if self._duration_label_var else ""
-        if duration_label.startswith("Recording · "):
-            duration_label = duration_label.replace("Recording · ", "")
-        tk.Label(title, text=f"  ({duration_label or 'done'})", bg=self.BG, fg=self.FG2,
-                 font=("Segoe UI", 10)).pack(side="left")
-
-        # Tabbed-ish layout via three notebook tabs
+        # Tabbed-ish layout: summary & action items, full transcript
         nb = ttk.Notebook(self.win)
         nb.pack(fill="both", expand=True, padx=24, pady=(10, 8))
 
@@ -4167,8 +4374,35 @@ class MeetingsWindow:
         _add_tab("Summary & action items", self._summary_var or "")
         _add_tab("Full transcript", self._transcript_var or "")
 
+        # ── Share row ────────────────────────────────────────────────────
+        share_row = tk.Frame(self.win, bg=self.BG)
+        share_row.pack(side="bottom", fill="x", padx=24, pady=(0, 14))
+
+        tk.Label(share_row, text="Share", bg=self.BG, fg=self.FG2,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 10))
+
+        def _share_btn(text, action):
+            b = tk.Label(share_row, text=text, bg="#efefef", fg=self.FG,
+                         font=("Segoe UI", 9), padx=10, pady=6, cursor="hand2")
+            b.pack(side="left", padx=(0, 6))
+            b.bind("<Button-1>", lambda _e: action())
+            b.bind("<Enter>", lambda _e: b.configure(bg="#e0e0e8"))
+            b.bind("<Leave>", lambda _e: b.configure(bg="#efefef"))
+            return b
+
+        _share_btn("Copy Markdown",
+                   lambda: self._copy_to_clipboard(self._format_share("markdown")))
+        _share_btn("Copy plain text",
+                   lambda: self._copy_to_clipboard(self._format_share("plain")))
+        _share_btn("Copy as email",
+                   lambda: self._copy_to_clipboard(self._format_share("email")))
+        _share_btn("Copy as Slack",
+                   lambda: self._copy_to_clipboard(self._format_share("slack")))
+        _share_btn("Save as file…", self._save_as_file)
+
+        # ── Main button row ──────────────────────────────────────────────
         btn_row = tk.Frame(self.win, bg=self.BG)
-        btn_row.pack(side="bottom", fill="x", padx=24, pady=(0, 20))
+        btn_row.pack(side="bottom", fill="x", padx=24, pady=(0, 18))
 
         def _btn(text, bg, fg, action, side="right", padx=(8, 0)):
             b = tk.Label(btn_row, text=text, bg=bg, fg=fg,
@@ -4182,9 +4416,74 @@ class MeetingsWindow:
             return b
 
         _btn("Close", "#efefef", self.FG, self._on_close)
-        _btn("Copy notes", "#efefef", self.FG, lambda: self._copy_to_clipboard(self._summary_var or ""))
         _btn("Open folder", "#efefef", self.FG, self._open_meeting_folder)
         _btn("New meeting", cfg["accent_color"], "#ffffff", self._reset_to_idle, side="left", padx=(0, 8))
+
+    def _format_share(self, fmt):
+        """Render the meeting notes in the requested share-format.
+
+        markdown — full Markdown (the LLM output verbatim)
+        plain    — Markdown stripped to plain text (no #, *, [ ])
+        email    — greeting + plain text + signature
+        slack    — Slack-friendly formatting (bullets, simple bold)
+        """
+        notes = self._summary_var or ""
+        title = self._meeting_title.strip() or "Meeting"
+        if fmt == "markdown":
+            return notes
+        if fmt == "plain":
+            return self._strip_markdown(notes)
+        if fmt == "email":
+            plain = self._strip_markdown(notes)
+            return (
+                f"Subject: {title} — Notes\n\n"
+                "Hi,\n\n"
+                f"Here are the notes from our meeting:\n\n{plain}\n\n"
+                "Best,"
+            )
+        if fmt == "slack":
+            # Convert ## Section → *Section* (Slack bold); leave bullets
+            slack = re.sub(r"^#{1,6}\s*(.+)$", r"*\1*", notes, flags=re.MULTILINE)
+            slack = re.sub(r"\*\*(.+?)\*\*", r"*\1*", slack)  # **bold** → *bold*
+            return f"*{title} — Notes*\n\n{slack}"
+        return notes
+
+    @staticmethod
+    def _strip_markdown(text):
+        """Bare-bones Markdown-to-plain conversion. We don't need a real
+        parser — the share helpers just need to drop the obvious sigils."""
+        if not text:
+            return ""
+        out = text
+        out = re.sub(r"^#{1,6}\s*", "", out, flags=re.MULTILINE)
+        out = re.sub(r"\*\*(.+?)\*\*", r"\1", out)
+        out = re.sub(r"\*(.+?)\*", r"\1", out)
+        out = re.sub(r"`(.+?)`", r"\1", out)
+        out = re.sub(r"^\s*-\s*\[\s*[ xX]\s*\]\s*", "• ", out, flags=re.MULTILINE)
+        out = re.sub(r"^\s*-\s+", "• ", out, flags=re.MULTILINE)
+        return out
+
+    def _save_as_file(self):
+        if not self._meeting_dir:
+            return
+        try:
+            from tkinter import filedialog
+            path = filedialog.asksaveasfilename(
+                parent=self.win,
+                title="Save meeting notes",
+                defaultextension=".md",
+                initialfile=(self._meeting_title.strip().replace(" ", "_") or "meeting") + ".md",
+                filetypes=[("Markdown", "*.md"), ("Plain text", "*.txt"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            content = self._summary_var or ""
+            if path.lower().endswith(".txt"):
+                content = self._strip_markdown(content)
+            Path(path).write_text(content, encoding="utf-8")
+            self.app.show_tray_hint("Meeting notes saved", path)
+        except Exception as e:
+            logger.warning("Could not save meeting notes: %s", e)
 
     # ── Recording control ────────────────────────────────────────────────────
 
@@ -4197,6 +4496,14 @@ class MeetingsWindow:
                 parent=self.win,
             )
             return
+
+        # Capture meeting context from the idle form before the widgets
+        # are torn down by the state transition.
+        if self._title_var:
+            self._meeting_title = self._title_var.get().strip()
+        if self._attendees_var:
+            self._meeting_attendees = self._attendees_var.get().strip()
+        self._user_notes = ""
 
         # Re-apply the device selection from the meetings combo
         sel = self._device_lookup.get(self._device_var.get(), {})
@@ -4216,8 +4523,10 @@ class MeetingsWindow:
 
         self.state = self.STATE_RECORDING
 
-        # Hook chunk-complete events so we can stream live transcript +
-        # durably persist each chunk to disk.
+        # Hook recorder callbacks so we can stream live transcript, draw
+        # the level meter, and durably persist each chunk to disk.
+        self._prev_recorder_on_levels = self.app.recorder.on_levels
+        self.app.recorder.on_levels = self._on_levels
         self.app.recorder.on_chunk_complete = self._on_chunk_complete
         self.app.recorder.on_lang_detected  = self._on_lang_detected
 
@@ -4226,23 +4535,101 @@ class MeetingsWindow:
         except Exception as e:
             self.app.is_rec = False
             self.state = self.STATE_IDLE
+            self._restore_recorder_callbacks()
             from tkinter import messagebox
             messagebox.showerror("Microphone error", str(e), parent=self.win)
             return
 
-        telemetry.track("meeting_started", {"backend": cfg.get("backend", "local")}, cfg, APP_VERSION)
+        # Pin the window so the user always knows it's actively recording,
+        # even if they switch to the meeting app. We drop topmost again
+        # when recording stops.
+        try:
+            self.win.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        # Flip the tray icon to a "recording" variant so the system tray
+        # also signals the live recording state.
+        self._swap_tray_icon_for_recording()
+
+        telemetry.track("meeting_started",
+                        {"backend": cfg.get("backend", "local"),
+                         "has_attendees": bool(self._meeting_attendees)},
+                        cfg, APP_VERSION)
         self._render()
+
+    def _restore_recorder_callbacks(self):
+        if hasattr(self, "_prev_recorder_on_levels"):
+            try:
+                self.app.recorder.on_levels = self._prev_recorder_on_levels
+            except Exception:
+                pass
+            self._prev_recorder_on_levels = None
+        try:
+            # Reset to no-op so a stale meeting callback never fires during
+            # subsequent dictation.
+            self.app.recorder.on_chunk_complete = lambda *_a: None
+        except Exception:
+            pass
+        try:
+            self.win.attributes("-topmost", False)
+        except Exception:
+            pass
+
+    def _swap_tray_icon_for_recording(self):
+        """Tint the tray icon red while a meeting is being recorded so the
+        system tray itself signals the live state."""
+        try:
+            icon = self.app._tray_icon
+            if icon is None:
+                return
+            self._original_tray_icon = icon.icon
+            icon.icon = make_icon("#dc2626")
+            try:
+                icon.title = "● Recording meeting — Transcribe"
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _restore_tray_icon(self):
+        try:
+            icon = self.app._tray_icon
+            if icon is None:
+                return
+            if self._original_tray_icon is not None:
+                icon.icon = self._original_tray_icon
+                self._original_tray_icon = None
+            try:
+                icon.title = f"Transcribe  ·  {cfg['hotkey']}"
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _on_chunk_complete(self, idx, text, lang):
         if not text or not text.strip():
             return
         if lang:
             self._lang_hint = lang
+        # Lightweight speaker-change detection: if there was a long silence
+        # gap before this chunk (relative to the silence trigger), the
+        # speaker probably changed. We attach the silence duration to the
+        # record so the LLM prompt can include a `[speaker change]` marker
+        # when building the final transcript.
+        silence_before = 0.0
+        try:
+            silence_before = float(
+                self.app.recorder._chunk_silence_before.get(idx, 0.0)
+            )
+        except Exception:
+            pass
         record = {
             "ts": datetime.datetime.utcnow().isoformat() + "Z",
             "idx": idx,
             "text": text.strip(),
             "lang": lang or "",
+            "silence_before": round(silence_before, 2),
         }
         with self._chunks_lock:
             self._chunks.append(record)
@@ -4286,6 +4673,8 @@ class MeetingsWindow:
             pass
         self.app.is_rec = False
         self.state = self.STATE_IDLE
+        self._restore_recorder_callbacks()
+        self._restore_tray_icon()
         # Best-effort: leave the chunks.jsonl on disk; user can recover.
 
     def _discard(self):
@@ -4315,6 +4704,14 @@ class MeetingsWindow:
         try:
             duration_sec = int(time.time() - (self._record_started_at or time.time()))
 
+            # Snapshot the user notepad before we tear the widget down on
+            # state transition.
+            try:
+                if self._user_notes_widget and self._user_notes_widget.winfo_exists():
+                    self._user_notes = self._user_notes_widget.get("1.0", "end").strip()
+            except Exception:
+                pass
+
             # Stop and drain the recorder (mirrors the watchdog logic in _stop)
             try:
                 self.app.recorder.stop_recording()
@@ -4334,14 +4731,25 @@ class MeetingsWindow:
             t.join(timeout=180)
             self.app.is_rec = False
 
+            # Release pinning + restore tray icon + callbacks now that the
+            # recorder is done. Doing this in a `finally`-style block via
+            # the UI thread to be safe.
+            self._post_to_ui(self._restore_recorder_callbacks)
+            self._post_to_ui(self._restore_tray_icon)
+
             # Build the full transcript from BOTH the durably persisted
             # chunks (which include everything that finished while recording)
             # AND the final tail from transcribe() (in case the very last
             # partial chunk was processed only at stop time).
+            # Speaker-change markers are inserted where the silence gap
+            # before a chunk exceeded 1.4s — a lightweight diarization
+            # signal the LLM uses to attribute action items.
             with self._chunks_lock:
-                persisted = [c["text"] for c in self._chunks if c.get("text")]
+                chunks_snapshot = list(self._chunks)
+            transcript = self._build_transcript_with_markers(chunks_snapshot)
             tail_text = (_result.get("text") or "").strip()
-            transcript = " ".join(part for part in (persisted + [tail_text]) if part).strip()
+            if tail_text:
+                transcript = (transcript + " " + tail_text).strip()
 
             if not transcript:
                 self._summary_var = ("(no audio captured)\n\nIf this is unexpected, check that "
@@ -4353,11 +4761,14 @@ class MeetingsWindow:
                 self._post_to_ui(self._render)
                 return
 
-            # Generate notes. Action engine handles cloud/local-LLM/extractive
-            # automatically based on the configured action_model.
+            # Prepend meeting context (title + attendees + user notes) so the
+            # LLM can attribute action items to the right names and merge
+            # the user's own bullet points into the summary.
+            llm_input = self._build_llm_input(transcript)
+
             try:
                 notes = actions.process(
-                    transcript,
+                    llm_input,
                     actions.ACTION_MEETING_NOTES,
                     source_lang=self._lang_hint or "auto",
                     target_lang=cfg.get("translate_target", "en"),
@@ -4380,6 +4791,8 @@ class MeetingsWindow:
                 {
                     "duration_bucket": _bucket_count(duration_sec),
                     "chunks": len(self._chunks),
+                    "has_attendees": bool(self._meeting_attendees),
+                    "has_user_notes": bool(self._user_notes),
                     "engine_kind": actions.ACTION_MODELS.get(
                         actions.normalize_action_model(cfg.get("action_model")), {}
                     ).get("kind", "rules"),
@@ -4394,7 +4807,53 @@ class MeetingsWindow:
             self._summary_var = f"(error generating notes: {e})"
             self._transcript_var = self._summary_var
             self.state = self.STATE_DONE
+            self._post_to_ui(self._restore_recorder_callbacks)
+            self._post_to_ui(self._restore_tray_icon)
             self._post_to_ui(self._render)
+
+    def _build_transcript_with_markers(self, chunks):
+        """Stitch chunk texts into one transcript, inserting `[speaker
+        change]` between chunks whose preceding silence exceeded a
+        threshold. This is the lightweight diarization signal — the LLM
+        sees these markers and uses them, together with the attendee list,
+        to attribute action items."""
+        parts = []
+        SPEAKER_GAP_SEC = 1.4
+        for c in chunks:
+            text = (c.get("text") or "").strip()
+            if not text:
+                continue
+            gap = float(c.get("silence_before", 0.0) or 0.0)
+            if parts and gap >= SPEAKER_GAP_SEC:
+                parts.append("[speaker change]")
+            parts.append(text)
+        return " ".join(parts).strip()
+
+    def _build_llm_input(self, transcript):
+        """Compose the input we hand to the action engine: a small
+        contextual header (title, attendees, the user's own notepad)
+        followed by the transcript. The prompt itself tells the LLM how
+        to use each section."""
+        header_lines = []
+        if self._meeting_title.strip():
+            header_lines.append(f"Meeting title: {self._meeting_title.strip()}")
+        attendees = self._meeting_attendees.strip()
+        if attendees:
+            header_lines.append(
+                f"Attendees (prefer these exact spellings when attributing owners): {attendees}"
+            )
+        notes = (self._user_notes or "").strip()
+        if notes:
+            header_lines.append(
+                "The user took these notes during the meeting — merge them into the "
+                "Summary section, preserving their phrasing and reinforcing them with "
+                "evidence from the transcript:\n" + notes
+            )
+        if not header_lines:
+            return transcript
+        header_lines.append("---")
+        header_lines.append("Transcript:")
+        return "\n".join(header_lines) + "\n" + transcript
 
     def _post_to_ui(self, fn, *args):
         if not self.win or not self.win.winfo_exists():
