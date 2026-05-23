@@ -67,15 +67,44 @@ def build_messages(text, mode, source_lang="auto", target_lang="en"):
             "Output only the summary — no preamble, no headings."
         )
     elif mode == "meeting_notes":
+        # Prompt engineering applied from Microsoft Research's meeting-recap
+        # paper (arxiv 2307.15793): two-stage thinking (identify utterances
+        # first, then summarise with context), third-person rephrasing so
+        # the notes are shareable, explicit owner attribution, and careful
+        # name preservation for non-Western names.
         instruction = (
-            "You are summarising a meeting transcript. Produce well-formed Markdown "
-            "with EXACTLY these four sections, in this order, even if a section is empty:\n\n"
-            "## Summary\nA 2-4 sentence overview of what was discussed.\n\n"
-            "## Key decisions\nBullet list of concrete decisions made. Skip if none.\n\n"
-            "## Action items\nMarkdown checkbox list `- [ ] task` — include owner names "
-            "and due dates if mentioned. Skip if none.\n\n"
-            "## Open questions\nBullet list of unresolved questions raised. Skip if none.\n\n"
-            "Be specific. Do not invent decisions or owners that aren't in the transcript."
+            "You are summarising a meeting transcript. Think carefully before writing:\n"
+            "1. First mentally identify the most important utterances in the transcript "
+            "(decisions, commitments, questions, blockers). DO NOT output this — it is "
+            "internal reasoning to ground the notes.\n"
+            "2. Then produce well-formed Markdown with EXACTLY these four sections in "
+            "this order, even if a section is empty:\n\n"
+            "## Summary\n"
+            "2-4 sentences in third person ('The team discussed…', 'Aram committed to…'). "
+            "Never use first-person ('I will…') — convert to third person using whoever "
+            "spoke when known, or 'the speaker' otherwise.\n\n"
+            "## Key decisions\n"
+            "Bullet list of concrete decisions reached. Skip if none.\n\n"
+            "## Action items\n"
+            "Markdown checkbox list. Format each as:\n"
+            "`- [ ] <task>` (Owner: <name>, Due: <date>)\n"
+            "Attribute owners using these heuristics:\n"
+            "  - 'I'll do X' → Owner is the speaker (use their name if known)\n"
+            "  - 'Aram should review' → Owner: Aram\n"
+            "  - 'we need to' → leave owner blank\n"
+            "Skip the section if no action items.\n\n"
+            "## Open questions\n"
+            "Bullet list of questions raised but not answered. Skip if none.\n\n"
+            "CRITICAL RULES:\n"
+            "- Preserve names EXACTLY as written, including Armenian, Russian, and "
+            "other non-English names. Never anglicise or guess at spellings.\n"
+            "- Do not invent decisions, owners, dates, or facts that aren't in the "
+            "transcript. If unsure, omit rather than fabricate.\n"
+            "- The transcript may contain `[speaker change]` markers indicating likely "
+            "speaker transitions; use them to attribute who said what when names are "
+            "available from the attendees list.\n"
+            "- If an attendee list is provided in context, prefer those exact names "
+            "when attributing owners."
         )
     else:
         instruction = "Rewrite this text clearly while preserving meaning. Output only the result."

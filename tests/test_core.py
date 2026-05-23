@@ -413,5 +413,101 @@ class TestFmtHotkey(unittest.TestCase):
         self.assertIn("Back", result)
 
 
+class TestMeetingsWindowHelpers(unittest.TestCase):
+    """Tests for the pure-data helpers on MeetingsWindow — transcript
+    stitching, prompt context building, and share-format conversion.
+
+    These don't exercise the Tk widgets; we bypass __init__ and set the
+    handful of instance attributes the helpers actually read."""
+
+    def _make_mw(self, **overrides):
+        import main
+        mw = main.MeetingsWindow.__new__(main.MeetingsWindow)
+        mw._meeting_title = overrides.get("title", "")
+        mw._meeting_attendees = overrides.get("attendees", "")
+        mw._user_notes = overrides.get("user_notes", "")
+        mw._summary_var = overrides.get("summary", "")
+        mw._transcript_var = overrides.get("transcript", "")
+        return mw
+
+    def test_build_transcript_inserts_speaker_change_markers(self):
+        mw = self._make_mw()
+        chunks = [
+            {"text": "Hello everyone.", "silence_before": 0.0},
+            {"text": "Thanks for joining.", "silence_before": 0.3},   # short — no marker
+            {"text": "I'll draft the spec.", "silence_before": 1.8},  # long — marker
+            {"text": "Sounds good.", "silence_before": 2.0},          # long — marker
+        ]
+        out = mw._build_transcript_with_markers(chunks)
+        self.assertIn("Hello everyone.", out)
+        self.assertIn("[speaker change] I'll draft the spec.", out)
+        self.assertIn("[speaker change] Sounds good.", out)
+        # First chunk should never get a marker even if its silence_before > 0
+        self.assertFalse(out.startswith("[speaker change]"))
+
+    def test_build_llm_input_prepends_context_when_provided(self):
+        mw = self._make_mw(
+            title="Q3 planning",
+            attendees="Aram, Sara, John",
+            user_notes="• budget approval still pending",
+        )
+        out = mw._build_llm_input("The team discussed the roadmap.")
+        self.assertIn("Q3 planning", out)
+        self.assertIn("Aram, Sara, John", out)
+        self.assertIn("budget approval still pending", out)
+        self.assertIn("Transcript:", out)
+        self.assertIn("The team discussed the roadmap.", out)
+
+    def test_build_llm_input_returns_bare_transcript_when_no_context(self):
+        mw = self._make_mw()
+        out = mw._build_llm_input("raw transcript only")
+        self.assertEqual(out, "raw transcript only")
+
+    def test_strip_markdown_removes_sigils(self):
+        import main
+        md = "## Heading\n\n**bold** text and `code` here\n- [ ] checkbox task\n- bullet"
+        out = main.MeetingsWindow._strip_markdown(md)
+        self.assertNotIn("##", out)
+        self.assertNotIn("**", out)
+        self.assertNotIn("- [ ]", out)
+        self.assertNotIn("`code`", out)
+        self.assertIn("Heading", out)
+        self.assertIn("bold", out)
+        self.assertIn("code", out)
+        # Both line-starting `- [ ] X` and `- Y` should convert to bullet glyph
+        bullet_lines = [l for l in out.splitlines() if l.startswith("• ")]
+        self.assertGreaterEqual(len(bullet_lines), 2)
+
+    def test_format_share_renders_email_with_greeting(self):
+        mw = self._make_mw(
+            title="Sync with Sara",
+            summary="## Summary\nGreat call.\n\n## Action items\n- [ ] follow up",
+        )
+        out = mw._format_share("email")
+        self.assertIn("Subject: Sync with Sara — Notes", out)
+        self.assertIn("Hi,", out)
+        self.assertIn("Best,", out)
+        # Markdown sigils should be stripped in the email body
+        self.assertNotIn("##", out)
+        self.assertNotIn("- [ ]", out)
+
+    def test_format_share_renders_slack_with_bold(self):
+        mw = self._make_mw(
+            title="Standup",
+            summary="## Summary\n**Aram** will ship by Friday.",
+        )
+        out = mw._format_share("slack")
+        self.assertIn("*Standup — Notes*", out)
+        # ## Summary becomes *Summary*; **Aram** becomes *Aram*
+        self.assertIn("*Summary*", out)
+        self.assertIn("*Aram*", out)
+        self.assertNotIn("**", out)
+        self.assertNotIn("##", out)
+
+    def test_format_share_markdown_returns_summary_verbatim(self):
+        mw = self._make_mw(summary="## Hello\n**bold**\n- item")
+        self.assertEqual(mw._format_share("markdown"), "## Hello\n**bold**\n- item")
+
+
 if __name__ == "__main__":
     unittest.main()
