@@ -39,15 +39,15 @@ It was built especially for **Armenian speakers** who need accurate, native-scri
 |---|---|
 | 🎙 **Hotkey recording** | Press any key combo (or mouse button) to start/stop |
 | 📋 **Smart paste** | Auto-pastes at your cursor; falls back to clipboard |
-| 🌐 **Armenian-first** | Native script output — not transliteration |
-| 🔒 **Fully offline** | Local Whisper AI, no data leaves your machine |
+| 🌐 **Armenian-first** | Optimized offline models with vibrant Armenian Flag Tricolor visual style |
+| 🔒 **Fully offline** | Local Whisper AI and Qwen/Gemma action summaries offline |
 | ☁️ **Google Cloud option** | Best accuracy for Armenian via Speech-to-Text API |
 | ⚡ **Streaming results** | Background chunks transcribed while you speak |
-| 📊 **Waveform overlay** | Clean floating UI with live audio visualization |
+| 📊 **Waveform overlay** | Premium floating visualizer overlay |
 | 🕘 **History log** | Searchable list of all past transcriptions |
-| ⚙️ **Settings panel** | Model, language, hotkey, color — all configurable |
+| ⚙️ **Settings panel** | Staged transactional settings (Save &amp; Cancel buttons) for full layout configuration |
 | 📝 **Custom vocabulary** | Seed recognition with names or domain terms |
-| 🪟 **System tray** | Zero footprint until you need it |
+| 🪟 **System tray** | Zero footprint background daemon |
 
 ---
 
