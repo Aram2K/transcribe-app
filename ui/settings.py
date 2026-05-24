@@ -80,13 +80,18 @@ class Settings(QDialog):
         self.tabs.addTab(self._create_models_tab(), "Local Models")
         self.tabs.addTab(self._create_actions_tab(), "AI Actions")
         self.tabs.addTab(self._create_history_tab(), "History")
-        self.tabs.addTab(self._create_about_tab(), "About")
+        
+        about_title = "About"
+        if self.app and self.app.cfg.get("pending_update_version"):
+            about_title = f"About (Update v{self.app.cfg.get('pending_update_version').replace('v', '')}!)"
+            
+        self.tabs.addTab(self._create_about_tab(), about_title)
         layout.addWidget(self.tabs)
 
         # Bottom Close Row
         bottom_layout = QHBoxLayout()
         bottom_layout.addStretch()
-        btn_close = QPushButton("Close", self)
+        btn_close = QPushButton("Save & Close", self)
         btn_close.setObjectName("primaryButton")
         btn_close.clicked.connect(self.accept)
         bottom_layout.addWidget(btn_close)
@@ -724,6 +729,10 @@ class Settings(QDialog):
 
         # Update checking button
         self.btn_update = QPushButton("Check for Updates", tab)
+        if self.app and self.app.cfg.get("pending_update_version"):
+            tag = self.app.cfg.get("pending_update_version")
+            self.btn_update.setText(f"Install Update {tag}")
+            self.btn_update.setObjectName("primaryButton")
         self.btn_update.clicked.connect(self._check_for_updates)
         layout.addWidget(self.btn_update)
 
@@ -731,6 +740,11 @@ class Settings(QDialog):
         return tab
 
     def _check_for_updates(self):
+        if self.app and self.app.cfg.get("pending_update_version"):
+            tag = self.app.cfg.get("pending_update_version")
+            self._on_download_finished("update", f"available:{tag}")
+            return
+
         from main import APP_VERSION
         self.btn_update.setText("Checking...")
         self.btn_update.setEnabled(False)
@@ -738,18 +752,22 @@ class Settings(QDialog):
         def _check():
             import requests
             try:
-                # Direct call to repo releases (mock or network check)
-                resp = requests.get("https://api.github.com/repos/Aram2K/transcribe-app/releases/latest", timeout=5)
+                resp = requests.get("https://api.github.com/repos/Aram2K/transcribe-app/releases/latest", timeout=8, proxies={"http": None, "https": None})
                 if resp.status_code == 200:
                     data = resp.json()
-                    tag = data.get("tag_name", "").replace("v", "")
-                    curr = APP_VERSION.replace("v", "")
+                    tag = data.get("tag_name", "")
+                    curr = APP_VERSION
                     
-                    if tag and tag > curr:
-                        self.downloader_signals.finished.emit("update", f"available:{data.get('tag_name')}")
+                    from main import _parse_version
+                    if tag and _parse_version(tag) > _parse_version(curr):
+                        self.downloader_signals.finished.emit("update", f"available:{tag}")
                         return
-                self.downloader_signals.finished.emit("update", "latest")
-            except Exception:
+                    self.downloader_signals.finished.emit("update", "latest")
+                else:
+                    self.downloader_signals.finished.emit("update", "error")
+            except Exception as e:
+                import logging
+                logging.error("Updater request error: %s", e)
                 self.downloader_signals.finished.emit("update", "error")
                 
         threading.Thread(target=_check, daemon=True).start()
@@ -899,6 +917,11 @@ class Settings(QDialog):
                             
                             # Execute the setup.exe natively
                             os.startfile(dest_path)
+                            
+                            # Clear pending update from configuration
+                            if self.app:
+                                self.app.cfg["pending_update_version"] = ""
+                                self.app.save_config()
                             
                             # Quit the running instance so that the installer can overwrite the files
                             if self.app:
