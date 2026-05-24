@@ -62,6 +62,46 @@ _stub("history",       {"add": MagicMock, "all": MagicMock(return_value=[]),
                          "delete": MagicMock, "export_csv": MagicMock,
                          "export_txt": MagicMock})
 _stub("requests",      {"get": MagicMock, "post": MagicMock})
+
+# Stub PySide6
+_core = _stub("PySide6.QtCore", {
+    "Qt": MagicMock,
+    "QTimer": MagicMock,
+    "QObject": MagicMock,
+    "Signal": MagicMock,
+})
+_gui = _stub("PySide6.QtGui", {
+    "QIcon": MagicMock,
+    "QPixmap": MagicMock,
+    "QImage": MagicMock,
+    "QAction": MagicMock,
+    "QFont": MagicMock,
+    "QColor": MagicMock,
+})
+_widgets = _stub("PySide6.QtWidgets", {
+    "QApplication": MagicMock,
+    "QSystemTrayIcon": MagicMock,
+    "QMenu": MagicMock,
+    "QMessageBox": MagicMock,
+    "QDialog": MagicMock,
+    "QWidget": MagicMock,
+    "QVBoxLayout": MagicMock,
+    "QHBoxLayout": MagicMock,
+    "QLabel": MagicMock,
+    "QPushButton": MagicMock,
+    "QComboBox": MagicMock,
+    "QLineEdit": MagicMock,
+    "QTextEdit": MagicMock,
+    "QFrame": MagicMock,
+    "QSplitter": MagicMock,
+    "QProgressBar": MagicMock,
+    "QStackedWidget": MagicMock,
+    "QFileDialog": MagicMock,
+})
+_pyside6 = _stub("PySide6", {})
+_pyside6.QtCore = _core
+_pyside6.QtGui = _gui
+_pyside6.QtWidgets = _widgets
 # ctypes is NOT stubbed — it is stdlib and works cross-platform.
 # ctypes.windll only appears inside apply_glass() which is never called by tests.
 # Replacing ctypes in sys.modules breaks ctypes._layout imports on Python 3.11.
