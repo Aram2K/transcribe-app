@@ -36,7 +36,7 @@ import local_llm
 import telemetry
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.5.38"
+APP_VERSION = "1.5.39"
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
