@@ -36,7 +36,7 @@ import local_llm
 import telemetry
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.5.37"
+APP_VERSION = "1.5.38"
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
@@ -724,14 +724,37 @@ class AudioRecorder:
 
 # ── Dynamic Pillow Tray Icon Generator ───────────────────────────────────────
 def make_icon(color="#3b82f6"):
-    img = Image.new("RGBA", (64,64), (0,0,0,0))
+    # Create the transparent base image
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    
+    # Create a temporary image for the Armenian flag background
+    bg = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    bg_draw = ImageDraw.Draw(bg)
+    
+    # Armenian flag colors
+    red = (217, 30, 24, 255)     # #d91e18
+    blue = (0, 51, 160, 255)     # #0033a0
+    orange = (242, 168, 21, 255) # #f2a815
+    
+    # Draw three horizontal stripes
+    bg_draw.rectangle([0, 0, 64, 22], fill=red)
+    bg_draw.rectangle([0, 22, 64, 42], fill=blue)
+    bg_draw.rectangle([0, 42, 64, 64], fill=orange)
+    
+    # Create a circular mask
+    mask = Image.new("L", (64, 64), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.ellipse([2, 2, 62, 62], fill=255)
+    
+    # Composite the flag background onto the main image using the circular mask
+    img.paste(bg, (0, 0), mask)
+    
+    # Draw the white microphone outline/elements on top
     d = ImageDraw.Draw(img)
-    r,g,b = int(color[1:3],16), int(color[3:5],16), int(color[5:7],16)
-    d.ellipse([2,2,62,62], fill=(r,g,b))
-    d.rectangle([24,12,40,40], fill="white")
-    d.ellipse([18,32,46,52],   fill="white")
-    d.rectangle([30,50,34,60], fill="white")
-    d.rectangle([22,58,42,62], fill="white")
+    d.rectangle([24, 12, 40, 40], fill="white")
+    d.ellipse([18, 32, 46, 52],   fill="white")
+    d.rectangle([30, 50, 34, 60], fill="white")
+    d.rectangle([22, 58, 42, 62], fill="white")
     return img
 
 def make_qicon(color="#3b82f6"):
