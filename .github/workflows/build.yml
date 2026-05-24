@@ -20,7 +20,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install test dependencies
-        run: python -m pip install pytest requests psutil pillow numpy PySide6 --quiet
+        run: python -m pip install pytest requests psutil pillow numpy --quiet
 
       - name: Diagnose import
         run: |
@@ -57,6 +57,11 @@ jobs:
           _ttt=_stub("tkinter.ttk",{"Scrollbar":MagicMock}); _tk.ttk=_ttt
           _stub("history",{"add":MagicMock,"all":MagicMock(return_value=[]),"clear":MagicMock,"search":MagicMock(return_value=[])})
           _stub("requests",{"get":MagicMock,"post":MagicMock})
+          _core = _stub("PySide6.QtCore", {"Qt":MagicMock,"QTimer":MagicMock,"QObject":MagicMock,"Signal":MagicMock})
+          _gui = _stub("PySide6.QtGui", {"QIcon":MagicMock,"QPixmap":MagicMock,"QImage":MagicMock,"QAction":MagicMock,"QFont":MagicMock,"QColor":MagicMock})
+          _widgets = _stub("PySide6.QtWidgets", {"QApplication":MagicMock,"QSystemTrayIcon":MagicMock,"QMenu":MagicMock,"QMessageBox":MagicMock,"QDialog":MagicMock,"QWidget":MagicMock,"QVBoxLayout":MagicMock,"QHBoxLayout":MagicMock,"QLabel":MagicMock,"QPushButton":MagicMock,"QComboBox":MagicMock,"QLineEdit":MagicMock,"QTextEdit":MagicMock,"QFrame":MagicMock,"QSplitter":MagicMock,"QProgressBar":MagicMock,"QStackedWidget":MagicMock,"QFileDialog":MagicMock})
+          _pyside6 = _stub("PySide6", {})
+          _pyside6.QtCore = _core; _pyside6.QtGui = _gui; _pyside6.QtWidgets = _widgets
           sys.path.insert(0,".")
           print("Python", sys.version)
           print("Stubs ready, importing main...")
