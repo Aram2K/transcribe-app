@@ -253,17 +253,30 @@ class Settings(QDialog):
             return
             
         state = self._model_states.get(name, "missing")
+        is_active = False
+        if self.app and self.app.cfg.get("whisper_model") == name:
+            is_active = True
         
         # Configure matching visuals
         if state == "downloaded":
-            card.lbl_state.setText("Downloaded")
-            card.lbl_state.setStyleSheet("color: #22c55e; font-weight: bold;")
-            card.btn_action.setText("Use Model")
-            card.btn_action.setEnabled(True)
-            card.btn_action.setObjectName("primaryButton")
             card.btn_remove.setVisible(True)
             card.progress_bar.setVisible(False)
+            if is_active:
+                card.setObjectName("activeCardFrame")
+                card.lbl_state.setText("Active")
+                card.lbl_state.setStyleSheet("color: #22c55e; font-weight: bold;")
+                card.btn_action.setText("Currently Active")
+                card.btn_action.setEnabled(False)
+                card.btn_action.setObjectName("")
+            else:
+                card.setObjectName("cardFrame")
+                card.lbl_state.setText("Downloaded")
+                card.lbl_state.setStyleSheet("color: #3b82f6; font-weight: bold;")
+                card.btn_action.setText("Use Model")
+                card.btn_action.setEnabled(True)
+                card.btn_action.setObjectName("primaryButton")
         elif state == "downloading":
+            card.setObjectName("cardFrame")
             progress = self._model_progress.get(name, {"percent": 0})
             card.lbl_state.setText("Downloading...")
             card.lbl_state.setStyleSheet("color: #3b82f6;")
@@ -272,6 +285,7 @@ class Settings(QDialog):
             card.progress_bar.setVisible(True)
             card.progress_bar.setValue(progress.get("percent", 0))
         else: # missing or failed
+            card.setObjectName("cardFrame")
             card.lbl_state.setText("Not Downloaded")
             card.lbl_state.setStyleSheet("color: #64748b;")
             card.btn_action.setText("Download")
@@ -281,6 +295,8 @@ class Settings(QDialog):
             card.progress_bar.setVisible(False)
 
         # Repolish stylesheet elements
+        card.style().unpolish(card)
+        card.style().polish(card)
         card.btn_action.style().unpolish(card.btn_action)
         card.btn_action.style().polish(card.btn_action)
 
@@ -478,16 +494,29 @@ class Settings(QDialog):
             return
             
         state = self._local_llm_states.get(name, "missing")
+        is_active = False
+        if self.app and self.app.cfg.get("action_model") == name:
+            is_active = True
         
         if state == "downloaded":
-            card.lbl_state.setText("Downloaded")
-            card.lbl_state.setStyleSheet("color: #22c55e; font-weight: bold;")
-            card.btn_action.setText("Use Model")
-            card.btn_action.setEnabled(True)
-            card.btn_action.setObjectName("primaryButton")
             card.btn_remove.setVisible(True)
             card.progress_bar.setVisible(False)
+            if is_active:
+                card.setObjectName("activeCardFrame")
+                card.lbl_state.setText("Active")
+                card.lbl_state.setStyleSheet("color: #22c55e; font-weight: bold;")
+                card.btn_action.setText("Currently Active")
+                card.btn_action.setEnabled(False)
+                card.btn_action.setObjectName("")
+            else:
+                card.setObjectName("cardFrame")
+                card.lbl_state.setText("Downloaded")
+                card.lbl_state.setStyleSheet("color: #3b82f6; font-weight: bold;")
+                card.btn_action.setText("Use Model")
+                card.btn_action.setEnabled(True)
+                card.btn_action.setObjectName("primaryButton")
         elif state == "downloading":
+            card.setObjectName("cardFrame")
             progress = self._local_llm_progress.get(name, {"percent": 0})
             card.lbl_state.setText("Downloading...")
             card.lbl_state.setStyleSheet("color: #3b82f6;")
@@ -496,6 +525,7 @@ class Settings(QDialog):
             card.progress_bar.setVisible(True)
             card.progress_bar.setValue(progress.get("percent", 0))
         else: # missing or failed
+            card.setObjectName("cardFrame")
             card.lbl_state.setText("Not Downloaded")
             card.lbl_state.setStyleSheet("color: #64748b;")
             card.btn_action.setText("Download")
@@ -505,6 +535,8 @@ class Settings(QDialog):
             card.progress_bar.setVisible(False)
 
         # Repolish
+        card.style().unpolish(card)
+        card.style().polish(card)
         card.btn_action.style().unpolish(card.btn_action)
         card.btn_action.style().polish(card.btn_action)
 
@@ -724,6 +756,14 @@ class Settings(QDialog):
 
     # ── Model Downloaders & Handlers (Thread-Safe integration) ───────────────
     def _download_whisper(self, name):
+        if self._model_states.get(name) == "downloaded":
+            if self.app:
+                self.app.cfg["whisper_model"] = name
+                self.app.save_config()
+            for m_name in list(self.whisper_cards.keys()):
+                self._update_whisper_card_ui(m_name)
+            return
+
         if self._model_states.get(name) == "downloading":
             return
             
@@ -761,6 +801,20 @@ class Settings(QDialog):
                 QMessageBox.information(self, "Success", f"Whisper {name.upper()} removed successfully.")
 
     def _download_llm(self, name):
+        if self._local_llm_states.get(name) == "downloaded":
+            if self.app:
+                self.app.cfg["action_model"] = name
+                self.app.save_config()
+            if hasattr(self, "combo_local_model"):
+                idx = self.combo_local_model.findData(name)
+                if idx >= 0:
+                    self.combo_local_model.blockSignals(True)
+                    self.combo_local_model.setCurrentIndex(idx)
+                    self.combo_local_model.blockSignals(False)
+            for m_name in list(self.llm_cards.keys()):
+                self._update_llm_card_ui(m_name)
+            return
+
         if self._local_llm_states.get(name) == "downloading":
             return
             
@@ -809,11 +863,60 @@ class Settings(QDialog):
             self.btn_update.setText("Check for Updates")
             if state.startswith("available:"):
                 tag = state.split(":")[1]
-                QMessageBox.information(
+                reply = QMessageBox.question(
                     self, "Update Available",
                     f"A new version ({tag}) of Transcribe is available!\n\n"
-                    f"Please download it from: {PROJECT_GITHUB_URL}/releases"
+                    "Would you like to automatically download and apply the update now?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
                 )
+                if reply == QMessageBox.Yes:
+                    self.btn_update.setText("Downloading Update...")
+                    self.btn_update.setEnabled(False)
+                    
+                    def _download_and_install():
+                        import urllib.request
+                        import tempfile
+                        import shutil
+                        import os
+                        import logging
+                        
+                        try:
+                            # Construct the setup url
+                            setup_url = f"{PROJECT_GITHUB_URL}/releases/download/{tag}/TranscribeApp-Windows-Setup.exe"
+                            
+                            # Create a temporary directory in the workspace or standard temp
+                            temp_dir = tempfile.gettempdir()
+                            dest_path = os.path.join(temp_dir, "TranscribeApp-Windows-Setup.exe")
+                            
+                            # Fetch the installer
+                            req = urllib.request.Request(
+                                setup_url,
+                                headers={'User-Agent': 'Mozilla/5.0'}
+                            )
+                            with urllib.request.urlopen(req) as response:
+                                with open(dest_path, 'wb') as out_file:
+                                    shutil.copyfileobj(response, out_file)
+                            
+                            # Execute the setup.exe natively
+                            os.startfile(dest_path)
+                            
+                            # Quit the running instance so that the installer can overwrite the files
+                            if self.app:
+                                QTimer.singleShot(0, self.app.qapp.quit)
+                        except Exception as e:
+                            logging.error("Failed to download and execute update installer: %s", e)
+                            # Show error in main thread
+                            def _show_err():
+                                self.btn_update.setText("Check for Updates")
+                                self.btn_update.setEnabled(True)
+                                QMessageBox.critical(
+                                    self, "Update Error",
+                                    f"Failed to download the update automatically:\n{e}\n\n"
+                                    f"Please update manually from:\n{PROJECT_GITHUB_URL}/releases"
+                                )
+                            QTimer.singleShot(0, _show_err)
+                            
+                    threading.Thread(target=_download_and_install, daemon=True).start()
             elif state == "latest":
                 QMessageBox.information(self, "No Updates", "You are running the latest version of Transcribe.")
             else:
