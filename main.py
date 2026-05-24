@@ -757,7 +757,7 @@ class AppController(QObject):
         self.recorder.on_levels = self._on_levels
         self.recorder.on_lang_detected = self._on_lang
         self.recorder.on_partial = self._on_partial
-        
+        from pynput.keyboard import Controller
         self.kbd = Controller()
         self.is_rec = False
         self._mouse_listener = None

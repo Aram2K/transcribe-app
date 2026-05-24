@@ -9,7 +9,8 @@ import threading
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, 
-    QLineEdit, QTextEdit, QFrame, QMessageBox, QSplitter, QProgressBar
+    QLineEdit, QTextEdit, QFrame, QMessageBox, QSplitter, QProgressBar,
+    QStackedWidget, QFileDialog, QWidget
 )
 from PySide6.QtGui import QFont, QColor
 import storage
