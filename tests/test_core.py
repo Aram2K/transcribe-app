@@ -38,7 +38,7 @@ def _stub(name, attrs=None):
 
 _stub("pyaudio",       {"PyAudio": MagicMock, "paInt16": 8})
 _stub("pystray",       {"Icon": MagicMock, "Menu": MagicMock, "MenuItem": MagicMock})
-_pynput_kb    = _stub("pynput.keyboard", {"Controller": MagicMock, "Key": MagicMock})
+_pynput_kb    = _stub("pynput.keyboard", {"Controller": MagicMock, "Key": MagicMock, "GlobalHotKeys": MagicMock, "Listener": MagicMock})
 _pynput_mouse = _stub("pynput.mouse",   {"Listener": MagicMock, "Button": MagicMock})
 _pynput       = _stub("pynput",         {})
 _pynput.keyboard = _pynput_kb    # needed for Python ≤ 3.11 (no sys.modules fallback in IMPORT_FROM)

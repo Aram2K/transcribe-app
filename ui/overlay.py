@@ -129,14 +129,14 @@ class Overlay(QWidget):
         
         accent_color = self.app.cfg.get("accent_color", "#3b82f6") if self.app else "#3b82f6"
         
-        # 1. Base Glassmorphic Panel Background
+        # 1. Base Glassmorphic Panel Background (Light mode)
         path = QPainterPath()
         path.addRoundedRect(QRectF(1, 1, self.W - 2, self.H - 2), 14, 14)
         
-        painter.fillPath(path, QBrush(QColor(22, 22, 24, 230)))
+        painter.fillPath(path, QBrush(QColor(255, 255, 255, 242)))
         
         # Border
-        pen = QPen(QColor(43, 43, 47, 200))
+        pen = QPen(QColor(226, 232, 240, 240))
         pen.setWidth(1)
         if self.overlay_state == RECORDING:
             border_color = QColor(accent_color)
@@ -170,13 +170,13 @@ class Overlay(QWidget):
         painter.setBrush(QBrush(QColor(255, 59, 59)))
         painter.drawEllipse(QPoint(dx, dy), 4.5, 4.5)
         
-        # Labels
-        painter.setPen(QColor(255, 255, 255))
+        # Labels (Charcoal / Slate colors for Light mode)
+        painter.setPen(QColor(15, 23, 42))
         font = QFont("Segoe UI", 11, QFont.Bold)
         painter.setFont(font)
         painter.drawText(38, 25, "Recording")
         
-        painter.setPen(QColor(115, 115, 125))
+        painter.setPen(QColor(100, 116, 139))
         font = QFont("Segoe UI", 8)
         painter.setFont(font)
         hotkey_str = self.app.cfg.get("hotkey", "Alt+R") if self.app else "Alt+R"
@@ -219,8 +219,8 @@ class Overlay(QWidget):
         angle = int(-(t * 260) % 360) * 16 # 1/16th of a degree in Qt
         cx, cy, r = 22, 28, 10
         
-        # Dull track circle
-        painter.setPen(QPen(QColor(40, 40, 45), 2.5))
+        # Dull track circle (Light mode soft grey)
+        painter.setPen(QPen(QColor(226, 232, 240), 2.5))
         painter.setBrush(Qt.NoBrush)
         painter.drawEllipse(QPoint(cx, cy), r, r)
         
@@ -232,28 +232,28 @@ class Overlay(QWidget):
         dots = "." * (int(t * 2.5) % 4)
         label = f"Transcribing · {self._lang}{dots}" if self._lang else f"Finalising{dots}"
         
-        painter.setPen(QColor(255, 255, 255))
+        painter.setPen(QColor(15, 23, 42))
         painter.setFont(QFont("Segoe UI", 11, QFont.Bold))
         painter.drawText(42, 25, label)
         
         backend = "Google Cloud" if self.app and self.app.cfg.get("backend") == "google" else "Local AI"
-        painter.setPen(QColor(90, 90, 100))
+        painter.setPen(QColor(100, 116, 139))
         painter.setFont(QFont("Segoe UI", 8))
         painter.drawText(42, 39, f"via {backend}  ·  pasting when ready")
 
-        # Partial Preview Card
+        # Partial Preview Card (Light mode)
         if self._partial:
             preview = self._partial[-55:].lstrip()
             if len(self._partial) > 55:
                 preview = "…" + preview
             
             # Preview box container
-            painter.setPen(QPen(QColor(39, 39, 42), 1))
-            painter.setBrush(QBrush(QColor(18, 18, 20)))
+            painter.setPen(QPen(QColor(226, 232, 240), 1))
+            painter.setBrush(QBrush(QColor(248, 250, 252)))
             painter.drawRoundedRect(QRectF(10, 52, self.W - 20, 36), 6, 6)
             
             # Preview text
-            painter.setPen(QColor(148, 163, 184))
+            painter.setPen(QColor(71, 85, 105))
             painter.setFont(QFont("Segoe UI", 9))
             painter.drawText(18, 74, preview)
 
@@ -263,7 +263,7 @@ class Overlay(QWidget):
         if self._done_error:
             # Circle
             painter.setPen(QPen(QColor(239, 68, 68), 1.5))
-            painter.setBrush(QBrush(QColor(58, 26, 26)))
+            painter.setBrush(QBrush(QColor(254, 242, 242)))
             painter.drawEllipse(QPoint(cx, cy), r, r)
             # Red X lines
             painter.setPen(QPen(QColor(239, 68, 68), 2, Qt.SolidLine, Qt.RoundCap))
@@ -276,13 +276,13 @@ class Overlay(QWidget):
             painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
             painter.drawText(46, self.H // 2 - 2, msg)
             
-            painter.setPen(QColor(115, 115, 125))
+            painter.setPen(QColor(100, 116, 139))
             painter.setFont(QFont("Segoe UI", 8))
             painter.drawText(46, self.H // 2 + 12, "Check Settings → Test Key")
         else:
             # Green checkmark circle
             painter.setPen(QPen(QColor(34, 197, 94), 1.5))
-            painter.setBrush(QBrush(QColor(26, 58, 36)))
+            painter.setBrush(QBrush(QColor(240, 253, 244)))
             painter.drawEllipse(QPoint(cx, cy), r, r)
             # Checkmark lines
             painter.setPen(QPen(QColor(34, 197, 94), 2.5, Qt.SolidLine, Qt.RoundCap))
@@ -290,6 +290,6 @@ class Overlay(QWidget):
             painter.drawLine(cx - 1, cy + 4, cx + 6, cy - 4)
             
             # Text Success
-            painter.setPen(QColor(255, 255, 255))
+            painter.setPen(QColor(15, 23, 42))
             painter.setFont(QFont("Segoe UI", 11, QFont.Bold))
             painter.drawText(46, self.H // 2 + 5, self._done_msg)

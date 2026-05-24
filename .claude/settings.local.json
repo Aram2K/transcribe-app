@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir)",
+      "PowerShell(git clone https://github.com/Aram2K/transcribe-app.git .)"
+    ]
+  }
+}

@@ -19,7 +19,6 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import numpy as np
-import keyboard
 import pyperclip
 import ctypes
 import psutil
@@ -37,7 +36,7 @@ import local_llm
 import telemetry
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.5.36"
+APP_VERSION = "1.5.37"
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
@@ -761,6 +760,7 @@ class AppController(QObject):
         self.kbd = Controller()
         self.is_rec = False
         self._mouse_listener = None
+        self._kbd_listener = None
         
         # Initialize UI Dialog Windows (modularly split!)
         from ui.overlay import Overlay
@@ -777,8 +777,20 @@ class AppController(QObject):
 
         # Apply global hotkey and keyboard loops
         self._setup_hotkey(self.cfg["hotkey"])
-        keyboard.add_hotkey("enter", self._on_enter)
-        keyboard.add_hotkey("esc", self._on_escape)
+        from pynput import keyboard as pynput_keyboard
+        def _on_pynput_press(key):
+            if not self.is_rec:
+                return
+            try:
+                if key == pynput_keyboard.Key.enter:
+                    QTimer.singleShot(0, self._on_enter)
+                elif key == pynput_keyboard.Key.esc:
+                    QTimer.singleShot(0, self._on_escape)
+            except Exception:
+                pass
+        self._general_keyboard_listener = pynput_keyboard.Listener(on_press=_on_pynput_press)
+        self._general_keyboard_listener.daemon = True
+        self._general_keyboard_listener.start()
 
         # Setup System Tray
         self._setup_tray()
@@ -881,7 +893,8 @@ class AppController(QObject):
 
     # ── Hotkeys IPC bindings ─────────────────────────────────────────────────
     def _setup_hotkey(self, hotkey, remove_old=None):
-        old_listener = self._mouse_listener
+        old_mouse = self._mouse_listener
+        old_kbd = getattr(self, "_kbd_listener", None)
         try:
             if hotkey.startswith("mouse:"):
                 from pynput import mouse as pynput_mouse
@@ -900,22 +913,57 @@ class AppController(QObject):
                 new_listener.daemon = True
                 new_listener.start()
                 self._mouse_listener = new_listener
+                if old_kbd:
+                    try: old_kbd.stop()
+                    except Exception: pass
+                    self._kbd_listener = None
             else:
-                keyboard.add_hotkey(hotkey, lambda: QTimer.singleShot(0, self._on_hotkey))
+                from pynput import keyboard as pynput_keyboard
+                def format_pynput_hotkey(hk):
+                    parts = hk.lower().split("+")
+                    formatted = []
+                    for p in parts:
+                        p = p.strip()
+                        if p in ("ctrl", "control"):
+                            formatted.append("<ctrl>")
+                        elif p in ("alt", "option"):
+                            formatted.append("<alt>")
+                        elif p in ("shift",):
+                            formatted.append("<shift>")
+                        elif p in ("win", "super", "cmd", "command"):
+                            formatted.append("<cmd>")
+                        else:
+                            formatted.append(p)
+                    return "+".join(formatted)
+
+                hk_formatted = format_pynput_hotkey(hotkey)
+                new_listener = pynput_keyboard.GlobalHotKeys({
+                    hk_formatted: lambda: QTimer.singleShot(0, self._on_hotkey)
+                })
+                new_listener.daemon = True
+                new_listener.start()
+                self._kbd_listener = new_listener
+                if old_mouse:
+                    try: old_mouse.stop()
+                    except Exception: pass
+                    self._mouse_listener = None
         except Exception as e:
             logger.warning("Could not register hotkey %s: %s", hotkey, e)
             return False
 
         if remove_old and remove_old != hotkey:
             if remove_old.startswith("mouse:"):
-                if old_listener:
-                    try: old_listener.stop()
+                if old_mouse:
+                    try: old_mouse.stop()
                     except Exception: pass
-                    if self._mouse_listener is old_listener:
+                    if self._mouse_listener is old_mouse:
                         self._mouse_listener = None
             else:
-                try: keyboard.remove_hotkey(remove_old)
-                except Exception: pass
+                if old_kbd:
+                    try: old_kbd.stop()
+                    except Exception: pass
+                    if self._kbd_listener is old_kbd:
+                        self._kbd_listener = None
         return True
 
     def apply_tray_bindings(self):

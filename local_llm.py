@@ -17,7 +17,7 @@ MODEL_CATALOG = {
     GEMMA_2B_ID: {
         "label": "Gemma 2 2B Instruct",
         "description": "Google's state-of-the-art 2B model. Highly accurate for reasoning, translation, and summary on modern CPUs.",
-        "repo": "google/gemma-2-2b-it-GGUF",
+        "repo": "bartowski/gemma-2-2b-it-GGUF",
         "filename": "gemma-2-2b-it-Q4_K_M.gguf",
         "size": 1_600_000_000,
         "min_ram": 8,
