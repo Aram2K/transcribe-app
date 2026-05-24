@@ -12,11 +12,27 @@ os.environ["TRANSCRIBE_SKIP_MIGRATION"] = "1"
 
 # ── Stub heavy imports so tests run without GPU / audio hardware ──────────────
 
+class StubMeta(type):
+    def __getattr__(cls, name):
+        return MagicMock()
+
+class StubBase(metaclass=StubMeta):
+    def __init__(self, *args, **kwargs):
+        pass
+    def __getattr__(self, name):
+        return MagicMock()
+
+class StubModule(types.ModuleType):
+    def __init__(self, name, attrs=None):
+        super().__init__(name)
+        if attrs:
+            for k, v in attrs.items():
+                setattr(self, k, v)
+    def __getattr__(self, name):
+        return StubBase
+
 def _stub(name, attrs=None):
-    m = types.ModuleType(name)
-    if attrs:
-        for k, v in attrs.items():
-            setattr(m, k, v)
+    m = StubModule(name, attrs)
     sys.modules[name] = m
     return m
 
@@ -64,41 +80,10 @@ _stub("history",       {"add": MagicMock, "all": MagicMock(return_value=[]),
 _stub("requests",      {"get": MagicMock, "post": MagicMock})
 
 # Stub PySide6
-_core = _stub("PySide6.QtCore", {
-    "Qt": MagicMock,
-    "QTimer": MagicMock,
-    "QObject": MagicMock,
-    "Signal": MagicMock,
-})
-_gui = _stub("PySide6.QtGui", {
-    "QIcon": MagicMock,
-    "QPixmap": MagicMock,
-    "QImage": MagicMock,
-    "QAction": MagicMock,
-    "QFont": MagicMock,
-    "QColor": MagicMock,
-})
-_widgets = _stub("PySide6.QtWidgets", {
-    "QApplication": MagicMock,
-    "QSystemTrayIcon": MagicMock,
-    "QMenu": MagicMock,
-    "QMessageBox": MagicMock,
-    "QDialog": MagicMock,
-    "QWidget": MagicMock,
-    "QVBoxLayout": MagicMock,
-    "QHBoxLayout": MagicMock,
-    "QLabel": MagicMock,
-    "QPushButton": MagicMock,
-    "QComboBox": MagicMock,
-    "QLineEdit": MagicMock,
-    "QTextEdit": MagicMock,
-    "QFrame": MagicMock,
-    "QSplitter": MagicMock,
-    "QProgressBar": MagicMock,
-    "QStackedWidget": MagicMock,
-    "QFileDialog": MagicMock,
-})
-_pyside6 = _stub("PySide6", {})
+_core = _stub("PySide6.QtCore")
+_gui = _stub("PySide6.QtGui")
+_widgets = _stub("PySide6.QtWidgets")
+_pyside6 = _stub("PySide6")
 _pyside6.QtCore = _core
 _pyside6.QtGui = _gui
 _pyside6.QtWidgets = _widgets
