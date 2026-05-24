@@ -24,6 +24,9 @@ class Settings(QDialog):
         super().__init__(parent)
         self.app = main_app
         
+        import copy
+        self.cfg_working = copy.deepcopy(self.app.cfg if self.app else {})
+        
         self.setWindowTitle("Settings")
         self.setMinimumSize(560, 640)
         self.resize(560, 700)
@@ -52,7 +55,91 @@ class Settings(QDialog):
         self._scan_model_statuses()
         
         self._build_ui()
-        self._set_backend_layout(self.app.cfg.get("action_api_provider", "api_openai_compatible") if self.app else "api_openai_compatible")
+        self._set_backend_layout(self.cfg_working.get("action_api_provider", "api_openai_compatible") if self.app else "api_openai_compatible")
+        self._load_values_into_widgets()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        import copy
+        if self.app:
+            self.cfg_working = copy.deepcopy(self.app.cfg)
+        self._scan_model_statuses()
+        self._load_values_into_widgets()
+        for name in list(self.whisper_cards.keys()):
+            self._update_whisper_card_ui(name)
+        for name in list(self.llm_cards.keys()):
+            self._update_llm_card_ui(name)
+
+    def _on_save_clicked(self):
+        if self.app:
+            self.app.cfg.update(self.cfg_working)
+            self.app.save_config()
+            self.app.apply_tray_bindings()
+        self.accept()
+
+    def _load_values_into_widgets(self):
+        # 1. Hotkey
+        hk = self.cfg_working.get("hotkey", "alt+r")
+        self.btn_hotkey.setText(self._fmt_hotkey(None, hk).upper())
+        self.capturing = False
+        self.btn_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; border-color: #3b82f6;")
+        
+        # 2. Spoken Language
+        idx = self.combo_lang.findData(self.cfg_working.get("language", "auto"))
+        if idx >= 0:
+            self.combo_lang.blockSignals(True)
+            self.combo_lang.setCurrentIndex(idx)
+            self.combo_lang.blockSignals(False)
+            
+        # 3. Custom Vocab
+        self.vocab_input.blockSignals(True)
+        self.vocab_input.setPlainText(self.cfg_working.get("initial_prompt", ""))
+        self.vocab_input.blockSignals(False)
+        
+        # 4. Privacy Mode
+        self.chk_privacy.blockSignals(True)
+        self.chk_privacy.setChecked(bool(self.cfg_working.get("privacy_mode", False)))
+        self.chk_privacy.blockSignals(False)
+        
+        # 5. Engine Provider
+        provider = self.cfg_working.get("action_model", "rule_based")
+        import local_llm
+        if provider in (local_llm.QWEN_TINY_ID, local_llm.QWEN_3B_ID, local_llm.QWEN_7B_ID, local_llm.GEMMA_2B_ID):
+            provider = "local_llm"
+        idx = self.combo_engine.findData(provider)
+        if idx >= 0:
+            self.combo_engine.blockSignals(True)
+            self.combo_engine.setCurrentIndex(idx)
+            self.combo_engine.blockSignals(False)
+            
+        # 6. Local Model
+        model = self.cfg_working.get("action_model", local_llm.QWEN_TINY_ID)
+        if model not in local_llm.MODEL_CATALOG:
+            model = local_llm.QWEN_TINY_ID
+        idx = self.combo_local_model.findData(model)
+        if idx >= 0:
+            self.combo_local_model.blockSignals(True)
+            self.combo_local_model.setCurrentIndex(idx)
+            self.combo_local_model.blockSignals(False)
+            
+        # 7. Stack layout based on engine
+        self._set_backend_layout(provider)
+        
+        # 8. Telemetry
+        self.chk_telemetry.blockSignals(True)
+        self.chk_telemetry.setChecked(bool(self.cfg_working.get("analytics_enabled", True)))
+        self.chk_telemetry.blockSignals(False)
+        
+        # 9. About Update button
+        if self.app and self.cfg_working.get("pending_update_version"):
+            tag = self.cfg_working.get("pending_update_version")
+            self.btn_update.setText(f"Install Update {tag}")
+            self.btn_update.setObjectName("primaryButton")
+        else:
+            self.btn_update.setText("Check for Updates")
+            self.btn_update.setObjectName("")
+        self.btn_update.style().unpolish(self.btn_update)
+        self.btn_update.style().polish(self.btn_update)
 
     def _scan_model_statuses(self):
         # Scan whisper models
@@ -82,8 +169,8 @@ class Settings(QDialog):
         self.tabs.addTab(self._create_history_tab(), "History")
         
         about_title = "About"
-        if self.app and self.app.cfg.get("pending_update_version"):
-            about_title = f"About (Update v{self.app.cfg.get('pending_update_version').replace('v', '')}!)"
+        if self.app and self.cfg_working.get("pending_update_version"):
+            about_title = f"About (Update v{self.cfg_working.get('pending_update_version').replace('v', '')}!)"
             
         self.tabs.addTab(self._create_about_tab(), about_title)
         layout.addWidget(self.tabs)
@@ -91,10 +178,16 @@ class Settings(QDialog):
         # Bottom Close Row
         bottom_layout = QHBoxLayout()
         bottom_layout.addStretch()
-        btn_close = QPushButton("Save & Close", self)
-        btn_close.setObjectName("primaryButton")
-        btn_close.clicked.connect(self.accept)
-        bottom_layout.addWidget(btn_close)
+        
+        btn_cancel = QPushButton("Cancel", self)
+        btn_cancel.clicked.connect(self.reject)
+        bottom_layout.addWidget(btn_cancel)
+        
+        btn_save = QPushButton("Save", self)
+        btn_save.setObjectName("primaryButton")
+        btn_save.clicked.connect(self._on_save_clicked)
+        bottom_layout.addWidget(btn_save)
+        
         layout.addLayout(bottom_layout)
 
     # ── TAB 1: General Settings ──────────────────────────────────────────────
@@ -111,7 +204,7 @@ class Settings(QDialog):
         hk_lay = QVBoxLayout(hotkey_frame)
         hk_lay.addWidget(QLabel("Dictation Hotkey", hotkey_frame))
         
-        self.btn_hotkey = QPushButton(self.app.cfg.get("hotkey", "alt+r").upper() if self.app else "ALT+R", hotkey_frame)
+        self.btn_hotkey = QPushButton(self.cfg_working.get("hotkey", "alt+r").upper() if self.app else "ALT+R", hotkey_frame)
         self.btn_hotkey.clicked.connect(self._toggle_capture)
         self.btn_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; border-color: #3b82f6;")
         hk_lay.addWidget(self.btn_hotkey)
@@ -127,7 +220,7 @@ class Settings(QDialog):
         for val, label in LANG_NAMES.items():
             self.combo_lang.addItem(label, val)
         if self.app:
-            idx = self.combo_lang.findData(self.app.cfg.get("language", "auto"))
+            idx = self.combo_lang.findData(self.cfg_working.get("language", "auto"))
             if idx >= 0:
                 self.combo_lang.setCurrentIndex(idx)
         self.combo_lang.currentIndexChanged.connect(self._save_general_configs)
@@ -144,7 +237,7 @@ class Settings(QDialog):
         self.vocab_input.setPlaceholderText("Add names or complex terms (e.g. Aram, Aibuben, PySide6) to guide Whisper's script.")
         self.vocab_input.setMaximumHeight(80)
         if self.app:
-            self.vocab_input.setPlainText(self.app.cfg.get("initial_prompt", ""))
+            self.vocab_input.setPlainText(self.cfg_working.get("initial_prompt", ""))
         self.vocab_input.textChanged.connect(self._save_general_configs)
         vocab_lay.addWidget(self.vocab_input)
         layout.addWidget(vocab_frame)
@@ -152,7 +245,7 @@ class Settings(QDialog):
         # Privacy mode checkbox
         self.chk_privacy = QCheckBox("Privacy Mode (Disable local history, force offline local models)", tab)
         if self.app:
-            self.chk_privacy.setChecked(bool(self.app.cfg.get("privacy_mode", False)))
+            self.chk_privacy.setChecked(bool(self.cfg_working.get("privacy_mode", False)))
         self.chk_privacy.stateChanged.connect(self._save_general_configs)
         layout.addWidget(self.chk_privacy)
 
@@ -186,6 +279,7 @@ class Settings(QDialog):
             card = self._build_whisper_card(name, info)
             self.whisper_cards[name] = card
             scroll_lay.addWidget(card)
+            self._update_whisper_card_ui(name)
             
         scroll.setWidget(scroll_content)
         layout.addWidget(scroll)
@@ -248,8 +342,6 @@ class Settings(QDialog):
         
         card_lay.addLayout(btn_lay)
 
-        # Initialise card widget states
-        self._update_whisper_card_ui(name)
         return card
 
     def _update_whisper_card_ui(self, name):
@@ -259,7 +351,7 @@ class Settings(QDialog):
             
         state = self._model_states.get(name, "missing")
         is_active = False
-        if self.app and self.app.cfg.get("whisper_model") == name:
+        if self.app and self.cfg_working.get("whisper_model") == name:
             is_active = True
         
         # Configure matching visuals
@@ -420,6 +512,7 @@ class Settings(QDialog):
             card = self._build_llm_card(name, info)
             self.llm_cards[name] = card
             llm_s_lay.addWidget(card)
+            self._update_llm_card_ui(name)
             
         self.llm_scroll.setWidget(llm_scroll_content)
         lay_llm.addWidget(self.llm_scroll)
@@ -489,8 +582,6 @@ class Settings(QDialog):
         
         card_lay.addLayout(btn_lay)
 
-        # Render states
-        self._update_llm_card_ui(name)
         return card
 
     def _update_llm_card_ui(self, name):
@@ -500,7 +591,7 @@ class Settings(QDialog):
             
         state = self._local_llm_states.get(name, "missing")
         is_active = False
-        if self.app and self.app.cfg.get("action_model") == name:
+        if self.app and self.cfg_working.get("action_model") == name:
             is_active = True
         
         if state == "downloaded":
@@ -553,51 +644,53 @@ class Settings(QDialog):
     def _on_local_llm_model_changed(self, idx):
         model_id = self.combo_local_model.itemData(idx)
         if self.app:
-            self.app.cfg["action_model"] = model_id
-            self.app.save_config()
+            self.cfg_working["action_model"] = model_id
 
     def _set_backend_layout(self, provider):
         if provider == actions.RULE_BASED_ID:
             self.engine_stack.setCurrentIndex(0)
         elif provider == "local_llm":
             self.engine_stack.setCurrentIndex(2)
-            # Make sure list shows matching card
             self.llm_scroll.setVisible(True)
-        else: # Cloud APIs (OpenAI, Gemini, Anthropic)
+        else:
             self.engine_stack.setCurrentIndex(1)
             
-            # Configure placeholders & custom labels for specific provider details
+            # Block signals to prevent cascade updates during text entry
+            self.cloud_api_key.blockSignals(True)
+            self.cloud_api_url.blockSignals(True)
+            self.cloud_api_model.blockSignals(True)
+            
             if provider == actions.API_GEMINI_ID:
                 self.lbl_cloud_url.setVisible(False)
                 self.cloud_api_url.setVisible(False)
                 self.cloud_api_model.setPlaceholderText("gemini-1.5-flash")
-                if self.app:
-                    self.cloud_api_key.setText(self.app.cfg.get("google_api_key", ""))
-                    self.cloud_api_model.setText(self.app.cfg.get("action_api_model", "") or "gemini-1.5-flash")
+                self.cloud_api_key.setText(self.cfg_working.get("google_api_key", ""))
+                self.cloud_api_model.setText(self.cfg_working.get("action_api_model", "") or "gemini-1.5-flash")
             elif provider == actions.API_ANTHROPIC_ID:
                 self.lbl_cloud_url.setVisible(False)
                 self.cloud_api_url.setVisible(False)
                 self.cloud_api_model.setPlaceholderText("claude-3-haiku-20240307")
-                if self.app:
-                    self.cloud_api_key.setText(self.app.cfg.get("action_api_key", ""))
-                    self.cloud_api_model.setText(self.app.cfg.get("action_api_model", "") or "claude-3-haiku-20240307")
+                self.cloud_api_key.setText(self.cfg_working.get("action_api_key", ""))
+                self.cloud_api_model.setText(self.cfg_working.get("action_api_model", "") or "claude-3-haiku-20240307")
             else: # OpenAI
                 self.lbl_cloud_url.setVisible(True)
                 self.cloud_api_url.setVisible(True)
                 self.cloud_api_url.setPlaceholderText("https://api.openai.com/v1")
                 self.cloud_api_model.setPlaceholderText("gpt-4o-mini")
-                if self.app:
-                    self.cloud_api_key.setText(self.app.cfg.get("action_api_key", ""))
-                    self.cloud_api_url.setText(self.app.cfg.get("action_api_base_url", ""))
-                    self.cloud_api_model.setText(self.app.cfg.get("action_api_model", ""))
+                self.cloud_api_key.setText(self.cfg_working.get("action_api_key", ""))
+                self.cloud_api_url.setText(self.cfg_working.get("action_api_base_url", ""))
+                self.cloud_api_model.setText(self.cfg_working.get("action_api_model", ""))
+                
+            self.cloud_api_key.blockSignals(False)
+            self.cloud_api_url.blockSignals(False)
+            self.cloud_api_model.blockSignals(False)
 
     def _save_general_configs(self):
         if not self.app:
             return
-        self.app.cfg["language"] = self.combo_lang.currentData()
-        self.app.cfg["initial_prompt"] = self.vocab_input.toPlainText().strip()
-        self.app.cfg["privacy_mode"] = self.chk_privacy.isChecked()
-        self.app.save_config()
+        self.cfg_working["language"] = self.combo_lang.currentData()
+        self.cfg_working["initial_prompt"] = self.vocab_input.toPlainText().strip()
+        self.cfg_working["privacy_mode"] = self.chk_privacy.isChecked()
 
     def _save_action_configs(self):
         if not self.app:
@@ -605,23 +698,21 @@ class Settings(QDialog):
         provider = self.combo_engine.currentData()
         
         if provider == "local_llm":
-            self.app.cfg["action_model"] = self.combo_local_model.currentData()
+            self.cfg_working["action_model"] = self.combo_local_model.currentData()
         elif provider == actions.RULE_BASED_ID:
-            self.app.cfg["action_model"] = actions.RULE_BASED_ID
+            self.cfg_working["action_model"] = actions.RULE_BASED_ID
         else: # Cloud API config saving
-            self.app.cfg["action_model"] = provider
+            self.cfg_working["action_model"] = provider
             key_text = self.cloud_api_key.text().strip()
             
             if provider == actions.API_GEMINI_ID:
-                self.app.cfg["google_api_key"] = key_text
+                self.cfg_working["google_api_key"] = key_text
             else:
-                self.app.cfg["action_api_key"] = key_text
-                self.app.cfg["action_api_base_url"] = self.cloud_api_url.text().strip()
+                self.cfg_working["action_api_key"] = key_text
+                self.cfg_working["action_api_base_url"] = self.cloud_api_url.text().strip()
                 
-            self.app.cfg["action_api_model"] = self.cloud_api_model.text().strip()
-            self.app.cfg["action_api_provider"] = action_api.normalize_provider(provider)
-            
-        self.app.save_config()
+            self.cfg_working["action_api_model"] = self.cloud_api_model.text().strip()
+            self.cfg_working["action_api_provider"] = action_api.normalize_provider(provider)
 
     # ── TAB 4: History & Telemetry ───────────────────────────────────────────
     def _create_history_tab(self):
@@ -691,8 +782,7 @@ class Settings(QDialog):
     def _save_telemetry_config(self):
         if not self.app:
             return
-        self.app.cfg["analytics_enabled"] = self.chk_telemetry.isChecked()
-        self.app.save_config()
+        self.cfg_working["analytics_enabled"] = self.chk_telemetry.isChecked()
 
     # ── TAB 5: About & Updates ───────────────────────────────────────────────
     def _create_about_tab(self):
@@ -729,8 +819,8 @@ class Settings(QDialog):
 
         # Update checking button
         self.btn_update = QPushButton("Check for Updates", tab)
-        if self.app and self.app.cfg.get("pending_update_version"):
-            tag = self.app.cfg.get("pending_update_version")
+        if self.app and self.cfg_working.get("pending_update_version"):
+            tag = self.cfg_working.get("pending_update_version")
             self.btn_update.setText(f"Install Update {tag}")
             self.btn_update.setObjectName("primaryButton")
         self.btn_update.clicked.connect(self._check_for_updates)
@@ -740,8 +830,8 @@ class Settings(QDialog):
         return tab
 
     def _check_for_updates(self):
-        if self.app and self.app.cfg.get("pending_update_version"):
-            tag = self.app.cfg.get("pending_update_version")
+        if self.app and self.cfg_working.get("pending_update_version"):
+            tag = self.cfg_working.get("pending_update_version")
             self._on_download_finished("update", f"available:{tag}")
             return
 
@@ -776,8 +866,7 @@ class Settings(QDialog):
     def _download_whisper(self, name):
         if self._model_states.get(name) == "downloaded":
             if self.app:
-                self.app.cfg["whisper_model"] = name
-                self.app.save_config()
+                self.cfg_working["whisper_model"] = name
             for m_name in list(self.whisper_cards.keys()):
                 self._update_whisper_card_ui(m_name)
             return
@@ -821,8 +910,7 @@ class Settings(QDialog):
     def _download_llm(self, name):
         if self._local_llm_states.get(name) == "downloaded":
             if self.app:
-                self.app.cfg["action_model"] = name
-                self.app.save_config()
+                self.cfg_working["action_model"] = name
             if hasattr(self, "combo_local_model"):
                 idx = self.combo_local_model.findData(name)
                 if idx >= 0:
@@ -952,8 +1040,7 @@ class Settings(QDialog):
             self._update_llm_card_ui(name)
             if state == "downloaded":
                 if self.app:
-                    self.app.cfg["action_model"] = name
-                    self.app.save_config()
+                    self.cfg_working["action_model"] = name
                 # Select it in combo
                 idx = self.combo_local_model.findData(name)
                 if idx >= 0:
@@ -964,15 +1051,14 @@ class Settings(QDialog):
             self._update_whisper_card_ui(model_name)
             if state == "downloaded":
                 if self.app:
-                    self.app.cfg["whisper_model"] = model_name
-                    self.app.save_config()
+                    self.cfg_working["whisper_model"] = model_name
                 QMessageBox.information(self, "Download Complete", f"Whisper {model_name.upper()} model is ready for local offline dictation!")
 
     # ── Hotkey Capturing Logic ───────────────────────────────────────────────
     def _toggle_capture(self):
         if self.capturing:
             self.capturing = False
-            self.btn_hotkey.setText(self.app.cfg.get("hotkey", "alt+r").upper() if self.app else "ALT+R")
+            self.btn_hotkey.setText(self.cfg_working.get("hotkey", "alt+r").upper() if self.app else "ALT+R")
             self.btn_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; border-color: #3b82f6;")
         else:
             self.capturing = True
@@ -1037,9 +1123,7 @@ class Settings(QDialog):
         hotkey_str = "+".join(mods + [key_str])
         
         if self.app:
-            self.app.cfg["hotkey"] = hotkey_str
-            self.app.save_config()
-            self.app.apply_tray_bindings()
+            self.cfg_working["hotkey"] = hotkey_str
             
         self.capturing = False
         self.btn_hotkey.setText(hotkey_str.upper())

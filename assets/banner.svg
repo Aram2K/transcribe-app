@@ -1,24 +1,40 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="820" height="200" viewBox="0 0 820 200">
 
+  <defs>
+    <!-- Armenian Flag Linear Gradient -->
+    <linearGradient id="armeniaGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#D90012"/>
+      <stop offset="33%" stop-color="#D90012"/>
+      <stop offset="33%" stop-color="#0033A0"/>
+      <stop offset="66%" stop-color="#0033A0"/>
+      <stop offset="66%" stop-color="#F2A800"/>
+      <stop offset="100%" stop-color="#F2A800"/>
+    </linearGradient>
+  </defs>
+
   <!-- Background -->
   <rect width="820" height="200" fill="#0d0d0d"/>
 
-  <!-- Subtle top border -->
-  <rect width="820" height="2" fill="#3b82f6" opacity="0.8"/>
+  <!-- Subtle top tricolor border -->
+  <rect x="0" y="0" width="273" height="2" fill="#D90012" opacity="0.8"/>
+  <rect x="273" y="0" width="274" height="2" fill="#0033A0" opacity="0.8"/>
+  <rect x="547" y="0" width="273" height="2" fill="#F2A800" opacity="0.8"/>
 
-  <!-- Blue accent left bar -->
-  <rect x="0" y="0" width="4" height="200" fill="#3b82f6"/>
+  <!-- Armenian Tricolor Left Bar -->
+  <rect x="0" y="0" width="4" height="66" fill="#D90012"/>
+  <rect x="0" y="66" width="4" height="68" fill="#0033A0"/>
+  <rect x="0" y="134" width="4" height="66" fill="#F2A800"/>
 
   <!-- ── Mic icon ── -->
   <!-- Outer glow circle -->
   <circle cx="90" cy="100" r="52" fill="#0f172a"/>
   <circle cx="90" cy="100" r="50" fill="none" stroke="#1e3a5f" stroke-width="1.5"/>
 
-  <!-- Mic capsule -->
-  <rect x="79" y="62" width="22" height="44" rx="11" fill="#3b82f6"/>
+  <!-- Mic capsule filled with Armenian Tricolor -->
+  <rect x="79" y="62" width="22" height="44" rx="11" fill="url(#armeniaGrad)"/>
 
   <!-- Mic highlight -->
-  <rect x="82" y="66" width="7" height="14" rx="3.5" fill="#93c5fd" opacity="0.5"/>
+  <rect x="82" y="66" width="7" height="14" rx="3.5" fill="#ffffff" opacity="0.4"/>
 
   <!-- Mic stand arc -->
   <path d="M 66 100 Q 66 126 90 126 Q 114 126 114 100"
@@ -37,7 +53,7 @@
   <!-- Tagline -->
   <text x="163" y="118"
         font-family="Arial, Helvetica, sans-serif"
-        font-size="16" fill="#94a3b8">Press a key&#160;&#160;·&#160;&#160;Speak&#160;&#160;·&#160;&#160;Text appears — anywhere on your screen</text>
+        font-size="15" fill="#94a3b8">🇦🇲 Armenian-first&#160;&#160;·&#160;&#160;⚡ 100% Offline AI&#160;&#160;·&#160;&#160;🎙 Private Dictation &amp; Summaries</text>
 
   <!-- ── Waveform bars ── -->
   <g transform="translate(162, 170)">
@@ -127,7 +143,7 @@
   <!-- Offline -->
   <rect x="596" y="82" width="100" height="26" rx="5" fill="#1e293b"/>
   <text x="646" y="99" font-family="Arial, Helvetica, sans-serif" font-size="12"
-        fill="#94a3b8" text-anchor="middle">⚡ Offline</text>
+        fill="#94a3b8" text-anchor="middle">⚡ 100% Offline</text>
 
   <!-- Free -->
   <rect x="706" y="82" width="94" height="26" rx="5" fill="#14532d"/>
@@ -137,6 +153,6 @@
   <!-- Armenian -->
   <rect x="596" y="116" width="204" height="26" rx="5" fill="#1e293b"/>
   <text x="698" y="133" font-family="Arial, Helvetica, sans-serif" font-size="12"
-        fill="#94a3b8" text-anchor="middle">🌐 Armenian · English · Russian</text>
+        fill="#94a3b8" text-anchor="middle">🇦🇲 Armenian Pro Optimized</text>
 
 </svg>
