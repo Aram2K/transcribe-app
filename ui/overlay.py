@@ -2,7 +2,7 @@
 
 import math
 import time
-from PySide6.QtCore import Qt, QTimer, QRectF, QPoint
+from PySide6.QtCore import Qt, QTimer, QRectF, QPoint, Signal
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QPainterPath
 from PySide6.QtWidgets import QWidget, QApplication
 
@@ -14,9 +14,16 @@ DONE = "done"
 class Overlay(QWidget):
     W, H = 340, 96
 
+    # Cross-thread invoker: emit to dispatch a callable onto the Qt main thread.
+    # QueuedConnection guarantees the slot runs on this QObject's owning thread
+    # regardless of which thread emits — so worker threads (audio recorder,
+    # transcription thread) can safely update UI state.
+    _invoke = Signal(object)
+
     def __init__(self, main_app=None):
         super().__init__()
         self.app = main_app
+        self._invoke.connect(self._run_callable, Qt.QueuedConnection)
         
         # Transparent, frameless overlay setup
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.SubWindow)
@@ -94,8 +101,16 @@ class Overlay(QWidget):
         self._hide_at = time.time() + 4.0
 
     def call_soon(self, func, *args, **kwargs):
-        # PySide6 handles cross-thread UI updates safely if we schedule it via QTimer.singleShot
-        QTimer.singleShot(0, lambda: func(*args, **kwargs))
+        # Marshal onto Qt main thread via Signal — works reliably from any
+        # thread. (QTimer.singleShot from a non-Qt thread is documented
+        # thread-unsafe and was silently dropping calls.)
+        self._invoke.emit(lambda: func(*args, **kwargs))
+
+    def _run_callable(self, fn):
+        try:
+            fn()
+        except Exception:
+            pass
 
     def _loop(self):
         # Auto-hide timer

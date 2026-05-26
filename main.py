@@ -36,7 +36,7 @@ import local_llm
 import telemetry
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.5.41"
+APP_VERSION = "1.5.42"
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
@@ -412,6 +412,10 @@ class AudioRecorder:
         self._chunk_errors    = []
         self._chunk_silence_before = {}
         self._record_error    = ""
+        # Rolling peak amplitude for adaptive bar normalization. Decays slowly
+        # so bars stay calibrated to recent mic activity (handles mics with
+        # very different gain levels — laptop mic vs. headset vs. far-field).
+        self._level_peak      = 0.05
 
     def load_model(self, name=None):
         name = name or cfg["whisper_model"]
@@ -439,6 +443,7 @@ class AudioRecorder:
         self._session_lang  = None
         self._chunk_threads = []
         self._record_error  = ""
+        self._level_peak    = 0.05
         
         open_args = {
             "format": pyaudio.paFloat32,
@@ -482,8 +487,22 @@ class AudioRecorder:
                 is_speech  = rms > threshold
 
                 if self.on_levels:
+                    # Auto-normalize: track rolling peak amplitude so bars
+                    # adapt to whatever mic gain the user has. Loud speech
+                    # fills the bars, quiet speech still produces visible
+                    # motion. Peak decays ~halves every 5s of silence so
+                    # bars recalibrate if mic gain changes.
+                    peak_now = float(np.abs(arr).max()) if len(arr) > 0 else 0.0
+                    if peak_now > self._level_peak:
+                        self._level_peak = peak_now
+                    else:
+                        self._level_peak = max(0.01, self._level_peak * 0.995)
+                    # Use 0.7 * peak as the "full bar" reference — leaves
+                    # headroom so transient loud sounds visibly spike past
+                    # normal speech levels.
+                    scale = max(0.01, self._level_peak * 0.7)
                     n, sz  = 20, max(len(arr) // 20, 1)
-                    levels = [min(float(np.abs(arr[i*sz:(i+1)*sz]).mean()) * 20, 1.0)
+                    levels = [min(float(np.abs(arr[i*sz:(i+1)*sz]).mean()) / scale, 1.0)
                               for i in range(n)]
                     self.on_levels(levels)
 
@@ -765,15 +784,24 @@ def make_qicon(color="#3b82f6"):
 
 # ── Main PySide6 Application Controller ───────────────────────────────────────
 class AppController(QObject):
+    # Cross-thread Signals — emitted from background hotkey-listener threads
+    # (keyboard lib / pynput) and delivered on the Qt main thread via
+    # QueuedConnection. Avoids QTimer.singleShot from non-Qt threads, which
+    # silently no-ops because those threads have no Qt event loop.
+    sig_hotkey = Signal()
+    sig_enter = Signal()
+    sig_escape = Signal()
+    sig_update_available = Signal(str)  # tag of newer version
+
     def __init__(self, qapp):
         super().__init__()
         self.qapp = qapp
         self.cfg = cfg
-        
+
         # Load stylesheet
         from ui.styles import STYLESHEET
         self.style_content = STYLESHEET
-        
+
         # Setup pure business Audio Recorder
         self.recorder = AudioRecorder()
         self.recorder.on_levels = self._on_levels
@@ -784,6 +812,8 @@ class AppController(QObject):
         self.is_rec = False
         self._mouse_listener = None
         self._kbd_listener = None
+        self._registered_kbd_hotkey = None
+        self._transient_kbd_handles = []
         
         # Initialize UI Dialog Windows (modularly split!)
         from ui.overlay import Overlay
@@ -798,63 +828,17 @@ class AppController(QObject):
         self.meetings_win = MeetingsWindow(main_app=self)
         self.onboarding_win = Onboarding(main_app=self)
 
-        # Apply global hotkey and keyboard loops
-        self._pressed_keys = set()
-        self._hk_modifiers = []
-        self._hk_key = None
+        # Wire Signals to main-thread handlers. QueuedConnection guarantees the
+        # slot runs on this QObject's owning thread (the Qt main thread),
+        # regardless of which thread emits the signal.
+        self.sig_hotkey.connect(self._on_hotkey, Qt.QueuedConnection)
+        self.sig_enter.connect(self._on_enter, Qt.QueuedConnection)
+        self.sig_escape.connect(self._on_escape, Qt.QueuedConnection)
+        self.sig_update_available.connect(self._prompt_update, Qt.QueuedConnection)
+        self._update_prompt_open = False
+
+        # Register the configured hotkey (keyboard combo or mouse button).
         self._setup_hotkey(self.cfg["hotkey"])
-        
-        from pynput import keyboard as pynput_keyboard
-        def _on_pynput_press(key):
-            try:
-                self._pressed_keys.add(key)
-                
-                # Modifier mappings
-                pressed_modifiers = []
-                for k in self._pressed_keys:
-                    if k in (pynput_keyboard.Key.alt, pynput_keyboard.Key.alt_l, pynput_keyboard.Key.alt_r):
-                        pressed_modifiers.append("alt")
-                    elif k in (pynput_keyboard.Key.ctrl, pynput_keyboard.Key.ctrl_l, pynput_keyboard.Key.ctrl_r):
-                        pressed_modifiers.append("ctrl")
-                    elif k in (pynput_keyboard.Key.shift, pynput_keyboard.Key.shift_l, pynput_keyboard.Key.shift_r):
-                        pressed_modifiers.append("shift")
-                    elif k in (pynput_keyboard.Key.cmd, pynput_keyboard.Key.cmd_l, pynput_keyboard.Key.cmd_r):
-                        pressed_modifiers.append("win")
-                
-                # Check main key
-                key_pressed = False
-                if self._hk_key:
-                    for k in self._pressed_keys:
-                        if hasattr(k, 'char') and k.char and k.char.lower() == self._hk_key:
-                            key_pressed = True
-                        elif hasattr(k, 'name') and k.name and k.name.lower() == self._hk_key:
-                            key_pressed = True
-                
-                # Match global hotkey
-                mods_match = all(m in pressed_modifiers for m in self._hk_modifiers) if self._hk_modifiers else True
-                if self._hk_key and mods_match and key_pressed:
-                    self._pressed_keys.clear()
-                    QTimer.singleShot(0, self._on_hotkey)
-                    return
-                
-                # Recording controls (Enter/Esc)
-                if self.is_rec:
-                    if key == pynput_keyboard.Key.enter:
-                        QTimer.singleShot(0, self._on_enter)
-                    elif key == pynput_keyboard.Key.esc:
-                        QTimer.singleShot(0, self._on_escape)
-            except Exception:
-                pass
-
-        def _on_pynput_release(key):
-            try:
-                self._pressed_keys.discard(key)
-            except Exception:
-                pass
-
-        self._general_keyboard_listener = pynput_keyboard.Listener(on_press=_on_pynput_press, on_release=_on_pynput_release)
-        self._general_keyboard_listener.daemon = True
-        self._general_keyboard_listener.start()
 
         # Setup System Tray
         self._setup_tray()
@@ -876,6 +860,13 @@ class AppController(QObject):
         # Onboarding wizard trigger on first launch
         if not self.cfg.get("onboarding_done", False):
             QTimer.singleShot(500, self.show_onboarding)
+
+        # If a previous session already detected an update, prompt at startup
+        # immediately — don't wait for the network check to confirm. (The
+        # background check still runs and will clear the flag if no update.)
+        cached_pending = self.cfg.get("pending_update_version", "")
+        if cached_pending and self.cfg.get("onboarding_done", False):
+            QTimer.singleShot(1500, lambda: self.sig_update_available.emit(cached_pending))
 
     def _setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
@@ -931,26 +922,71 @@ class AppController(QObject):
             if resp.status_code == 200:
                 data = resp.json()
                 tag = data.get("tag_name", "")
-                
+
                 from main import _parse_version
                 if tag and _parse_version(tag) > _parse_version(APP_VERSION):
                     self.cfg["pending_update_version"] = tag
                     self.save_config()
-                    
-                    # Notify the user on the main thread via system tray message
-                    QTimer.singleShot(5000, lambda: self.tray_icon.showMessage(
-                        "Update Available",
-                        f"A new version ({tag}) of Transcribe is available!\n"
-                        "Open Settings -> About to download and apply.",
-                        QSystemTrayIcon.Information,
-                        10000
-                    ))
+                    # Emit signal — handled on main thread via QueuedConnection.
+                    self.sig_update_available.emit(tag)
                 else:
                     if self.cfg.get("pending_update_version"):
                         self.cfg["pending_update_version"] = ""
                         self.save_config()
         except Exception as e:
             logger.debug("Background update check failed: %s", e)
+
+    def _prompt_update(self, tag):
+        # Runs on Qt main thread. Pops up a modal asking the user to install
+        # the new version. Reentrancy guard so a second emit (e.g. another
+        # transcription finishes while the dialog is open) doesn't stack popups.
+        if self._update_prompt_open:
+            return
+        if not tag:
+            return
+        # Skip if user is mid-recording — don't interrupt them.
+        if self.is_rec:
+            return
+        self._update_prompt_open = True
+        try:
+            reply = QMessageBox.question(
+                None, "Transcribe — Update Available",
+                f"A new version ({tag}) is available.\n"
+                f"You are running v{APP_VERSION}.\n\n"
+                "Install update now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                threading.Thread(
+                    target=self._download_and_install_update,
+                    args=(tag,), daemon=True,
+                ).start()
+        finally:
+            self._update_prompt_open = False
+
+    def _download_and_install_update(self, tag):
+        # Background-thread installer fetch. Identical to the Settings → About
+        # button flow, lifted here so the popup works without the user
+        # opening Settings first.
+        import urllib.request, tempfile, shutil, os
+        try:
+            setup_url = (
+                f"{PROJECT_GITHUB_URL}/releases/download/{tag}/"
+                "TranscribeApp-Windows-Setup.exe"
+            )
+            dest_path = os.path.join(tempfile.gettempdir(), "TranscribeApp-Windows-Setup.exe")
+            req = urllib.request.Request(setup_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req) as response:
+                with open(dest_path, "wb") as out_file:
+                    shutil.copyfileobj(response, out_file)
+            os.startfile(dest_path)
+            self.cfg["pending_update_version"] = ""
+            self.save_config()
+            # Give the installer a moment to launch before we exit.
+            time.sleep(1.5)
+            QTimer.singleShot(0, self.qapp.quit)
+        except Exception as e:
+            logger.warning("Update download failed: %s", e)
 
     # ── Modular Window Surface Triggers (Main thread-safe wrappers) ──
     def show_settings(self):
@@ -986,9 +1022,20 @@ class AppController(QObject):
         if hasattr(self.meetings_win, "txt_summary"):
             self.meetings_win.setStyleSheet(self.style_content)
 
-    # ── Hotkeys IPC bindings ─────────────────────────────────────────────────
+    # ── Hotkeys ──────────────────────────────────────────────────────────────
+    # The dictation hotkey can be either a keyboard combo ("alt+r") or a mouse
+    # button ("mouse:middle"). We use the `keyboard` library on Windows for
+    # keyboard combos because it uses a proven low-level hook (the same one
+    # that worked in earlier Tkinter releases). On macOS/Linux we fall back to
+    # pynput's GlobalHotKeys. Mouse always goes through pynput.
+    #
+    # All listeners emit `sig_hotkey` rather than calling handlers directly,
+    # so the work is marshalled onto the Qt main thread safely.
     def _setup_hotkey(self, hotkey, remove_old=None):
-        old_mouse = self._mouse_listener
+        # Tear down any previous registration before installing the new one.
+        self._unregister_kbd_hotkey()
+        self._unregister_mouse_listener()
+
         try:
             if hotkey.startswith("mouse:"):
                 from pynput import mouse as pynput_mouse
@@ -1000,45 +1047,87 @@ class AppController(QObject):
                     "x2":     pynput_mouse.Button.x2,
                 }
                 target = btn_map.get(hotkey.split(":")[1], pynput_mouse.Button.middle)
+
                 def _on_click(x, y, btn, pressed):
                     if pressed and btn == target:
-                        QTimer.singleShot(0, self._on_hotkey)
-                new_listener = pynput_mouse.Listener(on_click=_on_click)
-                new_listener.daemon = True
-                new_listener.start()
-                self._mouse_listener = new_listener
-                self._hk_key = None
-                self._hk_modifiers = []
+                        self.sig_hotkey.emit()
+
+                listener = pynput_mouse.Listener(on_click=_on_click)
+                listener.daemon = True
+                listener.start()
+                self._mouse_listener = listener
+                logger.info("Registered mouse hotkey: %s", hotkey)
+            elif sys.platform == "win32":
+                import keyboard as kbd_lib
+                # `keyboard` accepts the same "alt+r" / "ctrl+shift+space"
+                # syntax we already produce in settings.py.
+                kbd_lib.add_hotkey(
+                    hotkey,
+                    lambda: self.sig_hotkey.emit(),
+                    suppress=False,
+                    trigger_on_release=False,
+                )
+                self._registered_kbd_hotkey = hotkey
+                logger.info("Registered keyboard hotkey: %s", hotkey)
             else:
-                if old_mouse:
-                    try: old_mouse.stop()
-                    except Exception: pass
-                    self._mouse_listener = None
-                
-                # Parse keyboard hotkey into modifiers and key
-                hk = hotkey.lower()
-                self._hk_modifiers = []
-                self._hk_key = None
-                for part in hk.split("+"):
-                    part = part.strip()
-                    if part in ("alt", "option"):
-                        self._hk_modifiers.append("alt")
-                    elif part in ("ctrl", "control"):
-                        self._hk_modifiers.append("ctrl")
-                    elif part in ("shift",):
-                        self._hk_modifiers.append("shift")
-                    elif part in ("win", "super", "cmd"):
-                        self._hk_modifiers.append("win")
-                    else:
-                        self._hk_key = part
+                # macOS / Linux: pynput GlobalHotKeys (handles modifier tracking
+                # internally — more robust than a custom Listener).
+                from pynput import keyboard as pynput_keyboard
+                listener = pynput_keyboard.GlobalHotKeys({
+                    self._to_pynput_hotkey(hotkey): lambda: self.sig_hotkey.emit(),
+                })
+                listener.daemon = True
+                listener.start()
+                self._kbd_listener = listener
+                logger.info("Registered keyboard hotkey (pynput): %s", hotkey)
         except Exception as e:
             logger.warning("Could not register hotkey %s: %s", hotkey, e)
             return False
         return True
 
+    def _unregister_kbd_hotkey(self):
+        if self._registered_kbd_hotkey is not None:
+            try:
+                import keyboard as kbd_lib
+                kbd_lib.remove_hotkey(self._registered_kbd_hotkey)
+            except Exception:
+                pass
+            self._registered_kbd_hotkey = None
+        if self._kbd_listener is not None:
+            try:
+                self._kbd_listener.stop()
+            except Exception:
+                pass
+            self._kbd_listener = None
+
+    def _unregister_mouse_listener(self):
+        if self._mouse_listener is not None:
+            try:
+                self._mouse_listener.stop()
+            except Exception:
+                pass
+            self._mouse_listener = None
+
+    @staticmethod
+    def _to_pynput_hotkey(hotkey):
+        # "alt+shift+r" -> "<alt>+<shift>+r" for pynput.GlobalHotKeys
+        parts = []
+        for p in hotkey.lower().split("+"):
+            p = p.strip()
+            if p in ("ctrl", "control"):
+                parts.append("<ctrl>")
+            elif p in ("alt", "option"):
+                parts.append("<alt>")
+            elif p == "shift":
+                parts.append("<shift>")
+            elif p in ("win", "super", "cmd", "command"):
+                parts.append("<cmd>")
+            else:
+                parts.append(p)
+        return "+".join(parts)
+
     def apply_tray_bindings(self):
-        old_hk = self.cfg.get("hotkey", "alt+r")
-        self._setup_hotkey(self.cfg["hotkey"], remove_old=old_hk)
+        self._setup_hotkey(self.cfg["hotkey"])
 
     # ── Event Callbacks ──
     def _on_levels(self, levels):
@@ -1051,16 +1140,19 @@ class AppController(QObject):
         self.overlay.call_soon(self.overlay.set_partial, text)
 
     def _on_hotkey(self):
+        logger.info("[main] _on_hotkey fired (is_rec=%s)", self.is_rec)
         if not self.is_rec:
             self._start()
         else:
             threading.Thread(target=self._stop, daemon=True).start()
 
     def _on_enter(self):
+        logger.info("[main] _on_enter fired (is_rec=%s)", self.is_rec)
         if self.is_rec:
             threading.Thread(target=self._stop, daemon=True).start()
 
     def _on_escape(self):
+        logger.info("[main] _on_escape fired (is_rec=%s)", self.is_rec)
         if self.is_rec:
             threading.Thread(target=self._cancel, daemon=True).start()
 
@@ -1073,7 +1165,8 @@ class AppController(QObject):
             from ui.overlay import RECORDING
             self.overlay.show_overlay(RECORDING)
             self.recorder.start_recording()
-            
+            self._register_transient_keys()
+
             if self.cfg["backend"] == "local":
                 threading.Thread(
                     target=self.recorder.load_model,
@@ -1081,15 +1174,57 @@ class AppController(QObject):
                 ).start()
         except Exception as e:
             self.is_rec = False
+            self._unregister_transient_keys()
             self.overlay.show_error(f"Microphone error: {e}")
 
     def _cancel(self):
         self.recorder.stop_recording()
         self.is_rec = False
+        self._unregister_transient_keys()
         self.overlay.call_soon(self.overlay.hide_overlay)
+
+    def _register_transient_keys(self):
+        # Enter (stop) and Esc (cancel) are only meaningful while recording.
+        # Use a pynput Listener — we confirmed in the logs that pynput reliably
+        # receives plain Enter/Esc events on Windows, while the `keyboard`
+        # library's on_press_key callback wasn't firing for those keys when
+        # another hotkey was already registered with add_hotkey.
+        self._unregister_transient_keys()
+        try:
+            from pynput import keyboard as pynput_keyboard
+
+            def _on_press(key):
+                try:
+                    if key == pynput_keyboard.Key.enter:
+                        logger.info("[hook] Enter pressed, is_rec=%s", self.is_rec)
+                        if self.is_rec:
+                            self.sig_enter.emit()
+                    elif key == pynput_keyboard.Key.esc:
+                        logger.info("[hook] Esc pressed, is_rec=%s", self.is_rec)
+                        if self.is_rec:
+                            self.sig_escape.emit()
+                except Exception:
+                    pass
+
+            listener = pynput_keyboard.Listener(on_press=_on_press)
+            listener.daemon = True
+            listener.start()
+            self._transient_kbd_handles.append(listener)
+            logger.info("Registered transient Enter/Esc listener")
+        except Exception as e:
+            logger.warning("Could not register enter/esc listener: %s", e)
+
+    def _unregister_transient_keys(self):
+        for h in self._transient_kbd_handles:
+            try:
+                h.stop()
+            except Exception:
+                pass
+        self._transient_kbd_handles = []
 
     def _stop(self):
         self.recorder.stop_recording()
+        self._unregister_transient_keys()
         from ui.overlay import TRANSCRIBING
         self.overlay.call_soon(self.overlay.set_state, TRANSCRIBING)
 
@@ -1202,6 +1337,13 @@ class AppController(QObject):
 
         self.overlay.call_soon(self.overlay.show_done, pasted)
 
+        # After a finished transcription, nudge the user about a pending update.
+        # Wait until the "done" overlay has had time to show before popping up.
+        pending = self.cfg.get("pending_update_version", "")
+        if pending:
+            time.sleep(2.5)
+            self.sig_update_available.emit(pending)
+
     def paste_text(self, text):
         # Triggers cursor paste for clicked history logs
         pyperclip.copy(text)
@@ -1215,9 +1357,9 @@ class AppController(QObject):
 
     def quit_app(self):
         # Graceful shutdown of system hooks
-        if self._mouse_listener:
-            try: self._mouse_listener.stop()
-            except Exception: pass
+        self._unregister_transient_keys()
+        self._unregister_kbd_hotkey()
+        self._unregister_mouse_listener()
         self.recorder.shutdown()
         self.qapp.quit()
 

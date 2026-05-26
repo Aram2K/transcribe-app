@@ -14,5 +14,7 @@ Pillow
 psutil
 requests
 llama-cpp-python
-PySide6
-
+PySide6==6.8.2
+PySide6_Essentials==6.8.2
+PySide6_Addons==6.8.2
+shiboken6==6.8.2
