@@ -290,10 +290,23 @@ class Overlay(QWidget):
             painter.setPen(QColor(239, 68, 68))
             painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
             painter.drawText(46, self.H // 2 - 2, msg)
-            
+
+            # Pick a contextual hint based on the kind of error message.
+            low = self._done_msg.lower()
+            if "model.bin" in low or "model" in low and "open" in low:
+                hint = "Whisper cache issue — restart app or redownload model"
+            elif "api" in low or "key" in low or "auth" in low or "401" in low or "403" in low:
+                hint = "Check Settings → API key"
+            elif "microphone" in low or "input" in low or "audio" in low:
+                hint = "Check microphone access / device"
+            elif "timeout" in low or "timed out" in low:
+                hint = "Try a shorter clip or smaller model"
+            else:
+                hint = "Try again or restart Transcribe"
+
             painter.setPen(QColor(100, 116, 139))
             painter.setFont(QFont("Segoe UI", 8))
-            painter.drawText(46, self.H // 2 + 12, "Check Settings → Test Key")
+            painter.drawText(46, self.H // 2 + 12, hint)
         else:
             # Green checkmark circle
             painter.setPen(QPen(QColor(34, 197, 94), 1.5))

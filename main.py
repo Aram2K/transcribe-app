@@ -36,7 +36,7 @@ import local_llm
 import telemetry
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.5.43"
+APP_VERSION = "1.5.44"
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
@@ -422,7 +422,19 @@ class AudioRecorder:
         with self._model_lock:
             if self._model is None or self._model_name != name:
                 from faster_whisper import WhisperModel
-                self._model      = WhisperModel(name, device="cpu", compute_type="int8")
+                # HF cache revalidation can race or fail under flaky network
+                # /proxy conditions, producing "Unable to open file 'model.bin'"
+                # errors even when the model is fully cached on disk. Try
+                # online first, then fall back to local_files_only=True so
+                # we never block the user on a network hiccup.
+                try:
+                    self._model = WhisperModel(name, device="cpu", compute_type="int8")
+                except Exception as e:
+                    logger.warning("Whisper online load failed (%s); trying offline cache", e)
+                    self._model = WhisperModel(
+                        name, device="cpu", compute_type="int8",
+                        local_files_only=True,
+                    )
                 self._model_name = name
 
     def unload_model(self, name=None):
