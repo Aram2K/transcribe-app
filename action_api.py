@@ -31,6 +31,9 @@ class ActionAPIError(RuntimeError):
     pass
 
 
+import smart_prompt
+
+
 def _max_tokens_for(mode):
     """Approximate completion budget per action mode.
 
@@ -38,6 +41,8 @@ def _max_tokens_for(mode):
     sections of structured output. Standalone summaries are short."""
     if mode == "meeting_notes":
         return 1200
+    if mode == "smart_auto":
+        return 600
     if mode == "summarize":
         return 400
     if mode == "write_email":
@@ -55,6 +60,8 @@ def defaults(provider):
 
 def build_messages(text, mode, source_lang="auto", target_lang="en"):
     text = (text or "").strip()
+    if mode == "smart_auto":
+        return smart_prompt.build_messages(text)
     if mode == "write_email":
         instruction = "Turn this dictated text into a concise email draft. Output only the email."
     elif mode == "make_todo_list":

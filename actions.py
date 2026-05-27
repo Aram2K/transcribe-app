@@ -2,9 +2,11 @@ import re
 
 import action_api
 import local_llm
+import smart_prompt
 
 
 ACTION_TRANSCRIBE_ONLY = "transcribe_only"
+ACTION_SMART_AUTO = "smart_auto"
 ACTION_WRITE_EMAIL = "write_email"
 ACTION_MAKE_TODO = "make_todo_list"
 ACTION_TRANSLATE = "translate"
@@ -120,8 +122,8 @@ class ActionError(RuntimeError):
 
 
 _ACTION_MODE_WHITELIST = {
-    ACTION_TRANSCRIBE_ONLY, ACTION_WRITE_EMAIL, ACTION_MAKE_TODO,
-    ACTION_TRANSLATE, ACTION_SUMMARIZE, ACTION_MEETING_NOTES,
+    ACTION_TRANSCRIBE_ONLY, ACTION_SMART_AUTO, ACTION_WRITE_EMAIL,
+    ACTION_MAKE_TODO, ACTION_TRANSLATE, ACTION_SUMMARIZE, ACTION_MEETING_NOTES,
 }
 
 
@@ -149,6 +151,32 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
     if not text:
         return ""
     if mode == ACTION_TRANSCRIBE_ONLY:
+        return text
+
+    # Smart auto: the LLM detects intent from voice. Fast-path: if the
+    # transcript has no action keywords, skip the LLM entirely and pass
+    # through the (Whisper-cleaned) text.
+    if mode == ACTION_SMART_AUTO:
+        if not smart_prompt.has_action_intent(text):
+            return text
+        kind = ACTION_MODELS[model].get("kind")
+        if kind == "cloud":
+            if not config:
+                raise ActionError("Add your action API settings before using Smart actions.")
+            api_config = {**config, "action_api_provider": ACTION_MODELS[model]["provider"]}
+            try:
+                return action_api.run_action(text, ACTION_SMART_AUTO, api_config,
+                                             source_lang=source_lang, target_lang=target_lang)
+            except action_api.ActionAPIError as e:
+                raise ActionError(str(e)) from e
+        if kind == "local_llm" and local_llm.model_downloaded(model):
+            try:
+                return local_llm.run_action(text, ACTION_SMART_AUTO,
+                                            source_lang=source_lang,
+                                            target_lang=target_lang, model_id=model)
+            except local_llm.LocalLLMError as e:
+                raise ActionError(str(e)) from e
+        # Rule-based engine can't do smart routing — pass through.
         return text
 
     if ACTION_MODELS[model].get("kind") == "cloud":

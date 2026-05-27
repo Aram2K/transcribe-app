@@ -36,7 +36,7 @@ import local_llm
 import telemetry
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.5.42"
+APP_VERSION = "1.5.43"
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
@@ -1172,6 +1172,20 @@ class AppController(QObject):
                     target=self.recorder.load_model,
                     daemon=True,
                 ).start()
+
+            # If Smart mode + local LLM, pre-warm the action model into RAM
+            # while the user is dictating, so post-Enter latency is just
+            # inference time (no cold-load wait).
+            output_mode = actions.normalize_action_mode(self.cfg.get("output_action"))
+            if output_mode == actions.ACTION_SMART_AUTO:
+                action_model = actions.normalize_action_model(self.cfg.get("action_model"))
+                if action_model in local_llm.MODEL_CATALOG and local_llm.model_downloaded(action_model):
+                    def _prewarm():
+                        try:
+                            local_llm._load_model(action_model)
+                        except Exception as exc:
+                            logger.debug("Action LLM pre-warm failed: %s", exc)
+                    threading.Thread(target=_prewarm, daemon=True).start()
         except Exception as e:
             self.is_rec = False
             self._unregister_transient_keys()
