@@ -5,6 +5,7 @@ from pathlib import Path
 import psutil
 import requests
 
+import smart_prompt
 import storage
 
 
@@ -169,6 +170,7 @@ _MAX_TOKENS_BY_MODE = {
     "meeting_notes": 1200,
     "summarize": 400,
     "write_email": 360,
+    "smart_auto": 600,
 }
 
 
@@ -234,6 +236,8 @@ def _load_model(model_id):
 
 
 def _messages_for(mode, text, source_lang, target_lang):
+    if mode == "smart_auto":
+        return smart_prompt.build_messages(text)
     if mode == "write_email":
         instruction = (
             "Turn the user's dictated text into a concise email draft. "

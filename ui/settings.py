@@ -4,9 +4,10 @@ import os
 import threading
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, 
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QCheckBox, QTabWidget, QWidget, QLineEdit, QTextEdit, QFrame, QScrollArea,
-    QMessageBox, QGridLayout, QProgressBar, QStackedWidget
+    QMessageBox, QGridLayout, QProgressBar, QStackedWidget, QRadioButton,
+    QButtonGroup
 )
 from PySide6.QtGui import QFont, QColor
 import local_llm
@@ -83,6 +84,20 @@ class Settings(QDialog):
         self.btn_hotkey.setText(self._fmt_hotkey(None, hk).upper())
         self.capturing = False
         self.btn_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; border-color: #3b82f6;")
+
+        # 1b. Output mode (Transcribe only vs Smart actions)
+        if hasattr(self, "rb_smart"):
+            current_mode = self.cfg_working.get("output_action", "transcribe_only")
+            self.rb_smart.blockSignals(True)
+            self.rb_transcribe.blockSignals(True)
+            if current_mode == actions.ACTION_SMART_AUTO:
+                self.rb_smart.setChecked(True)
+            else:
+                self.rb_transcribe.setChecked(True)
+            self.rb_smart.blockSignals(False)
+            self.rb_transcribe.blockSignals(False)
+            if hasattr(self, "engine_section"):
+                self.engine_section.setVisible(self.rb_smart.isChecked())
         
         # 2. Spoken Language
         idx = self.combo_lang.findData(self.cfg_working.get("language", "auto"))
@@ -404,13 +419,61 @@ class Settings(QDialog):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        # Actions settings notice
-        notice = QLabel("Transcribe can format, summarize, or translate your text\nafter dictation is complete. Choose your engine provider:")
+        # ── Mode selector ────────────────────────────────────────────────
+        # Top-level choice: paste raw transcription, or let the LLM detect
+        # an action from your voice (e.g. "translate to russian: ...").
+        mode_frame = QFrame(tab)
+        mode_frame.setObjectName("cardFrame")
+        mode_lay = QVBoxLayout(mode_frame)
+        mode_lay.addWidget(QLabel("Output Mode", mode_frame))
+
+        self.rb_transcribe = QRadioButton("Transcribe only — paste my exact words", mode_frame)
+        self.rb_smart = QRadioButton(
+            "Smart actions — detect intent from voice "
+            "(e.g. \"translate to russian: …\")", mode_frame
+        )
+        self.rb_smart.setToolTip(
+            "When enabled, your dictation is run through a language model "
+            "that detects whether you want a translation, email, todo "
+            "list, summary, or rewrite — and produces only that output. "
+            "If you don't ask for anything specific, your words are pasted "
+            "as-is."
+        )
+        self.output_mode_group = QButtonGroup(mode_frame)
+        self.output_mode_group.addButton(self.rb_transcribe, 0)
+        self.output_mode_group.addButton(self.rb_smart, 1)
+
+        current_mode = (self.cfg_working.get("output_action") if self.app else "transcribe_only")
+        if current_mode == actions.ACTION_SMART_AUTO:
+            self.rb_smart.setChecked(True)
+        else:
+            self.rb_transcribe.setChecked(True)
+
+        self.rb_transcribe.toggled.connect(self._on_output_mode_changed)
+        self.rb_smart.toggled.connect(self._on_output_mode_changed)
+
+        mode_lay.addWidget(self.rb_transcribe)
+        mode_lay.addWidget(self.rb_smart)
+        layout.addWidget(mode_frame)
+
+        # Engine picker + config (only meaningful when Smart actions is on)
+        self.engine_section = QWidget(tab)
+        engine_section_lay = QVBoxLayout(self.engine_section)
+        engine_section_lay.setContentsMargins(0, 0, 0, 0)
+        engine_section_lay.setSpacing(12)
+
+        notice = QLabel(
+            "Choose which language model will handle Smart actions. "
+            "Cloud APIs are fastest and highest-quality; local Qwen / "
+            "Gemma keeps everything on your machine.",
+            self.engine_section,
+        )
         notice.setObjectName("subtitleLabel")
-        layout.addWidget(notice)
+        notice.setWordWrap(True)
+        engine_section_lay.addWidget(notice)
 
         # Primary engine choice
-        engine_frame = QFrame(tab)
+        engine_frame = QFrame(self.engine_section)
         engine_frame.setObjectName("cardFrame")
         engine_lay = QVBoxLayout(engine_frame)
         engine_lay.addWidget(QLabel("Primary Action Engine", engine_frame))
@@ -432,10 +495,10 @@ class Settings(QDialog):
                 self.combo_engine.setCurrentIndex(idx)
         self.combo_engine.currentIndexChanged.connect(self._on_engine_changed)
         engine_lay.addWidget(self.combo_engine)
-        layout.addWidget(engine_frame)
+        engine_section_lay.addWidget(engine_frame)
 
         # Stacked Panels for Dynamic Engine configurations
-        self.engine_stack = QStackedWidget(tab)
+        self.engine_stack = QStackedWidget(self.engine_section)
         
         # Card 0: Rule-based (Empty config)
         self.card_rule = QWidget()
@@ -518,9 +581,21 @@ class Settings(QDialog):
         lay_llm.addWidget(self.llm_scroll)
         
         self.engine_stack.addWidget(self.card_local_llm)
-        
-        layout.addWidget(self.engine_stack)
+
+        engine_section_lay.addWidget(self.engine_stack)
+        layout.addWidget(self.engine_section)
+
+        # Reflect the current mode visibility: engine section is only
+        # relevant while Smart actions is selected.
+        self.engine_section.setVisible(self.rb_smart.isChecked())
         return tab
+
+    def _on_output_mode_changed(self):
+        is_smart = self.rb_smart.isChecked()
+        if hasattr(self, "engine_section"):
+            self.engine_section.setVisible(is_smart)
+        new_mode = actions.ACTION_SMART_AUTO if is_smart else actions.ACTION_TRANSCRIBE_ONLY
+        self.cfg_working["output_action"] = new_mode
 
     def _build_llm_card(self, name, info):
         card = QFrame()
