@@ -419,19 +419,36 @@ class Settings(QDialog):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        # ── Mode selector ────────────────────────────────────────────────
-        # Top-level choice: paste raw transcription, or let the LLM detect
-        # an action from your voice (e.g. "translate to russian: ...").
-        mode_frame = QFrame(tab)
-        mode_frame.setObjectName("cardFrame")
-        mode_lay = QVBoxLayout(mode_frame)
-        mode_lay.addWidget(QLabel("Output Mode", mode_frame))
+        # ── Mode selector: two compact option cards ───────────────────────
+        # We avoid wrapping everything in one tall card with a "fill any
+        # leftover space" stretch policy — that's what made the previous
+        # layout look like a giant empty box with the radios at the bottom.
+        section_label = QLabel("OUTPUT MODE", tab)
+        section_label.setObjectName("subtitleLabel")
+        section_label.setStyleSheet("font-weight: 600; letter-spacing: 0.5px;")
+        layout.addWidget(section_label)
 
-        self.rb_transcribe = QRadioButton("Transcribe only — paste my exact words", mode_frame)
-        self.rb_smart = QRadioButton(
-            "Smart actions — detect intent from voice "
-            "(e.g. \"translate to russian: …\")", mode_frame
+        self.output_mode_group = QButtonGroup(tab)
+
+        self.card_transcribe = self._build_mode_card(
+            tab,
+            "Transcribe only",
+            "Paste my exact words. Fast, predictable, no AI processing.",
+            checked=False,
         )
+        self.rb_transcribe = self.card_transcribe.radio
+        self.output_mode_group.addButton(self.rb_transcribe, 0)
+        layout.addWidget(self.card_transcribe)
+
+        self.card_smart = self._build_mode_card(
+            tab,
+            "Smart actions",
+            "Detect intent from voice — e.g. say \"translate to russian: …\", "
+            "\"write email to John\", or \"make a todo list\". The AI produces "
+            "only the result.",
+            checked=False,
+        )
+        self.rb_smart = self.card_smart.radio
         self.rb_smart.setToolTip(
             "When enabled, your dictation is run through a language model "
             "that detects whether you want a translation, email, todo "
@@ -439,9 +456,8 @@ class Settings(QDialog):
             "If you don't ask for anything specific, your words are pasted "
             "as-is."
         )
-        self.output_mode_group = QButtonGroup(mode_frame)
-        self.output_mode_group.addButton(self.rb_transcribe, 0)
         self.output_mode_group.addButton(self.rb_smart, 1)
+        layout.addWidget(self.card_smart)
 
         current_mode = (self.cfg_working.get("output_action") if self.app else "transcribe_only")
         if current_mode == actions.ACTION_SMART_AUTO:
@@ -451,10 +467,9 @@ class Settings(QDialog):
 
         self.rb_transcribe.toggled.connect(self._on_output_mode_changed)
         self.rb_smart.toggled.connect(self._on_output_mode_changed)
-
-        mode_lay.addWidget(self.rb_transcribe)
-        mode_lay.addWidget(self.rb_smart)
-        layout.addWidget(mode_frame)
+        # Make clicking anywhere on the card select that option.
+        self.card_transcribe.mousePressEvent = lambda _e: self.rb_transcribe.setChecked(True)
+        self.card_smart.mousePressEvent = lambda _e: self.rb_smart.setChecked(True)
 
         # Engine picker + config (only meaningful when Smart actions is on)
         self.engine_section = QWidget(tab)
@@ -585,9 +600,14 @@ class Settings(QDialog):
         engine_section_lay.addWidget(self.engine_stack)
         layout.addWidget(self.engine_section)
 
-        # Reflect the current mode visibility: engine section is only
-        # relevant while Smart actions is selected.
+        # Stretch at the end so the mode cards keep their compact natural
+        # height and don't expand to fill the dialog.
+        layout.addStretch(1)
+
+        # Reflect the current mode visibility + selected styling.
         self.engine_section.setVisible(self.rb_smart.isChecked())
+        self.card_transcribe.setStyleSheet(self._mode_card_style(self.rb_transcribe.isChecked()))
+        self.card_smart.setStyleSheet(self._mode_card_style(self.rb_smart.isChecked()))
         return tab
 
     def _on_output_mode_changed(self):
@@ -596,6 +616,68 @@ class Settings(QDialog):
             self.engine_section.setVisible(is_smart)
         new_mode = actions.ACTION_SMART_AUTO if is_smart else actions.ACTION_TRANSCRIBE_ONLY
         self.cfg_working["output_action"] = new_mode
+        # Visual emphasis: selected card gets a stronger border.
+        for card, sel in (
+            (getattr(self, "card_transcribe", None), not is_smart),
+            (getattr(self, "card_smart", None), is_smart),
+        ):
+            if card is not None:
+                card.setStyleSheet(self._mode_card_style(sel))
+
+    def _build_mode_card(self, parent, title, description, checked=False):
+        """One compact mode-choice card: radio + bold title + subtitle.
+
+        Returns a QFrame with a `radio` attribute holding the QRadioButton.
+        Fixed vertical size so it never expands to fill leftover space.
+        """
+        card = QFrame(parent)
+        card.setObjectName("cardFrame")
+        card.setStyleSheet(self._mode_card_style(checked))
+        card.setCursor(Qt.PointingHandCursor)
+
+        row = QHBoxLayout(card)
+        row.setContentsMargins(14, 12, 14, 12)
+        row.setSpacing(12)
+
+        radio = QRadioButton(card)
+        radio.setChecked(checked)
+        row.addWidget(radio, 0, Qt.AlignTop)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(2)
+
+        lbl_title = QLabel(title, card)
+        lbl_title.setStyleSheet("font-size: 14px; font-weight: 600; color: #0f172a;")
+        text_col.addWidget(lbl_title)
+
+        lbl_desc = QLabel(description, card)
+        lbl_desc.setObjectName("subtitleLabel")
+        lbl_desc.setWordWrap(True)
+        lbl_desc.setStyleSheet("color: #64748b;")
+        text_col.addWidget(lbl_desc)
+
+        row.addLayout(text_col, 1)
+        card.radio = radio
+        return card
+
+    @staticmethod
+    def _mode_card_style(selected):
+        if selected:
+            return (
+                "QFrame#cardFrame {"
+                "  border: 1.5px solid #3b82f6;"
+                "  border-radius: 8px;"
+                "  background: #eff6ff;"
+                "}"
+            )
+        return (
+            "QFrame#cardFrame {"
+            "  border: 1px solid #e2e8f0;"
+            "  border-radius: 8px;"
+            "  background: #ffffff;"
+            "}"
+        )
 
     def _build_llm_card(self, name, info):
         card = QFrame()
