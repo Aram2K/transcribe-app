@@ -223,6 +223,22 @@ class TestConfig(unittest.TestCase):
         finally:
             m.CONFIG_PATH = orig
 
+    def test_local_action_model_enables_smart_output_mode(self):
+        import main as m
+        import local_llm
+        orig = m.CONFIG_PATH
+        m.CONFIG_PATH = self._cfg_path
+        try:
+            save_config({
+                **DEFAULT,
+                "output_action": "transcribe_only",
+                "action_model": local_llm.QWEN_7B_ID,
+            })
+            c = load_config()
+            self.assertEqual(c["output_action"], "smart_auto")
+        finally:
+            m.CONFIG_PATH = orig
+
     def test_privacy_mode_forces_local_no_history_keeps_analytics(self):
         # Privacy Mode forces backend=local and disables history, but it
         # intentionally leaves analytics_enabled untouched — the user

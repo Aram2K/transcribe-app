@@ -158,26 +158,46 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
     # through the (Whisper-cleaned) text.
     if mode == ACTION_SMART_AUTO:
         if not smart_prompt.has_action_intent(text):
-            return text
+            return _clean_transcript(text)
+
         kind = ACTION_MODELS[model].get("kind")
+        llm_error = None
+
         if kind == "cloud":
             if not config:
                 raise ActionError("Add your action API settings before using Smart actions.")
             api_config = {**config, "action_api_provider": ACTION_MODELS[model]["provider"]}
             try:
-                return action_api.run_action(text, ACTION_SMART_AUTO, api_config,
-                                             source_lang=source_lang, target_lang=target_lang)
+                return action_api.run_action(
+                    text, ACTION_SMART_AUTO, api_config,
+                    source_lang=source_lang, target_lang=target_lang,
+                )
             except action_api.ActionAPIError as e:
-                raise ActionError(str(e)) from e
-        if kind == "local_llm" and local_llm.model_downloaded(model):
-            try:
-                return local_llm.run_action(text, ACTION_SMART_AUTO,
-                                            source_lang=source_lang,
-                                            target_lang=target_lang, model_id=model)
-            except local_llm.LocalLLMError as e:
-                raise ActionError(str(e)) from e
-        # Rule-based engine can't do smart routing — pass through.
-        return text
+                llm_error = ActionError(str(e))
+        elif kind == "local_llm":
+            if local_llm.model_downloaded(model):
+                try:
+                    return local_llm.run_action(
+                        text, ACTION_SMART_AUTO,
+                        source_lang=source_lang,
+                        target_lang=target_lang, model_id=model,
+                    )
+                except local_llm.LocalLLMError as e:
+                    llm_error = ActionError(str(e))
+            else:
+                label = local_llm.MODEL_CATALOG.get(model, {}).get("label", model)
+                llm_error = ActionError(
+                    f"{label} is not downloaded yet. Download it in Settings → AI Actions, "
+                    "or switch to Rule-based Formatter."
+                )
+
+        # Rule-based / extractive routing (also used when LLM fails or is rule_based).
+        routed = _run_smart_rule_based(text, source_lang, target_lang, config)
+        if routed is not None:
+            return routed
+        if llm_error:
+            raise llm_error
+        return _clean_transcript(text)
 
     if ACTION_MODELS[model].get("kind") == "cloud":
         if not config:
@@ -232,6 +252,52 @@ def _clean_sentence(text):
     if not text:
         return ""
     return text[0].upper() + text[1:]
+
+
+def _clean_transcript(text):
+    """Light cleanup when Smart mode has no specific action intent."""
+    text = re.sub(
+        r"\b(um|uh|er|like|you know|kind of|sort of)\b",
+        " ",
+        (text or ""),
+        flags=re.I,
+    )
+    return _clean_sentence(re.sub(r"\s+", " ", text).strip())
+
+
+def _run_smart_rule_based(text, source_lang, target_lang, config):
+    """Route obvious intents through fast local formatters (no LLM)."""
+    route = smart_prompt.detect_action_mode(text)
+    if not route:
+        return None
+    payload = smart_prompt.extract_payload(text, route)
+
+    if route == "write_email":
+        return _write_email(payload)
+    if route == "make_todo_list":
+        return _make_todo_list(payload)
+    if route == "summarize":
+        return _summarize_extractive(payload)
+    if route == "meeting_notes":
+        return _meeting_notes_extractive(payload)
+    if route == "rewrite":
+        return _clean_transcript(payload)
+    if route == "translate":
+        lang = smart_prompt.parse_translate_target(text) or target_lang
+        try:
+            return _translate_local(payload, source_lang, lang)
+        except ActionError:
+            llm_model = _first_downloaded_local_model()
+            if llm_model and local_llm.model_downloaded(llm_model):
+                try:
+                    return local_llm.run_action(
+                        text, ACTION_TRANSLATE,
+                        source_lang=source_lang, target_lang=lang, model_id=llm_model,
+                    )
+                except local_llm.LocalLLMError as e:
+                    raise ActionError(str(e)) from e
+            raise
+    return None
 
 
 def _subject_from_text(text):

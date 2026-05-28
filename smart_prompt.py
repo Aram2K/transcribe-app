@@ -91,7 +91,10 @@ DEFAULT_EXAMPLES = [
 _ACTION_INTENT_RE = re.compile(
     r"\b("
     r"translate|translation|"
-    r"email|compose|draft (an? )?(email|message|reply)|"
+    r"email|e-?mail|"
+    r"write\s+(?:an?\s+)?(?:email|e-?mail|message)|"
+    r"send\s+(?:an?\s+)?(?:email|e-?mail|message)|"
+    r"compose|draft (an? )?(email|message|reply)|"
     r"todo|to-?do|to do list|checklist|"
     r"list of|make (a |the )?list|"
     r"remind me to|things to do|"
@@ -101,6 +104,126 @@ _ACTION_INTENT_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
+
+# Maps spoken intent → concrete action mode (see actions.py constants).
+_DETECT_RULES = (
+    ("translate", re.compile(r"\b(translate|translation)\b", re.I)),
+    ("write_email", re.compile(
+        r"\b(email|e-?mail|compose|draft|reply)\b|"
+        r"\bwrite\s+(?:an?\s+)?(?:email|e-?mail|message)\b|"
+        r"\bsend\s+(?:an?\s+)?(?:email|e-?mail|message)\b",
+        re.I,
+    )),
+    ("make_todo_list", re.compile(
+        r"\b(todo|to-?do|checklist|make (a |the )?list|things to do|remind me to)\b",
+        re.I,
+    )),
+    ("summarize", re.compile(
+        r"\b(summari[sz]e|summary|recap|tldr|tl;dr|brief(ly)? (this|that|it))\b",
+        re.I,
+    )),
+    ("meeting_notes", re.compile(r"\b(meeting notes|take notes)\b", re.I)),
+    ("rewrite", re.compile(
+        r"\b(rewrite|clean (this|that|it) up|polish|"
+        r"fix (grammar|the grammar|typo|typos|this))\b",
+        re.I,
+    )),
+)
+
+_WRITE_EMAIL_PREFIX = re.compile(
+    r"^(?:please\s+)?(?:"
+    r"(?:write|compose|draft|send)\s+(?:an?\s+)?(?:email|e-mail|message|reply)"
+    r"|email\s+)"
+    r"(?:to\s+[\w.@\-']+(?:\s+[\w.@\-']+)?\s+)?"
+    r"(?:saying|that|about|regarding|:)?\s*",
+    re.I,
+)
+
+_TRANSLATE_PREFIX = re.compile(
+    r"^(?:please\s+)?translate(?:\s+this)?\s+to\s+(\w+)\s*[:,-]?\s*",
+    re.I,
+)
+
+_TODO_PREFIX = re.compile(
+    r"^(?:please\s+)?(?:make\s+(?:a\s+)?(?:todo|to-?do)\s*list|todo\s*list)\s*[:,-]?\s*",
+    re.I,
+)
+
+_SUMMARY_PREFIX = re.compile(
+    r"^(?:please\s+)?(?:summari[sz]e(?:\s+this)?|summary(?:\s+of)?|recap)\s*[:,-]?\s*",
+    re.I,
+)
+
+_REWRITE_PREFIX = re.compile(
+    r"^(?:please\s+)?(?:rewrite|clean (?:this|that|it) up|polish|fix (?:grammar|this))\s*[:,-]?\s*",
+    re.I,
+)
+
+_LANG_NAME_TO_CODE = {
+    "english": "en", "armenian": "hy", "russian": "ru", "french": "fr",
+    "german": "de", "spanish": "es", "italian": "it", "portuguese": "pt",
+    "arabic": "ar",
+}
+
+
+def detect_action_mode(text):
+    """Pick a concrete action mode from a Smart-mode transcript, or None."""
+    if not text:
+        return None
+    for mode, pattern in _DETECT_RULES:
+        if pattern.search(text):
+            return mode
+    return None
+
+
+def parse_translate_target(text):
+    """Parse 'translate to french …' → language code."""
+    m = _TRANSLATE_PREFIX.match((text or "").strip())
+    if not m:
+        return None
+    word = m.group(1).lower()
+    if len(word) <= 3 and word.isalpha():
+        return word
+    return _LANG_NAME_TO_CODE.get(word)
+
+
+def extract_payload(text, mode):
+    """Strip the instruction phrase; keep what should be transformed."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if mode == "write_email":
+        m = _WRITE_EMAIL_PREFIX.match(text)
+        if m:
+            rest = text[m.end() :].strip()
+            if rest:
+                return rest
+    elif mode == "translate":
+        m = _TRANSLATE_PREFIX.match(text)
+        if m:
+            rest = text[m.end() :].strip()
+            if rest:
+                return rest
+    elif mode == "make_todo_list":
+        m = _TODO_PREFIX.match(text)
+        if m:
+            rest = text[m.end() :].strip()
+            if rest:
+                return rest
+    elif mode == "summarize":
+        m = _SUMMARY_PREFIX.match(text)
+        if m:
+            rest = text[m.end() :].strip()
+            if rest:
+                return rest
+    elif mode == "rewrite":
+        m = _REWRITE_PREFIX.match(text)
+        if m:
+            rest = text[m.end() :].strip()
+            if rest:
+                return rest
+    return text
 
 
 def has_action_intent(text):
