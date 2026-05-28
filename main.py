@@ -120,6 +120,17 @@ def load_config():
             loaded["action_model"] = actions.RULE_BASED_ID
     loaded["action_model"] = actions.normalize_action_model(loaded.get("action_model"))
 
+    # Users often pick a local/cloud action model in Settings but leave output
+    # mode on the default "transcribe_only", so dictation never runs actions.
+    if loaded.get("output_action") == actions.ACTION_TRANSCRIBE_ONLY:
+        model_kind = actions.ACTION_MODELS.get(loaded["action_model"], {}).get("kind")
+        if model_kind in ("local_llm", "cloud"):
+            loaded["output_action"] = actions.ACTION_SMART_AUTO
+            logger.info(
+                "Enabled Smart actions automatically (action model: %s)",
+                loaded["action_model"],
+            )
+
     action_key = (loaded.get("action_api_key") or "").strip()
     if action_key:
         if storage.write_secret(storage.ACTION_API_KEY_SECRET, action_key):

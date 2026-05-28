@@ -2,12 +2,12 @@
 
 import os
 import threading
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QEvent
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QCheckBox, QTabWidget, QWidget, QLineEdit, QTextEdit, QFrame, QScrollArea,
     QMessageBox, QGridLayout, QProgressBar, QStackedWidget, QRadioButton,
-    QButtonGroup
+    QButtonGroup, QSizePolicy,
 )
 from PySide6.QtGui import QFont, QColor
 import local_llm
@@ -29,8 +29,8 @@ class Settings(QDialog):
         self.cfg_working = copy.deepcopy(self.app.cfg if self.app else {})
         
         self.setWindowTitle("Settings")
-        self.setMinimumSize(560, 640)
-        self.resize(560, 700)
+        self.setMinimumSize(580, 680)
+        self.resize(600, 760)
         
         # Apply global stylesheet
         if self.app and hasattr(self.app, "style_content"):
@@ -72,11 +72,22 @@ class Settings(QDialog):
             self._update_llm_card_ui(name)
 
     def _on_save_clicked(self):
+        self._sync_action_settings_from_widgets()
         if self.app:
             self.app.cfg.update(self.cfg_working)
             self.app.save_config()
             self.app.apply_tray_bindings()
         self.accept()
+
+    def _sync_action_settings_from_widgets(self):
+        """Persist output mode + engine from widgets (not only on toggle signals)."""
+        if hasattr(self, "rb_smart"):
+            self.cfg_working["output_action"] = (
+                actions.ACTION_SMART_AUTO if self.rb_smart.isChecked()
+                else actions.ACTION_TRANSCRIBE_ONLY
+            )
+        if hasattr(self, "combo_engine"):
+            self._save_action_configs()
 
     def _load_values_into_widgets(self):
         # 1. Hotkey
@@ -239,6 +250,7 @@ class Settings(QDialog):
             if idx >= 0:
                 self.combo_lang.setCurrentIndex(idx)
         self.combo_lang.currentIndexChanged.connect(self._save_general_configs)
+        self._configure_dropdown(self.combo_lang, show_all_items=True)
         lang_lay.addWidget(self.combo_lang)
         layout.addWidget(lang_frame)
 
@@ -412,36 +424,63 @@ class Settings(QDialog):
         card.btn_action.style().unpolish(card.btn_action)
         card.btn_action.style().polish(card.btn_action)
 
+    @staticmethod
+    def _configure_dropdown(combo, *, show_all_items=False, min_width=280):
+        """Consistent combo sizing; avoid clipped / blank popup rows on Windows."""
+        combo.setMinimumHeight(40)
+        combo.setMinimumWidth(min_width)
+        combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        if show_all_items and combo.count() > 0:
+            combo.setMaxVisibleItems(combo.count())
+        view = combo.view()
+        view.setUniformItemSizes(True)
+        view.setSpacing(0)
+
     # ── TAB 3: AI Action Engines ─────────────────────────────────────────────
     def _create_actions_tab(self):
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea(tab)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        # ── Mode selector: two compact option cards ───────────────────────
-        # We avoid wrapping everything in one tall card with a "fill any
-        # leftover space" stretch policy — that's what made the previous
-        # layout look like a giant empty box with the radios at the bottom.
-        section_label = QLabel("OUTPUT MODE", tab)
+        section_label = QLabel("OUTPUT MODE", content)
         section_label.setObjectName("subtitleLabel")
         section_label.setStyleSheet("font-weight: 600; letter-spacing: 0.5px;")
         layout.addWidget(section_label)
 
-        self.output_mode_group = QButtonGroup(tab)
+        self.mode_section = QWidget(content)
+        self.mode_section.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self._mode_cards_layout = QVBoxLayout(self.mode_section)
+        self._mode_cards_layout.setContentsMargins(0, 0, 0, 0)
+        self._mode_cards_layout.setSpacing(12)
+
+        self.output_mode_group = QButtonGroup(content)
 
         self.card_transcribe = self._build_mode_card(
-            tab,
+            self.mode_section,
             "Transcribe only",
             "Paste my exact words. Fast, predictable, no AI processing.",
             checked=False,
         )
         self.rb_transcribe = self.card_transcribe.radio
         self.output_mode_group.addButton(self.rb_transcribe, 0)
-        layout.addWidget(self.card_transcribe)
+        self._mode_cards_layout.addWidget(self.card_transcribe, 1)
 
         self.card_smart = self._build_mode_card(
-            tab,
+            self.mode_section,
             "Smart actions",
             "Detect intent from voice — e.g. say \"translate to russian: …\", "
             "\"write email to John\", or \"make a todo list\". The AI produces "
@@ -457,7 +496,9 @@ class Settings(QDialog):
             "as-is."
         )
         self.output_mode_group.addButton(self.rb_smart, 1)
-        layout.addWidget(self.card_smart)
+        self._mode_cards_layout.addWidget(self.card_smart, 1)
+
+        layout.addWidget(self.mode_section, 1)
 
         current_mode = (self.cfg_working.get("output_action") if self.app else "transcribe_only")
         if current_mode == actions.ACTION_SMART_AUTO:
@@ -472,7 +513,7 @@ class Settings(QDialog):
         self.card_smart.mousePressEvent = lambda _e: self.rb_smart.setChecked(True)
 
         # Engine picker + config (only meaningful when Smart actions is on)
-        self.engine_section = QWidget(tab)
+        self.engine_section = QWidget(content)
         engine_section_lay = QVBoxLayout(self.engine_section)
         engine_section_lay.setContentsMargins(0, 0, 0, 0)
         engine_section_lay.setSpacing(12)
@@ -509,17 +550,27 @@ class Settings(QDialog):
             if idx >= 0:
                 self.combo_engine.setCurrentIndex(idx)
         self.combo_engine.currentIndexChanged.connect(self._on_engine_changed)
+        self._configure_dropdown(self.combo_engine, min_width=320)
         engine_lay.addWidget(self.combo_engine)
         engine_section_lay.addWidget(engine_frame)
 
         # Stacked Panels for Dynamic Engine configurations
         self.engine_stack = QStackedWidget(self.engine_section)
+        self.engine_stack.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum
+        )
         
         # Card 0: Rule-based (Empty config)
         self.card_rule = QWidget()
         lay_rule = QVBoxLayout(self.card_rule)
-        lay_rule.addWidget(QLabel("No configuration needed for Rule-Based formatting.\nIt executes instantly and offline.", self.card_rule))
-        lay_rule.addStretch()
+        lay_rule.setContentsMargins(4, 8, 4, 8)
+        lay_rule.addWidget(
+            QLabel(
+                "No configuration needed for Rule-Based formatting.\n"
+                "It executes instantly and offline.",
+                self.card_rule,
+            )
+        )
         self.engine_stack.addWidget(self.card_rule)
 
         # Card 1: Cloud API Config Panels (Unified look)
@@ -572,51 +623,56 @@ class Settings(QDialog):
             if idx >= 0:
                 self.combo_local_model.setCurrentIndex(idx)
         self.combo_local_model.currentIndexChanged.connect(self._on_local_llm_model_changed)
+        self._configure_dropdown(self.combo_local_model, show_all_items=True)
         llm_p_lay.addWidget(self.combo_local_model)
         lay_llm.addWidget(llm_pick_frame)
 
-        # GGUF Model Cards (Scroll Area)
-        self.llm_scroll = QScrollArea(self.card_local_llm)
-        self.llm_scroll.setWidgetResizable(True)
-        self.llm_scroll.setFrameShape(QFrame.NoFrame)
-        
-        llm_scroll_content = QWidget()
-        llm_s_lay = QVBoxLayout(llm_scroll_content)
-        llm_s_lay.setContentsMargins(0, 8, 0, 0)
-        llm_s_lay.setSpacing(10)
-        
-        # Build GGUF LLM download cards
+        # GGUF model cards — scroll with the whole tab (no nested mini-scroll)
+        llm_cards_label = QLabel("Local model downloads", self.card_local_llm)
+        llm_cards_label.setObjectName("subtitleLabel")
+        llm_cards_label.setStyleSheet("font-weight: 600; color: #475569; margin-top: 4px;")
+        lay_llm.addWidget(llm_cards_label)
+
         for name, info in local_llm.MODEL_CATALOG.items():
             card = self._build_llm_card(name, info)
             self.llm_cards[name] = card
-            llm_s_lay.addWidget(card)
+            lay_llm.addWidget(card)
             self._update_llm_card_ui(name)
-            
-        self.llm_scroll.setWidget(llm_scroll_content)
-        lay_llm.addWidget(self.llm_scroll)
-        
+
         self.engine_stack.addWidget(self.card_local_llm)
 
         engine_section_lay.addWidget(self.engine_stack)
         layout.addWidget(self.engine_section)
 
-        # Stretch at the end so the mode cards keep their compact natural
-        # height and don't expand to fill the dialog.
-        layout.addStretch(1)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
 
-        # Reflect the current mode visibility + selected styling.
-        self.engine_section.setVisible(self.rb_smart.isChecked())
-        self.card_transcribe.setStyleSheet(self._mode_card_style(self.rb_transcribe.isChecked()))
-        self.card_smart.setStyleSheet(self._mode_card_style(self.rb_smart.isChecked()))
+        class _ActionsTabWidthSync(QObject):
+            def __init__(self, viewport, target):
+                super().__init__(viewport)
+                self._target = target
+
+            def eventFilter(self, obj, event):
+                if event.type() == QEvent.Type.Resize:
+                    w = obj.width()
+                    if w > 0:
+                        self._target.setMinimumWidth(w)
+                return super().eventFilter(obj, event)
+
+        self._actions_width_sync = _ActionsTabWidthSync(scroll.viewport(), content)
+        scroll.viewport().installEventFilter(self._actions_width_sync)
+        QTimer.singleShot(0, lambda: content.setMinimumWidth(scroll.viewport().width()))
+
+        self._refresh_mode_cards_layout()
         return tab
 
     def _on_output_mode_changed(self):
         is_smart = self.rb_smart.isChecked()
         if hasattr(self, "engine_section"):
             self.engine_section.setVisible(is_smart)
+        self._refresh_mode_cards_layout()
         new_mode = actions.ACTION_SMART_AUTO if is_smart else actions.ACTION_TRANSCRIBE_ONLY
         self.cfg_working["output_action"] = new_mode
-        # Visual emphasis: selected card gets a stronger border.
         for card, sel in (
             (getattr(self, "card_transcribe", None), not is_smart),
             (getattr(self, "card_smart", None), is_smart),
@@ -624,40 +680,82 @@ class Settings(QDialog):
             if card is not None:
                 card.setStyleSheet(self._mode_card_style(sel))
 
-    def _build_mode_card(self, parent, title, description, checked=False):
-        """One compact mode-choice card: radio + bold title + subtitle.
+    def _refresh_mode_cards_layout(self):
+        """Full-width cards; split vertical space when only output mode is shown."""
+        if not hasattr(self, "card_transcribe"):
+            return
+        is_smart = self.rb_smart.isChecked()
+        compact_h = 120
+        for card in (self.card_transcribe, self.card_smart):
+            card.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed if is_smart else QSizePolicy.Policy.Expanding,
+            )
+            card.setMinimumHeight(compact_h if is_smart else 140)
+            if is_smart:
+                card.setMaximumHeight(200)
+            else:
+                card.setMaximumHeight(16777215)
+        if hasattr(self, "_mode_cards_layout"):
+            stretch = 0 if is_smart else 1
+            self._mode_cards_layout.setStretch(0, stretch)
+            self._mode_cards_layout.setStretch(1, stretch)
+        parent_lay = self.mode_section.parentWidget().layout() if hasattr(self, "mode_section") else None
+        if parent_lay is not None:
+            parent_lay.setStretchFactor(self.mode_section, 0 if is_smart else 1)
+            if hasattr(self, "engine_section"):
+                parent_lay.setStretchFactor(self.engine_section, 1 if is_smart else 0)
 
-        Returns a QFrame with a `radio` attribute holding the QRadioButton.
-        Fixed vertical size so it never expands to fill leftover space.
-        """
+    def _build_mode_card(self, parent, title, description, checked=False):
+        """Full-width selectable mode card (radio + title + description)."""
         card = QFrame(parent)
         card.setObjectName("cardFrame")
         card.setStyleSheet(self._mode_card_style(checked))
         card.setCursor(Qt.PointingHandCursor)
+        card.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        card.setMinimumHeight(120)
 
-        row = QHBoxLayout(card)
-        row.setContentsMargins(14, 12, 14, 12)
-        row.setSpacing(12)
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(18, 16, 18, 16)
+        outer.setSpacing(0)
 
-        radio = QRadioButton(card)
+        row_host = QWidget(card)
+        row_host.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
+        )
+        row = QHBoxLayout(row_host)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(14)
+
+        radio = QRadioButton(row_host)
         radio.setChecked(checked)
         row.addWidget(radio, 0, Qt.AlignTop)
 
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
-        text_col.setSpacing(2)
+        text_col.setSpacing(4)
 
-        lbl_title = QLabel(title, card)
-        lbl_title.setStyleSheet("font-size: 14px; font-weight: 600; color: #0f172a;")
+        lbl_title = QLabel(title, row_host)
+        lbl_title.setStyleSheet("font-size: 15px; font-weight: 600; color: #0f172a;")
+        lbl_title.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
+        )
         text_col.addWidget(lbl_title)
 
-        lbl_desc = QLabel(description, card)
+        lbl_desc = QLabel(description, row_host)
         lbl_desc.setObjectName("subtitleLabel")
         lbl_desc.setWordWrap(True)
-        lbl_desc.setStyleSheet("color: #64748b;")
+        lbl_desc.setStyleSheet("color: #64748b; font-size: 13px;")
+        lbl_desc.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
+        )
         text_col.addWidget(lbl_desc)
 
         row.addLayout(text_col, 1)
+        outer.addWidget(row_host, 0, Qt.AlignTop)
+        outer.addStretch(1)
         card.radio = radio
         return card
 
@@ -808,7 +906,6 @@ class Settings(QDialog):
             self.engine_stack.setCurrentIndex(0)
         elif provider == "local_llm":
             self.engine_stack.setCurrentIndex(2)
-            self.llm_scroll.setVisible(True)
         else:
             self.engine_stack.setCurrentIndex(1)
             

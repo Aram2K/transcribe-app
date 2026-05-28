@@ -135,9 +135,12 @@ QComboBox::drop-down {
     border-bottom-right-radius: 8px;
 }
 QComboBox::down-arrow {
-    image: url(assets/arrow_down.png);
-    width: 10px;
-    height: 10px;
+    width: 0;
+    height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid #64748b;
+    margin-right: 10px;
 }
 QComboBox QAbstractItemView {
     background-color: #ffffff;
@@ -145,18 +148,45 @@ QComboBox QAbstractItemView {
     border-radius: 8px;
     selection-background-color: #3b82f6;
     selection-color: #ffffff;
-    outline: 0px;
-    padding: 4px;
+    outline: 0;
+    padding: 2px;
     color: #1e293b;
 }
 QComboBox QAbstractItemView::item {
-    height: 32px;
+    min-height: 34px;
+    padding: 6px 10px;
     border-radius: 4px;
-    padding-left: 8px;
+}
+QComboBox QAbstractItemView::item:selected {
+    background-color: #3b82f6;
+    color: #ffffff;
 }
 QComboBox QAbstractItemView::item:hover {
     background-color: #f1f5f9;
     color: #0f172a;
+}
+
+/* Scroll areas — visible scrollbars for long settings panels */
+QScrollArea {
+    background: transparent;
+    border: none;
+}
+QScrollBar:vertical {
+    background: #f1f5f9;
+    width: 10px;
+    margin: 2px;
+    border-radius: 5px;
+}
+QScrollBar::handle:vertical {
+    background: #94a3b8;
+    min-height: 28px;
+    border-radius: 5px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #64748b;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
 }
 
 /* Tab Widget and Bar */

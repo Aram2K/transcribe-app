@@ -65,6 +65,38 @@ class TestActions(unittest.TestCase):
         self.assertIn("Subject:", out)
         run_action.assert_not_called()
 
+    def test_smart_auto_email_uses_rule_formatter_when_rule_based(self):
+        out = actions.process(
+            "write an email to john that the report is ready tonight",
+            actions.ACTION_SMART_AUTO,
+            model=actions.RULE_BASED_ID,
+        )
+        self.assertIn("Subject:", out)
+        self.assertIn("Hi,", out)
+        self.assertNotIn("write an email", out.lower())
+
+    def test_smart_auto_email_uses_llm_when_downloaded(self):
+        with patch.object(actions.local_llm, "model_downloaded", return_value=True), \
+             patch.object(actions.local_llm, "run_action", return_value="Subject: Hi\n\nBody\n\nBest,") as run_action:
+            out = actions.process(
+                "write an email to john that the report is ready",
+                actions.ACTION_SMART_AUTO,
+                model=actions.local_llm.QWEN_TINY_ID,
+            )
+        self.assertIn("Subject:", out)
+        run_action.assert_called_once()
+
+    def test_smart_auto_missing_local_model_falls_back_to_rules(self):
+        with patch.object(actions.local_llm, "model_downloaded", return_value=False), \
+             patch.object(actions.local_llm, "run_action") as run_action:
+            out = actions.process(
+                "write an email to john that the report is ready",
+                actions.ACTION_SMART_AUTO,
+                model=actions.local_llm.QWEN_7B_ID,
+            )
+        self.assertIn("Subject:", out)
+        run_action.assert_not_called()
+
     def test_cloud_action_uses_configured_api(self):
         with patch.object(actions.action_api, "run_action", return_value="API output") as run_action:
             out = actions.process(
