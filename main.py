@@ -1525,6 +1525,12 @@ def main():
     qapp = QApplication(sys.argv)
     qapp.setQuitOnLastWindowClosed(False) # Tray-resident background app constraint!
 
+    # Set premium global application window icon (circular Armenian Flag + Microphone)
+    try:
+        qapp.setWindowIcon(make_qicon())
+    except Exception as e:
+        logging.error("Failed to set global window icon: %s", e)
+
     # Create app logic controller
     controller = AppController(qapp)
 
