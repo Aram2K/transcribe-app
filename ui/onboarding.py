@@ -1,6 +1,6 @@
 # Modern Onboarding Walkthrough Wizard in PySide6
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QEvent
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, 
     QComboBox, QCheckBox, QStackedWidget, QWidget, QLineEdit, QMessageBox, QFrame
@@ -29,9 +29,12 @@ class Onboarding(QDialog):
         self.backend_val = self.app.cfg.get("backend", "local") if self.app else "local"
         self.model_val = self.app.cfg.get("whisper_model", "base") if self.app else "base"
         self.google_key_val = self.app.cfg.get("google_api_key", "") if self.app else ""
+        self.mistral_key_val = self.app.cfg.get("mistral_api_key", "") if self.app else ""
         self.analytics_val = bool(self.app.cfg.get("analytics_enabled", True)) if self.app else True
         
         self._build_ui()
+        self.btn_hotkey.installEventFilter(self)
+        self.installEventFilter(self)
 
     def _build_ui(self):
         self.main_layout = QVBoxLayout(self)
@@ -231,6 +234,28 @@ class Onboarding(QDialog):
         
         layout_eng.addWidget(self.cloud_card)
         
+        # Mistral Backend Option Card
+        self.mistral_card = QFrame(self.page_engine)
+        self.mistral_card.setObjectName("cardFrame")
+        layout_m = QVBoxLayout(self.mistral_card)
+        layout_m.setContentsMargins(16, 16, 16, 16)
+        layout_m.setSpacing(8)
+        
+        self.btn_sel_mistral = QPushButton("Mistral AI Voxtral STT", self.mistral_card)
+        self.btn_sel_mistral.clicked.connect(lambda: self._set_backend("mistral"))
+        layout_m.addWidget(self.btn_sel_mistral)
+        
+        mistral_desc = QLabel(
+            "Leverages Mistral's highly accurate Voxtral STT model. "
+            "Perfect for multilingual meetings and developer workflows. Requires a Mistral API key.",
+            self.mistral_card
+        )
+        mistral_desc.setObjectName("subtitleLabel")
+        mistral_desc.setWordWrap(True)
+        layout_m.addWidget(mistral_desc)
+        
+        layout_eng.addWidget(self.mistral_card)
+        
         # Google API Input Box (Hidden initially)
         self.google_input_frame = QFrame(self.page_engine)
         self.google_input_frame.setVisible(False)
@@ -245,6 +270,20 @@ class Onboarding(QDialog):
         layout_gi.addWidget(self.google_key_input)
         layout_eng.addWidget(self.google_input_frame)
 
+        # Mistral API Input Box (Hidden initially)
+        self.mistral_input_frame = QFrame(self.page_engine)
+        self.mistral_input_frame.setVisible(False)
+        layout_mi = QVBoxLayout(self.mistral_input_frame)
+        layout_mi.setContentsMargins(0, 0, 0, 0)
+        layout_mi.setSpacing(6)
+        
+        layout_mi.addWidget(QLabel("Paste Mistral API Key:", self.mistral_input_frame))
+        self.mistral_key_input = QLineEdit(self.mistral_input_frame)
+        self.mistral_key_input.setPlaceholderText("mistral-key...")
+        self.mistral_key_input.setText(self.mistral_key_val)
+        layout_mi.addWidget(self.mistral_key_input)
+        layout_eng.addWidget(self.mistral_input_frame)
+
         # Telemetry Consent
         self.chk_telemetry = QCheckBox("Share anonymous usage metrics to improve Armenian AI models", self.page_engine)
         self.chk_telemetry.setChecked(self.analytics_val)
@@ -252,6 +291,23 @@ class Onboarding(QDialog):
 
         layout_eng.addStretch()
         self.stack.addWidget(self.page_engine)
+
+    def eventFilter(self, obj, event):
+        if self.capturing and event.type() == QEvent.MouseButtonPress:
+            btn = event.button()
+            btn_map = {
+                Qt.MiddleButton: "mouse:middle",
+                Qt.BackButton: "mouse:x1",
+                Qt.ForwardButton: "mouse:x2"
+            }
+            if btn in btn_map:
+                hotkey_str = btn_map[btn]
+                self.hotkey_val = hotkey_str
+                self.capturing = False
+                self.btn_hotkey.setText(self.hotkey_val.upper().replace("MOUSE:", "MOUSE "))
+                self.btn_hotkey.setStyleSheet("font-size: 15px; font-weight: bold; min-height: 40px; border-color: #3b82f6;")
+                return True # swallow event
+        return super().eventFilter(obj, event)
 
     def _toggle_capture(self):
         if self.capturing:
@@ -265,6 +321,11 @@ class Onboarding(QDialog):
             self.setFocus() # Pull focus away from button so keyPressEvent captures correctly
 
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            if not self.capturing:
+                event.ignore()
+                return
+
         if not self.capturing:
             super().keyPressEvent(event)
             return
@@ -317,38 +378,41 @@ class Onboarding(QDialog):
         else:
             return # ignore weird keys
 
-        if not mods:
-            # Require at least one modifier key
-            QMessageBox.warning(self, "Invalid Hotkey", "Dictation hotkeys require at least one modifier key (e.g. Alt or Ctrl).")
+        # Modifier-less binding is only safe for Function keys (F1–F12); a bare
+        # typing/navigation key would fire during normal use.
+        is_function_key = len(key_str) >= 2 and key_str[0] == "f" and key_str[1:].isdigit()
+        if not mods and not is_function_key:
+            QMessageBox.warning(
+                self, "Modifier Required",
+                "Use at least one modifier (Ctrl, Alt, Shift, or Win), a Function "
+                "key (F1–F12), or a mouse button.\n\nA single typing key can't be a "
+                "hotkey because it would trigger while you type."
+            )
             return
-            
-        self.hotkey_val = "+".join(mods + [key_str])
+
+        self.hotkey_val = "+".join(mods + [key_str]) if mods else key_str
         self._toggle_capture()
 
     def _set_backend(self, backend):
         self.backend_val = backend
-        if backend == "local":
-            self.local_card.setStyleSheet("QFrame#cardFrame { border-color: #3b82f6; }")
-            self.cloud_card.setStyleSheet("QFrame#cardFrame { border-color: #27272a; }")
-            self.google_input_frame.setVisible(False)
-            self.btn_sel_local.setObjectName("primaryButton")
-            self.btn_sel_cloud.setObjectName("")
-        else:
-            self.local_card.setStyleSheet("QFrame#cardFrame { border-color: #27272a; }")
-            self.cloud_card.setStyleSheet("QFrame#cardFrame { border-color: #3b82f6; }")
-            self.google_input_frame.setVisible(True)
-            self.btn_sel_local.setObjectName("")
-            self.btn_sel_cloud.setObjectName("primaryButton")
         
-        # Force redraw QSS styling
-        self.btn_sel_local.style().unpolish(self.btn_sel_local)
-        self.btn_sel_local.style().polish(self.btn_sel_local)
-        self.btn_sel_cloud.style().unpolish(self.btn_sel_cloud)
-        self.btn_sel_cloud.style().polish(self.btn_sel_cloud)
-        self.local_card.style().unpolish(self.local_card)
-        self.local_card.style().polish(self.local_card)
-        self.cloud_card.style().unpolish(self.cloud_card)
-        self.cloud_card.style().polish(self.cloud_card)
+        self.local_card.setStyleSheet(f"QFrame#cardFrame {{ border-color: {'#3b82f6' if backend == 'local' else '#27272a'}; }}")
+        self.cloud_card.setStyleSheet(f"QFrame#cardFrame {{ border-color: {'#3b82f6' if backend == 'google' else '#27272a'}; }}")
+        self.mistral_card.setStyleSheet(f"QFrame#cardFrame {{ border-color: {'#3b82f6' if backend == 'mistral' else '#27272a'}; }}")
+        
+        self.google_input_frame.setVisible(backend == "google")
+        self.mistral_input_frame.setVisible(backend == "mistral")
+        
+        self.btn_sel_local.setObjectName("primaryButton" if backend == "local" else "")
+        self.btn_sel_cloud.setObjectName("primaryButton" if backend == "google" else "")
+        self.btn_sel_mistral.setObjectName("primaryButton" if backend == "mistral" else "")
+        
+        for btn in (self.btn_sel_local, self.btn_sel_cloud, self.btn_sel_mistral):
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        for card in (self.local_card, self.cloud_card, self.mistral_card):
+            card.style().unpolish(card)
+            card.style().polish(card)
 
     def _back(self):
         if self.current_page > 0:
@@ -376,6 +440,7 @@ class Onboarding(QDialog):
         # Capture configurations
         self.lang_val = self.combo_lang.currentData()
         self.google_key_val = self.google_key_input.text().strip()
+        self.mistral_key_val = self.mistral_key_input.text().strip()
         self.analytics_val = self.chk_telemetry.isChecked()
         
         if self.backend_val == "google" and not self.google_key_val:
@@ -391,12 +456,27 @@ class Onboarding(QDialog):
                 self._set_backend("local")
                 return
 
+        if self.backend_val == "mistral" and not self.mistral_key_val:
+            reply = QMessageBox.question(
+                self, "Missing API Key",
+                "You selected Mistral AI but didn't provide an API key.\n\n"
+                "Do you want to go back and add it, or default to offline Local AI?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            )
+            if reply == QMessageBox.Yes:
+                return
+            else:
+                self._set_backend("local")
+                return
+
         # Save to main app configuration
         if self.app:
             self.app.cfg["hotkey"] = self.hotkey_val
             self.app.cfg["language"] = self.lang_val
             self.app.cfg["backend"] = self.backend_val
             self.app.cfg["google_api_key"] = self.google_key_val
+            self.app.cfg["mistral_api_key"] = self.mistral_key_val
+            self.app.cfg["mistral_stt_model"] = "voxtral-mini-latest"
             self.app.cfg["analytics_enabled"] = self.analytics_val
             self.app.cfg["onboarding_done"] = True
             
