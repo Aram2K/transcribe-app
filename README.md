@@ -39,13 +39,13 @@ It was built especially for **Armenian speakers** who need accurate, native-scri
 |---|---|
 | 🎙 **Hotkey recording** | Press any key combo (or mouse button) to start/stop |
 | 📋 **Smart paste** | Auto-pastes at your cursor; falls back to clipboard |
-| 🌐 **Armenian-first** | Optimized offline models with vibrant Armenian Flag Tricolor visual style |
+| 🌐 **Armenian-first** | Optimized offline models with Armenian Flag Tricolor branding and native AIBUBEN Yerevan AI Community integration |
 | 🔒 **Fully offline** | Local Whisper AI and Qwen/Gemma action summaries offline |
 | ☁️ **Google Cloud option** | Best accuracy for Armenian via Speech-to-Text API |
 | ⚡ **Streaming results** | Background chunks transcribed while you speak |
 | 📊 **Waveform overlay** | Premium floating visualizer overlay |
 | 🕘 **History log** | Searchable list of all past transcriptions |
-| ⚙️ **Settings panel** | Staged transactional settings (Save &amp; Cancel buttons) for full layout configuration |
+| ⚙️ **Settings panel** | Staged transactional settings (Save &amp; Cancel) with dynamic provider model isolation and real-world 2026 token pricing display |
 | 📝 **Custom vocabulary** | Seed recognition with names or domain terms |
 | 🪟 **System tray** | Zero footprint background daemon |
 
@@ -136,7 +136,7 @@ The summary and action items use whatever action engine you've configured in **S
 |---|---|---|
 | **Rule-based** (default) | Basic extractive summary + keyword-based action items | Free |
 | **Local Qwen** (1.5B/3B/7B) | Good summarisation, no network required | Free (one-time download) |
-| **OpenAI / Gemini / Anthropic** | Best quality | Pennies per meeting |
+| **OpenAI / Gemini / Anthropic** | Best quality (Gemini 2.5 Flash, Claude 4.6/4.8, GPT-5.4/5.5 with integrated real-time pricing display) | Pennies per meeting |
 
 For 1-hour+ meetings, a cloud engine is recommended because local Qwen has a smaller context window.
 
@@ -283,9 +283,9 @@ See the full [LICENSE](LICENSE) for details. For commercial licensing inquiries:
 
 ## Author
 
-Created by **Aram Adamyan**, Founder of [Aibuben.xyz](https://aibuben.xyz).
+Created by **[Aram Adamyan](https://www.linkedin.com/in/aram-adamyan-2k/)**, Founder of [Aibuben.xyz](https://aibuben.xyz).
 
-[Aibuben.xyz](https://aibuben.xyz) · [GitHub](https://github.com/Aram2K) · [Report an issue](https://github.com/Aram2K/transcribe-app/issues)
+[Aibuben.xyz](https://aibuben.xyz) · [LinkedIn](https://www.linkedin.com/in/aram-adamyan-2k/) · [GitHub](https://github.com/Aram2K) · [Report an issue](https://github.com/Aram2K/transcribe-app/issues)
 
 ---
 
