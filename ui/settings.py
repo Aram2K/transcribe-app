@@ -1205,6 +1205,49 @@ class Settings(QDialog):
         desc_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(desc_label)
 
+        # AIBUBEN Community & Founder Card
+        aibuben_frame = QFrame(tab)
+        aibuben_frame.setObjectName("cardFrame")
+        aibuben_lay = QVBoxLayout(aibuben_frame)
+        aibuben_lay.setContentsMargins(14, 14, 14, 14)
+        aibuben_lay.setSpacing(8)
+        aibuben_lay.setAlignment(Qt.AlignCenter)
+
+        lbl_aibuben_title = QLabel("Powered by AIBUBEN", aibuben_frame)
+        lbl_aibuben_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #3b82f6;")
+        lbl_aibuben_title.setAlignment(Qt.AlignCenter)
+        aibuben_lay.addWidget(lbl_aibuben_title)
+
+        lbl_aibuben_desc = QLabel(
+            "This project is proud to be part of the <b>AIBUBEN</b> AI community in Yerevan—"
+            "empowering AI builders, creators, and students to learn, connect, and build state-of-the-art products.",
+            aibuben_frame
+        )
+        lbl_aibuben_desc.setWordWrap(True)
+        lbl_aibuben_desc.setStyleSheet("font-size: 12px; color: #475569; line-height: 18px;")
+        lbl_aibuben_desc.setAlignment(Qt.AlignCenter)
+        aibuben_lay.addWidget(lbl_aibuben_desc)
+
+        # Clickable Social Links Row
+        links_layout = QHBoxLayout()
+        links_layout.setAlignment(Qt.AlignCenter)
+        links_layout.setSpacing(24)
+
+        lbl_web_link = QLabel(aibuben_frame)
+        lbl_web_link.setText("<a href='https://aibuben.xyz' style='color: #3b82f6; text-decoration: none; font-weight: bold;'>🌐 Visit aibuben.xyz</a>")
+        lbl_web_link.setOpenExternalLinks(True)
+        lbl_web_link.setStyleSheet("font-size: 12px;")
+        links_layout.addWidget(lbl_web_link)
+
+        lbl_linkedin_link = QLabel(aibuben_frame)
+        lbl_linkedin_link.setText("<a href='https://www.linkedin.com/in/aram-adamyan-2k/' style='color: #0077b5; text-decoration: none; font-weight: bold;'>🔗 Aram Adamyan on LinkedIn</a>")
+        lbl_linkedin_link.setOpenExternalLinks(True)
+        lbl_linkedin_link.setStyleSheet("font-size: 12px;")
+        links_layout.addWidget(lbl_linkedin_link)
+
+        aibuben_lay.addLayout(links_layout)
+        layout.addWidget(aibuben_frame)
+
         # Update checking button
         self.btn_update = QPushButton("Check for Updates", tab)
         if self.app and self.cfg_working.get("pending_update_version"):
