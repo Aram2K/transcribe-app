@@ -108,7 +108,7 @@ class Settings(QDialog):
             self.rb_smart.blockSignals(False)
             self.rb_transcribe.blockSignals(False)
             if hasattr(self, "engine_section"):
-                self.engine_section.setVisible(self.rb_smart.isChecked())
+                self.engine_section.setEnabled(self.rb_smart.isChecked())
         
         # 2. Spoken Language
         idx = self.combo_lang.findData(self.cfg_working.get("language", "auto"))
@@ -593,9 +593,12 @@ class Settings(QDialog):
         self.lay_cloud.addWidget(self.cloud_api_url)
 
         self.lay_cloud.addWidget(QLabel("API Model Identifier", self.card_cloud))
-        self.cloud_api_model = QLineEdit(self.card_cloud)
-        self.cloud_api_model.textChanged.connect(self._save_action_configs)
+        self.cloud_api_model = QComboBox(self.card_cloud)
+        self.cloud_api_model.setEditable(False)
+        self._configure_dropdown(self.cloud_api_model, min_width=320)
+        self.cloud_api_model.currentTextChanged.connect(self._on_model_changed)
         self.lay_cloud.addWidget(self.cloud_api_model)
+        self.lay_cloud.addStretch(1)
 
         self.engine_stack.addWidget(self.card_cloud)
 
@@ -643,6 +646,7 @@ class Settings(QDialog):
 
         engine_section_lay.addWidget(self.engine_stack)
         layout.addWidget(self.engine_section)
+        layout.addStretch(1)
 
         scroll.setWidget(content)
         outer.addWidget(scroll)
@@ -664,13 +668,18 @@ class Settings(QDialog):
         QTimer.singleShot(0, lambda: content.setMinimumWidth(scroll.viewport().width()))
 
         self._refresh_mode_cards_layout()
+        # Initial enabled state: engine controls active only in Smart mode.
+        if hasattr(self, "engine_section"):
+            self.engine_section.setEnabled(self.rb_smart.isChecked())
         return tab
 
     def _on_output_mode_changed(self):
         is_smart = self.rb_smart.isChecked()
+        # Engine controls stay visible at all times; they're just disabled
+        # (grayed out) when Transcribe-only is selected. No hide/expand so the
+        # layout never shifts.
         if hasattr(self, "engine_section"):
-            self.engine_section.setVisible(is_smart)
-        self._refresh_mode_cards_layout()
+            self.engine_section.setEnabled(is_smart)
         new_mode = actions.ACTION_SMART_AUTO if is_smart else actions.ACTION_TRANSCRIBE_ONLY
         self.cfg_working["output_action"] = new_mode
         for card, sel in (
@@ -681,30 +690,22 @@ class Settings(QDialog):
                 card.setStyleSheet(self._mode_card_style(sel))
 
     def _refresh_mode_cards_layout(self):
-        """Full-width cards; split vertical space when only output mode is shown."""
+        """Keep the two mode cards compact and fixed-height.
+
+        The engine section is always visible now (just enabled/disabled), so
+        the cards no longer need to expand to fill space when Transcribe-only
+        is selected — that previously caused the giant-empty-card layout.
+        """
         if not hasattr(self, "card_transcribe"):
             return
-        is_smart = self.rb_smart.isChecked()
-        compact_h = 120
+        compact_h = 96
         for card in (self.card_transcribe, self.card_smart):
-            card.setSizePolicy(
-                QSizePolicy.Policy.Expanding,
-                QSizePolicy.Policy.Fixed if is_smart else QSizePolicy.Policy.Expanding,
-            )
-            card.setMinimumHeight(compact_h if is_smart else 140)
-            if is_smart:
-                card.setMaximumHeight(200)
-            else:
-                card.setMaximumHeight(16777215)
+            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            card.setMinimumHeight(compact_h)
+            card.setMaximumHeight(140)
         if hasattr(self, "_mode_cards_layout"):
-            stretch = 0 if is_smart else 1
-            self._mode_cards_layout.setStretch(0, stretch)
-            self._mode_cards_layout.setStretch(1, stretch)
-        parent_lay = self.mode_section.parentWidget().layout() if hasattr(self, "mode_section") else None
-        if parent_lay is not None:
-            parent_lay.setStretchFactor(self.mode_section, 0 if is_smart else 1)
-            if hasattr(self, "engine_section"):
-                parent_lay.setStretchFactor(self.engine_section, 1 if is_smart else 0)
+            self._mode_cards_layout.setStretch(0, 0)
+            self._mode_cards_layout.setStretch(1, 0)
 
     def _build_mode_card(self, parent, title, description, checked=False):
         """Full-width selectable mode card (radio + title + description)."""
@@ -914,30 +915,125 @@ class Settings(QDialog):
             self.cloud_api_url.blockSignals(True)
             self.cloud_api_model.blockSignals(True)
             
+            self.cloud_api_model.clear()
+            
             if provider == actions.API_GEMINI_ID:
                 self.lbl_cloud_url.setVisible(False)
                 self.cloud_api_url.setVisible(False)
-                self.cloud_api_model.setPlaceholderText("gemini-1.5-flash")
+                models_info = [
+                    ("gemini-2.5-flash (~$0.075 / 1M tokens)", "gemini-2.5-flash"),
+                    ("gemini-2.5-flash-lite (~$0.0375 / 1M tokens)", "gemini-2.5-flash-lite"),
+                    ("gemini-2.5-pro (~$1.25 / 1M tokens)", "gemini-2.5-pro"),
+                    ("gemini-3.5-flash (~$0.075 / 1M tokens)", "gemini-3.5-flash"),
+                    ("gemini-3.1-flash-lite (~$0.0375 / 1M tokens)", "gemini-3.1-flash-lite"),
+                    ("gemini-1.5-flash (~$0.075 / 1M tokens)", "gemini-1.5-flash"),
+                ]
+                for label, model_id in models_info:
+                    self.cloud_api_model.addItem(label, model_id)
+                self.cloud_api_model.addItem("Custom Model...")
                 self.cloud_api_key.setText(self.cfg_working.get("google_api_key", ""))
-                self.cloud_api_model.setText(self.cfg_working.get("action_api_model", "") or "gemini-1.5-flash")
+                
+                saved_model = self.cfg_working.get("action_api_model", "") or "gemini-2.5-flash"
+                idx = self.cloud_api_model.findData(saved_model)
+                if idx < 0:
+                    idx = self.cloud_api_model.findText(saved_model)
+                    if idx < 0 and saved_model != "Custom Model...":
+                        insert_idx = max(0, self.cloud_api_model.count() - 1)
+                        self.cloud_api_model.insertItem(insert_idx, saved_model)
+                        idx = insert_idx
+                if idx >= 0:
+                    self.cloud_api_model.setCurrentIndex(idx)
+                
             elif provider == actions.API_ANTHROPIC_ID:
                 self.lbl_cloud_url.setVisible(False)
                 self.cloud_api_url.setVisible(False)
-                self.cloud_api_model.setPlaceholderText("claude-3-haiku-20240307")
+                models_info = [
+                    ("claude-3-5-sonnet-latest (~$3.00 / 1M tokens)", "claude-3-5-sonnet-latest"),
+                    ("claude-3-haiku-20240307 (~$0.25 / 1M tokens)", "claude-3-haiku-20240307"),
+                    ("claude-3-opus-20240229 (~$15.00 / 1M tokens)", "claude-3-opus-20240229"),
+                ]
+                for label, model_id in models_info:
+                    self.cloud_api_model.addItem(label, model_id)
+                self.cloud_api_model.addItem("Custom Model...")
                 self.cloud_api_key.setText(self.cfg_working.get("action_api_key", ""))
-                self.cloud_api_model.setText(self.cfg_working.get("action_api_model", "") or "claude-3-haiku-20240307")
+                
+                saved_model = self.cfg_working.get("action_api_model", "") or "claude-3-5-sonnet-latest"
+                idx = self.cloud_api_model.findData(saved_model)
+                if idx < 0:
+                    idx = self.cloud_api_model.findText(saved_model)
+                    if idx < 0 and saved_model != "Custom Model...":
+                        insert_idx = max(0, self.cloud_api_model.count() - 1)
+                        self.cloud_api_model.insertItem(insert_idx, saved_model)
+                        idx = insert_idx
+                if idx >= 0:
+                    self.cloud_api_model.setCurrentIndex(idx)
+                
             else: # OpenAI
                 self.lbl_cloud_url.setVisible(True)
                 self.cloud_api_url.setVisible(True)
                 self.cloud_api_url.setPlaceholderText("https://api.openai.com/v1")
-                self.cloud_api_model.setPlaceholderText("gpt-4o-mini")
+                models_info = [
+                    ("gpt-4o-mini (~$0.15 / 1M tokens)", "gpt-4o-mini"),
+                    ("gpt-4o (~$2.50 / 1M tokens)", "gpt-4o"),
+                    ("gpt-5.4-mini (~$0.10 / 1M tokens)", "gpt-5.4-mini"),
+                    ("gpt-4.8 (~$2.00 / 1M tokens)", "gpt-4.8"),
+                    ("gpt-4.6 (~$1.80 / 1M tokens)", "gpt-4.6"),
+                    ("gpt-4.5 (~$1.50 / 1M tokens)", "gpt-4.5"),
+                    ("gpt-3.5-turbo (~$0.50 / 1M tokens)", "gpt-3.5-turbo"),
+                ]
+                for label, model_id in models_info:
+                    self.cloud_api_model.addItem(label, model_id)
+                self.cloud_api_model.addItem("Custom Model...")
                 self.cloud_api_key.setText(self.cfg_working.get("action_api_key", ""))
                 self.cloud_api_url.setText(self.cfg_working.get("action_api_base_url", ""))
-                self.cloud_api_model.setText(self.cfg_working.get("action_api_model", ""))
+                
+                saved_model = self.cfg_working.get("action_api_model", "") or "gpt-4o-mini"
+                idx = self.cloud_api_model.findData(saved_model)
+                if idx < 0:
+                    idx = self.cloud_api_model.findText(saved_model)
+                    if idx < 0 and saved_model != "Custom Model...":
+                        insert_idx = max(0, self.cloud_api_model.count() - 1)
+                        self.cloud_api_model.insertItem(insert_idx, saved_model)
+                        idx = insert_idx
+                if idx >= 0:
+                    self.cloud_api_model.setCurrentIndex(idx)
                 
             self.cloud_api_key.blockSignals(False)
             self.cloud_api_url.blockSignals(False)
             self.cloud_api_model.blockSignals(False)
+
+    def _on_model_changed(self, text):
+        if text == "Custom Model...":
+            from PySide6.QtWidgets import QInputDialog
+            self.cloud_api_model.blockSignals(True)
+            custom_model, ok = QInputDialog.getText(
+                self,
+                "Custom Model",
+                "Enter valid API model identifier (e.g. 'deepseek-chat'):\n\n"
+                "Warning: Entering a random name like 'mango' will cause API requests to fail.\n"
+                "Please make sure it matches a model identifier supported by your API provider.",
+                text=""
+            )
+            custom_model = custom_model.strip() if ok else ""
+            if ok and custom_model:
+                idx = self.cloud_api_model.findText(custom_model)
+                if idx < 0:
+                    insert_idx = max(0, self.cloud_api_model.count() - 1)
+                    self.cloud_api_model.insertItem(insert_idx, custom_model)
+                    idx = insert_idx
+                self.cloud_api_model.setCurrentIndex(idx)
+            else:
+                prev_model = self.cfg_working.get("action_api_model", "")
+                idx = self.cloud_api_model.findData(prev_model)
+                if idx < 0:
+                    idx = self.cloud_api_model.findText(prev_model)
+                if idx >= 0:
+                    self.cloud_api_model.setCurrentIndex(idx)
+                else:
+                    self.cloud_api_model.setCurrentIndex(0)
+            self.cloud_api_model.blockSignals(False)
+            
+        self._save_action_configs()
 
     def _save_general_configs(self):
         if not self.app:
@@ -945,6 +1041,12 @@ class Settings(QDialog):
         self.cfg_working["language"] = self.combo_lang.currentData()
         self.cfg_working["initial_prompt"] = self.vocab_input.toPlainText().strip()
         self.cfg_working["privacy_mode"] = self.chk_privacy.isChecked()
+        if self.chk_privacy.isChecked():
+            self.cfg_working["save_history"] = False
+            if hasattr(self, "chk_history"):
+                self.chk_history.blockSignals(True)
+                self.chk_history.setChecked(False)
+                self.chk_history.blockSignals(False)
 
     def _save_action_configs(self):
         if not self.app:
@@ -965,7 +1067,10 @@ class Settings(QDialog):
                 self.cfg_working["action_api_key"] = key_text
                 self.cfg_working["action_api_base_url"] = self.cloud_api_url.text().strip()
                 
-            self.cfg_working["action_api_model"] = self.cloud_api_model.text().strip()
+            saved_val = self.cloud_api_model.currentData()
+            if not saved_val:
+                saved_val = self.cloud_api_model.currentText().strip()
+            self.cfg_working["action_api_model"] = saved_val
             self.cfg_working["action_api_provider"] = action_api.normalize_provider(provider)
 
     # ── TAB 4: History & Telemetry ───────────────────────────────────────────
@@ -994,6 +1099,13 @@ class Settings(QDialog):
         btn_lay.addWidget(btn_exp_txt)
         h_lay.addLayout(btn_lay)
         layout.addWidget(hist_frame)
+
+        # History toggle checkbox
+        self.chk_history = QCheckBox("Save local transcription history", tab)
+        if self.app:
+            self.chk_history.setChecked(bool(self.cfg_working.get("save_history", True)))
+        self.chk_history.stateChanged.connect(self._save_history_config)
+        layout.addWidget(self.chk_history)
 
         # Telemetry Consent checkbox
         self.chk_telemetry = QCheckBox("Share anonymous usage metrics to improve Armenian AI models", tab)
@@ -1032,6 +1144,11 @@ class Settings(QDialog):
                 QMessageBox.information(self, "Success", f"Exported {count} entries successfully!")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to export history: {e}")
+
+    def _save_history_config(self):
+        if not self.app:
+            return
+        self.cfg_working["save_history"] = self.chk_history.isChecked()
 
     def _save_telemetry_config(self):
         if not self.app:

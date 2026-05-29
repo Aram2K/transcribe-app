@@ -86,15 +86,19 @@ class TestActions(unittest.TestCase):
         self.assertIn("Subject:", out)
         run_action.assert_called_once()
 
-    def test_smart_auto_missing_local_model_falls_back_to_rules(self):
+    def test_smart_auto_missing_local_model_raises_clear_error(self):
+        # When the chosen local engine isn't downloaded, Smart mode must
+        # surface a clear, actionable error instead of silently degrading to
+        # rule-based output (which looked like "it just transcribed").
         with patch.object(actions.local_llm, "model_downloaded", return_value=False), \
              patch.object(actions.local_llm, "run_action") as run_action:
-            out = actions.process(
-                "write an email to john that the report is ready",
-                actions.ACTION_SMART_AUTO,
-                model=actions.local_llm.QWEN_7B_ID,
-            )
-        self.assertIn("Subject:", out)
+            with self.assertRaises(actions.ActionError) as ctx:
+                actions.process(
+                    "write an email to john that the report is ready",
+                    actions.ACTION_SMART_AUTO,
+                    model=actions.local_llm.QWEN_7B_ID,
+                )
+        self.assertIn("download", str(ctx.exception).lower())
         run_action.assert_not_called()
 
     def test_cloud_action_uses_configured_api(self):
