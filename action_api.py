@@ -10,7 +10,7 @@ PROVIDERS = {
         "label": "OpenAI-compatible API",
         "description": "Works with OpenAI, OpenRouter, Groq, Together, LM Studio, and compatible servers.",
         "default_base_url": "https://api.openai.com/v1",
-        "default_model": "gpt-4o-mini",
+        "default_model": "gpt-5.4-mini",
     },
     PROVIDER_GEMINI: {
         "label": "Google Gemini API",
@@ -22,7 +22,7 @@ PROVIDERS = {
         "label": "Anthropic API",
         "description": "Use your own Anthropic API key for cloud action modes.",
         "default_base_url": "https://api.anthropic.com/v1",
-        "default_model": "claude-3-haiku-20240307",
+        "default_model": "claude-sonnet-4-6",
     },
 }
 
