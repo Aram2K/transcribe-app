@@ -107,7 +107,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt pyinstaller --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 
       - name: Generate app icon
         shell: pwsh
@@ -209,7 +209,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           /opt/homebrew/bin/python3.11 -m pip install --upgrade pip
-          /opt/homebrew/bin/python3.11 -m pip install -r requirements.txt pyinstaller
+          /opt/homebrew/bin/python3.11 -m pip install -r requirements.txt pyinstaller --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 
       - name: Build .app
         run: |

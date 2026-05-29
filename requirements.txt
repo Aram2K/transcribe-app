@@ -13,7 +13,15 @@ pystray
 Pillow
 psutil
 requests
-llama-cpp-python
+# llama-cpp-python powers the local Smart-action LLMs (Qwen/Gemma).
+# Pinned to 0.2.90 because the prebuilt CPU wheels from 0.3.x onward are
+# compiled with AVX-512, which crashes (STATUS_ILLEGAL_INSTRUCTION /
+# 0xc000001d) on the majority of consumer CPUs that lack it — including
+# Intel hybrid P/E-core chips (12th gen+) and pre-2024 mobile i7s.
+# 0.2.90's CPU wheel targets an AVX2 baseline and still loads Qwen2.5 GGUF.
+# Install with the CPU wheel index, e.g.:
+#   pip install -r requirements.txt --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+llama-cpp-python==0.2.90
 PySide6==6.8.2
 PySide6_Essentials==6.8.2
 PySide6_Addons==6.8.2

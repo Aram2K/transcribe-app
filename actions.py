@@ -153,50 +153,55 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
     if mode == ACTION_TRANSCRIBE_ONLY:
         return text
 
-    # Smart auto: the LLM detects intent from voice. Fast-path: if the
-    # transcript has no action keywords, skip the LLM entirely and pass
-    # through the (Whisper-cleaned) text.
     if mode == ACTION_SMART_AUTO:
-        if not smart_prompt.has_action_intent(text):
-            return _clean_transcript(text)
 
         kind = ACTION_MODELS[model].get("kind")
-        llm_error = None
 
+        # Cloud engine: let API errors surface clearly (missing key, bad key,
+        # network). We do NOT silently fall back to rule-based — the user
+        # explicitly picked a cloud LLM, so a failure must be visible.
         if kind == "cloud":
             if not config:
-                raise ActionError("Add your action API settings before using Smart actions.")
+                raise ActionError("Add your API key in Settings → AI Actions to use Smart actions.")
             api_config = {**config, "action_api_provider": ACTION_MODELS[model]["provider"]}
+            # Convenience: Gemini actions reuse the Google API key (used for the
+            # speech backend) when no dedicated action key is configured, so a
+            # single Google key powers both transcription and Smart actions.
+            if (ACTION_MODELS[model]["provider"] == action_api.PROVIDER_GEMINI
+                    and not (api_config.get("action_api_key") or "").strip()):
+                google_key = (config.get("google_api_key") or "").strip()
+                if google_key:
+                    api_config["action_api_key"] = google_key
             try:
                 return action_api.run_action(
                     text, ACTION_SMART_AUTO, api_config,
                     source_lang=source_lang, target_lang=target_lang,
                 )
             except action_api.ActionAPIError as e:
-                llm_error = ActionError(str(e))
-        elif kind == "local_llm":
-            if local_llm.model_downloaded(model):
-                try:
-                    return local_llm.run_action(
-                        text, ACTION_SMART_AUTO,
-                        source_lang=source_lang,
-                        target_lang=target_lang, model_id=model,
-                    )
-                except local_llm.LocalLLMError as e:
-                    llm_error = ActionError(str(e))
-            else:
-                label = local_llm.MODEL_CATALOG.get(model, {}).get("label", model)
-                llm_error = ActionError(
-                    f"{label} is not downloaded yet. Download it in Settings → AI Actions, "
-                    "or switch to Rule-based Formatter."
-                )
+                raise ActionError(str(e)) from e
 
-        # Rule-based / extractive routing (also used when LLM fails or is rule_based).
+        # Local LLM engine: require the model to be present, and surface a
+        # clear "download it" message rather than quietly transcribing.
+        if kind == "local_llm":
+            if not local_llm.model_downloaded(model):
+                label = local_llm.MODEL_CATALOG.get(model, {}).get("label", model)
+                raise ActionError(
+                    f"Smart actions need {label}, which isn't downloaded yet. "
+                    "Download it in Settings → AI Actions, or choose a cloud engine."
+                )
+            try:
+                return local_llm.run_action(
+                    text, ACTION_SMART_AUTO,
+                    source_lang=source_lang,
+                    target_lang=target_lang, model_id=model,
+                )
+            except local_llm.LocalLLMError as e:
+                raise ActionError(str(e)) from e
+
+        # Rule-based engine was explicitly chosen — best-effort regex routing.
         routed = _run_smart_rule_based(text, source_lang, target_lang, config)
         if routed is not None:
             return routed
-        if llm_error:
-            raise llm_error
         return _clean_transcript(text)
 
     if ACTION_MODELS[model].get("kind") == "cloud":

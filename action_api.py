@@ -16,7 +16,7 @@ PROVIDERS = {
         "label": "Google Gemini API",
         "description": "Use your own Gemini API key for cloud action modes.",
         "default_base_url": "https://generativelanguage.googleapis.com/v1beta",
-        "default_model": "gemini-1.5-flash",
+        "default_model": "gemini-2.5-flash",
     },
     PROVIDER_ANTHROPIC: {
         "label": "Anthropic API",
