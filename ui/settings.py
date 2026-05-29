@@ -918,8 +918,8 @@ class Settings(QDialog):
             self.cloud_api_model.clear()
             
             gemini_models = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-1.5-flash"]
-            anthropic_models = ["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest", "claude-3-5-opus-latest", "claude-3-haiku-20240307", "claude-3-opus-20240229"]
-            openai_models = ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo", "gpt-5.4-mini"]
+            anthropic_models = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest", "claude-3-5-opus-latest", "claude-3-haiku-20240307", "claude-3-opus-20240229"]
+            openai_models = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"]
             
             if provider == actions.API_GEMINI_ID:
                 self.lbl_cloud_url.setVisible(False)
@@ -955,6 +955,9 @@ class Settings(QDialog):
                 self.lbl_cloud_url.setVisible(False)
                 self.cloud_api_url.setVisible(False)
                 models_info = [
+                    ("claude-opus-4-8 (~$5.00 / 1M tokens)", "claude-opus-4-8"),
+                    ("claude-sonnet-4-6 (~$3.00 / 1M tokens)", "claude-sonnet-4-6"),
+                    ("claude-haiku-4-5 (~$1.00 / 1M tokens)", "claude-haiku-4-5-20251001"),
                     ("claude-3-5-sonnet-latest (~$3.00 / 1M tokens)", "claude-3-5-sonnet-latest"),
                     ("claude-3-5-haiku-latest (~$0.80 / 1M tokens)", "claude-3-5-haiku-latest"),
                     ("claude-3-5-opus-latest (~$15.00 / 1M tokens)", "claude-3-5-opus-latest"),
@@ -966,9 +969,9 @@ class Settings(QDialog):
                 self.cloud_api_model.addItem("Custom Model...")
                 self.cloud_api_key.setText(self.cfg_working.get("action_api_key", ""))
                 
-                saved_model = self.cfg_working.get("action_api_model", "") or "claude-3-5-sonnet-latest"
+                saved_model = self.cfg_working.get("action_api_model", "") or "claude-sonnet-4-6"
                 if saved_model in set(gemini_models + openai_models):
-                    saved_model = "claude-3-5-sonnet-latest"
+                    saved_model = "claude-sonnet-4-6"
                 
                 idx = self.cloud_api_model.findData(saved_model)
                 if idx < 0:
@@ -985,9 +988,11 @@ class Settings(QDialog):
                 self.cloud_api_url.setVisible(True)
                 self.cloud_api_url.setPlaceholderText("https://api.openai.com/v1")
                 models_info = [
-                    ("gpt-4o-mini (~$0.15 / 1M tokens)", "gpt-4o-mini"),
+                    ("gpt-5.5 (~$5.00 / 1M tokens)", "gpt-5.5"),
+                    ("gpt-5.4 (~$2.50 / 1M tokens)", "gpt-5.4"),
+                    ("gpt-5.4-mini (~$0.75 / 1M tokens)", "gpt-5.4-mini"),
                     ("gpt-4o (~$2.50 / 1M tokens)", "gpt-4o"),
-                    ("gpt-5.4-mini (~$0.10 / 1M tokens)", "gpt-5.4-mini"),
+                    ("gpt-4o-mini (~$0.15 / 1M tokens)", "gpt-4o-mini"),
                     ("gpt-3.5-turbo (~$0.50 / 1M tokens)", "gpt-3.5-turbo"),
                 ]
                 for label, model_id in models_info:
@@ -996,9 +1001,9 @@ class Settings(QDialog):
                 self.cloud_api_key.setText(self.cfg_working.get("action_api_key", ""))
                 self.cloud_api_url.setText(self.cfg_working.get("action_api_base_url", ""))
                 
-                saved_model = self.cfg_working.get("action_api_model", "") or "gpt-4o-mini"
+                saved_model = self.cfg_working.get("action_api_model", "") or "gpt-5.4-mini"
                 if saved_model in set(gemini_models + anthropic_models):
-                    saved_model = "gpt-4o-mini"
+                    saved_model = "gpt-5.4-mini"
                 
                 idx = self.cloud_api_model.findData(saved_model)
                 if idx < 0:
