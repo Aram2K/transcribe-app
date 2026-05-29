@@ -122,11 +122,11 @@ Each meeting is stored in `%APPDATA%\Transcribe\meetings\<timestamp>\` with:
 
 ### Capturing the *other* participants' audio
 
-By default the meeting recorder captures your microphone. To also capture what the other people in the meeting are saying, you need to pick a **system loopback input**:
+By default, the meeting recorder is set to **Smart Meeting Mode (Record BOTH Computer Sound + My Microphone)**. This dynamically scans for the active default playback device (Speakers or Headphones) and automatically captures/mixes what the other people in the meeting are saying directly, with zero manual host API configuration needed!
 
-- **Windows:** the app bundles `pyaudiowpatch`, so any **`[Loopback]` entry** in the device picker captures system audio directly. No setup needed.
-- **macOS:** install [BlackHole](https://existential.audio/blackhole/) (free), route Google Meet / Zoom output through it, then select the BlackHole input in the meeting picker.
-- **Linux:** use PulseAudio's monitor source (`pactl load-module module-loopback`) and select the monitor device.
+- **Windows:** Completely automatic using the dynamic WASAPI loopback mixer. No virtual cables or complicated drivers needed.
+- **macOS:** Install [BlackHole](https://existential.audio/blackhole/) (free) to enable native loopback routing.
+- **Linux:** Select standard PulseAudio monitor inputs.
 
 ### Notes quality
 
@@ -175,17 +175,21 @@ Models are downloaded automatically on first use. The app grays out models your 
 
 ## Settings
 
-Open via **right-click tray icon → Settings**.
+Open via **right-click tray icon → Settings**. The settings window is cleanly split into task-oriented tabs:
 
-| Setting | Description |
-|---------|-------------|
-| **Backend** | Local (offline) or Google Cloud |
-| **Google API Key** | Paste your key; click Test to verify |
-| **Model** | Whisper model size (local only) |
-| **Hotkey** | Click the badge, press any key combo or mouse button |
-| **Language** | Auto-detect, Armenian, English, Russian, and more |
-| **Accent color** | Blue, Green, Purple, Pink, Orange, White |
-| **Custom vocabulary** | Words/names to help recognition (e.g. "Aram, Aibuben, AI") |
+### General Tab
+*   **Dictation Hotkey:** Configure your custom keyboard shortcut or mouse button trigger.
+*   **Default Spoken Language:** Select auto-detect or a specific language (Armenian, English, Russian, etc.).
+*   **Custom Vocabulary:** Guide recognition by providing names or domain-specific terms.
+*   **Meeting Recording Mode:** Toggle standard microphone-only recording or dynamic system loopback mixing.
+*   **Privacy Mode:** Disable history and enforce local offline models.
+
+### Models Tab
+Unifies all transcription backends as first-class card choices in a single view:
+*   **Local Models:** Whisper Tiny, Base, Small, Medium, Large-Turbo, and Large-v3.
+*   **Mistral AI Models:** Voxtral Mini, Small, and Large cloud STT models.
+*   **Google Cloud Models:** Enterprise Speech-to-Text API.
+*   **Cloud API Credentials:** Sleek, integrated input frame at the bottom to configure Google and Mistral API keys.
 
 ---
 

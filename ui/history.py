@@ -4,7 +4,7 @@ import os
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QListWidget, QListWidgetItem, QMenu, QMessageBox, QFileDialog, QWidget
+    QPushButton, QListWidget, QListWidgetItem, QMenu, QMessageBox, QFileDialog, QWidget, QApplication
 )
 from PySide6.QtGui import QFont, QAction, QIcon, QClipboard
 import history as hist
@@ -260,3 +260,9 @@ class HistoryWindow(QDialog):
                 )
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", f"Failed to export history: {e}")
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            event.ignore()
+        else:
+            super().keyPressEvent(event)

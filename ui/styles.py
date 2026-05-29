@@ -313,4 +313,35 @@ QListWidget::item:selected {
     background-color: #2563eb;
     color: #ffffff;
 }
+
+/* Checkboxes */
+QCheckBox {
+    spacing: 8px;
+    color: #334155;
+    font-weight: 500;
+}
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+    border: 1.5px solid #cbd5e1;
+    border-radius: 6px;
+    background-color: #ffffff;
+}
+QCheckBox::indicator:hover {
+    border-color: #3b82f6;
+    background-color: #f8fafc;
+}
+QCheckBox::indicator:checked {
+    border-color: #3b82f6;
+    background-color: #3b82f6;
+    image: url("assets/check.svg");
+}
+QCheckBox::indicator:checked:hover {
+    border-color: #2563eb;
+    background-color: #2563eb;
+}
+QCheckBox::indicator:disabled {
+    background-color: #f1f5f9;
+    border-color: #e2e8f0;
+}
 """

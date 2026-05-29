@@ -21,6 +21,9 @@ class DownloadProgressSignal(QObject):
     finished = Signal(str, str)          # model_name, state ("downloaded" / "failed")
 
 class Settings(QDialog):
+    mistral_test_finished = Signal(bool, str)
+    google_test_finished = Signal(bool, str)
+
     def __init__(self, parent=None, main_app=None):
         super().__init__(parent)
         self.app = main_app
@@ -48,6 +51,14 @@ class Settings(QDialog):
         self._local_llm_progress = {}
         self.capturing = False
         
+        # Cloud API key verification states
+        self._mistral_key_verified = None
+        self._google_key_verified = None
+        
+        # Connect test signals
+        self.mistral_test_finished.connect(self._on_mistral_test_finished)
+        self.google_test_finished.connect(self._on_google_test_finished)
+        
         # Whisper model card controls references
         self.whisper_cards = {}
         self.llm_cards = {}
@@ -56,6 +67,8 @@ class Settings(QDialog):
         self._scan_model_statuses()
         
         self._build_ui()
+        self.btn_hotkey.installEventFilter(self)
+        self.installEventFilter(self)
         self._set_backend_layout(self.cfg_working.get("action_api_provider", "api_openai_compatible") if self.app else "api_openai_compatible")
         self._load_values_into_widgets()
 
@@ -68,11 +81,75 @@ class Settings(QDialog):
         self._load_values_into_widgets()
         for name in list(self.whisper_cards.keys()):
             self._update_whisper_card_ui(name)
+        if hasattr(self, "mistral_cards"):
+            for name in list(self.mistral_cards.keys()):
+                self._update_mistral_card_ui(name)
+        self._update_google_card_ui()
         for name in list(self.llm_cards.keys()):
             self._update_llm_card_ui(name)
+        self._update_privacy_ui_state()
 
     def _on_save_clicked(self):
         self._sync_action_settings_from_widgets()
+        
+        backend = self.cfg_working.get("backend", "local")
+        if backend == "mistral":
+            mistral_key = self.cfg_working.get("mistral_api_key", "").strip()
+            if hasattr(self, "mistral_key_input"):
+                mistral_key = self.mistral_key_input.text().strip()
+            if not mistral_key:
+                self.tabs.setCurrentIndex(1)  # Switch to 'Models' tab
+                if hasattr(self, "mistral_key_input"):
+                    self.mistral_key_input.setFocus()
+                    self.mistral_key_input.setStyleSheet("border: 2px solid #ef4444; background-color: #fef2f2;")
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self,
+                    "API Key Required",
+                    "Mistral STT requires a valid Mistral API Key. Please enter it below before saving."
+                )
+                return
+            if getattr(self, "_mistral_key_verified", False) is False:
+                self.tabs.setCurrentIndex(1)
+                if hasattr(self, "mistral_key_input"):
+                    self.mistral_key_input.setFocus()
+                    self.mistral_key_input.setStyleSheet("border: 2px solid #ef4444; background-color: #fef2f2;")
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self,
+                    "Invalid API Key",
+                    "The provided Mistral API Key failed connection tests. Please test a valid API key before saving."
+                )
+                return
+        elif backend == "google":
+            google_key = self.cfg_working.get("google_api_key", "").strip()
+            if hasattr(self, "google_key_input"):
+                google_key = self.google_key_input.text().strip()
+            if not google_key:
+                self.tabs.setCurrentIndex(1)  # Switch to 'Models' tab
+                if hasattr(self, "google_key_input"):
+                    self.google_key_input.setFocus()
+                    self.google_key_input.setStyleSheet("border: 2px solid #ef4444; background-color: #fef2f2;")
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self,
+                    "API Key Required",
+                    "Google Cloud Speech STT requires a valid Google Speech API Key. Please enter it below before saving."
+                )
+                return
+            if getattr(self, "_google_key_verified", False) is False:
+                self.tabs.setCurrentIndex(1)
+                if hasattr(self, "google_key_input"):
+                    self.google_key_input.setFocus()
+                    self.google_key_input.setStyleSheet("border: 2px solid #ef4444; background-color: #fef2f2;")
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self,
+                    "Invalid API Key",
+                    "The provided Google Speech API Key failed connection tests. Please test a valid API key before saving."
+                )
+                return
+
         if self.app:
             self.app.cfg.update(self.cfg_working)
             self.app.save_config()
@@ -90,6 +167,19 @@ class Settings(QDialog):
             self._save_action_configs()
 
     def _load_values_into_widgets(self):
+        # Initialize verification states from saved config keys
+        m_key = self.cfg_working.get("mistral_api_key", "").strip()
+        self._mistral_key_verified = True if m_key else False
+        if hasattr(self, "lbl_status_mistral"):
+            self.lbl_status_mistral.setText("✓ Working (Saved)" if m_key else "Not Configured")
+            self.lbl_status_mistral.setStyleSheet("color: #22c55e; font-size: 11px;" if m_key else "color: #64748b; font-size: 11px;")
+            
+        g_key = self.cfg_working.get("google_api_key", "").strip()
+        self._google_key_verified = True if g_key else False
+        if hasattr(self, "lbl_status_google"):
+            self.lbl_status_google.setText("✓ Working (Saved)" if g_key else "Not Configured")
+            self.lbl_status_google.setStyleSheet("color: #22c55e; font-size: 11px;" if g_key else "color: #64748b; font-size: 11px;")
+
         # 1. Hotkey
         hk = self.cfg_working.get("hotkey", "alt+r")
         self.btn_hotkey.setText(self._fmt_hotkey(None, hk).upper())
@@ -190,7 +280,7 @@ class Settings(QDialog):
         # Tabs Container
         self.tabs = QTabWidget(self)
         self.tabs.addTab(self._create_general_tab(), "General")
-        self.tabs.addTab(self._create_models_tab(), "Local Models")
+        self.tabs.addTab(self._create_models_tab(), "Models")
         self.tabs.addTab(self._create_actions_tab(), "AI Actions")
         self.tabs.addTab(self._create_history_tab(), "History")
         
@@ -269,6 +359,29 @@ class Settings(QDialog):
         vocab_lay.addWidget(self.vocab_input)
         layout.addWidget(vocab_frame)
 
+
+
+        # Meeting Audio Device
+        dev_frame = QFrame(tab)
+        dev_frame.setObjectName("cardFrame")
+        dev_lay = QVBoxLayout(dev_frame)
+        dev_lay.addWidget(QLabel("Default Meeting Audio Device", dev_frame))
+        
+        self.combo_device = QComboBox(dev_frame)
+        self._populate_audio_devices()
+        self.combo_device.currentIndexChanged.connect(self._save_general_configs)
+        self._configure_dropdown(self.combo_device, show_all_items=True)
+        dev_lay.addWidget(self.combo_device)
+        
+        # Start meeting launch button
+        self.btn_launch_meeting = QPushButton("🚀 Start Smart Meeting Transcription", dev_frame)
+        self.btn_launch_meeting.setObjectName("primaryButton")
+        self.btn_launch_meeting.setMinimumHeight(38)
+        self.btn_launch_meeting.clicked.connect(self._launch_smart_meeting)
+        dev_lay.addWidget(self.btn_launch_meeting)
+        
+        layout.addWidget(dev_frame)
+
         # Privacy mode checkbox
         self.chk_privacy = QCheckBox("Privacy Mode (Disable local history, force offline local models)", tab)
         if self.app:
@@ -279,7 +392,32 @@ class Settings(QDialog):
         layout.addStretch()
         return tab
 
-    # ── TAB 2: Local Whisper Models ──────────────────────────────────────────
+    def _populate_audio_devices(self):
+        self.combo_device.clear()
+        self.combo_device.addItem("🔊 + 🎙️ Smart Meeting Mode (Record BOTH Computer Sound + My Microphone)", "smart_meeting")
+        self.combo_device.addItem("🎙️ Standard Mode (Record My Microphone Only)", "default_mic")
+        
+        # Set to current saved meeting capture mode
+        current_dev = self.cfg_working.get("meeting_audio_mode", "smart_meeting")
+        if current_dev not in ("smart_meeting", "default_mic"):
+            current_dev = "smart_meeting"
+            
+        idx = self.combo_device.findData(str(current_dev))
+        if idx >= 0:
+            self.combo_device.setCurrentIndex(idx)
+        else:
+            self.combo_device.setCurrentIndex(0)
+
+    def _launch_smart_meeting(self):
+        self._save_general_configs()
+        if self.app:
+            self.app.cfg.update(self.cfg_working)
+            self.app.save_config()
+            self.app.apply_tray_bindings()
+            self.accept()
+            self.app.show_meeting()
+
+    # ── TAB 2: Models Configurator ──────────────────────────────────────────
     def _create_models_tab(self):
         from main import MODELS
         tab = QWidget()
@@ -289,28 +427,460 @@ class Settings(QDialog):
         scroll = QScrollArea(tab)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         
         scroll_content = QWidget()
         scroll_lay = QVBoxLayout(scroll_content)
         scroll_lay.setContentsMargins(0, 0, 0, 0)
-        scroll_lay.setSpacing(10)
+        scroll_lay.setSpacing(14)
         
-        # Header Whisper notice
+        # Section 1: Local Offline Models
+        section_local = QLabel("Local Speech Models (Runs 100% Offline)")
+        section_local.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        section_local.setStyleSheet("color: #3b82f6; margin-top: 8px; margin-bottom: 2px;")
+        scroll_lay.addWidget(section_local)
+        
         whisper_notice = QLabel("Whisper local AI models run offline on your machine.\nSelect your preferred model size based on your system RAM.")
         whisper_notice.setObjectName("subtitleLabel")
         whisper_notice.setStyleSheet("margin-bottom: 8px;")
         scroll_lay.addWidget(whisper_notice)
 
-        # Build custom model card frames dynamically (never redrawn or destroyed!)
+        # Build Whisper cards
         for name, info in MODELS.items():
             card = self._build_whisper_card(name, info)
             self.whisper_cards[name] = card
             scroll_lay.addWidget(card)
             self._update_whisper_card_ui(name)
             
+        # Section 2: Mistral AI Cloud STT Models
+        section_mistral = QLabel("Mistral AI Voxtral STT Models")
+        section_mistral.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        section_mistral.setStyleSheet("color: #3b82f6; margin-top: 14px; margin-bottom: 2px;")
+        scroll_lay.addWidget(section_mistral)
+        
+        mistral_notice = QLabel("Mistral's state-of-the-art Voxtral models run via the cloud (API Key Required).")
+        mistral_notice.setObjectName("subtitleLabel")
+        mistral_notice.setStyleSheet("margin-bottom: 8px;")
+        scroll_lay.addWidget(mistral_notice)
+        
+        # Define Mistral STT catalog
+        self.mistral_cards = {}
+        self.mistral_model_catalog = {
+            "voxtral-mini-latest": {
+                "name": "Voxtral Mini",
+                "badge": "Fast / Low Cost",
+                "specs": "Speed: Ultra Fast (~0.2s response)  ·  Smart dictation & audio understanding",
+                "description": "Optimized for basic edge and standard transcription tasks."
+            },
+            "voxtral-small-latest": {
+                "name": "Voxtral Small",
+                "badge": "Balanced",
+                "specs": "Speed: Fast (~0.5s response)  ·  High accuracy & multi-language translation",
+                "description": "Production-scale high-capability model for balanced performance."
+            },
+            "voxtral-large-latest": {
+                "name": "Voxtral Large",
+                "badge": "Highest Quality",
+                "specs": "Speed: Moderate (~1.0s response)  ·  SOTA transcription & complex understanding",
+                "description": "Mistral's flagship, largest, and most capable voice understanding model."
+            }
+        }
+        
+        for name, info in self.mistral_model_catalog.items():
+            card = self._build_mistral_card(name, info)
+            self.mistral_cards[name] = card
+            scroll_lay.addWidget(card)
+            self._update_mistral_card_ui(name)
+            
+        # Section 3: Google Cloud STT
+        section_google = QLabel("Google Cloud Speech STT")
+        section_google.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        section_google.setStyleSheet("color: #3b82f6; margin-top: 14px; margin-bottom: 2px;")
+        scroll_lay.addWidget(section_google)
+        
+        google_info = {
+            "name": "Google Cloud Speech-to-Text API",
+            "badge": "Enterprise Cloud",
+            "specs": "Speed: Fast (~0.4s response)  ·  Robust, enterprise-grade cloud recognition",
+            "description": "Google's production speech recognition API with support for over 120 languages."
+        }
+        self.google_card = self._build_google_card(google_info)
+        scroll_lay.addWidget(self.google_card)
+        self._update_google_card_ui()
+        
+        # Section 4: Cloud API Key Credentials
+        section_keys = QLabel("Cloud API Credentials")
+        section_keys.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        section_keys.setStyleSheet("color: #3b82f6; margin-top: 18px; margin-bottom: 2px;")
+        scroll_lay.addWidget(section_keys)
+        
+        self.keys_frame = QFrame(scroll_content)
+        self.keys_frame.setObjectName("cardFrame")
+        kf_lay = QVBoxLayout(self.keys_frame)
+        kf_lay.setContentsMargins(14, 14, 14, 14)
+        kf_lay.setSpacing(10)
+        
+        kf_lay.addWidget(QLabel("Mistral API Key", self.keys_frame))
+        self.mistral_key_input = QLineEdit(self.keys_frame)
+        self.mistral_key_input.setPlaceholderText("mistral-key...")
+        self.mistral_key_input.setEchoMode(QLineEdit.Password)
+        self.mistral_key_input.setText(self.cfg_working.get("mistral_api_key", ""))
+        self.mistral_key_input.textChanged.connect(self._save_general_configs)
+        kf_lay.addWidget(self.mistral_key_input)
+        
+        m_test_lay = QHBoxLayout()
+        self.btn_test_mistral = QPushButton("Test API Key", self.keys_frame)
+        self.btn_test_mistral.setObjectName("secondaryButton")
+        self.btn_test_mistral.setStyleSheet("padding: 4px 10px; font-size: 11px;")
+        self.btn_test_mistral.clicked.connect(self._test_mistral_key)
+        self.lbl_status_mistral = QLabel("Not Tested", self.keys_frame)
+        self.lbl_status_mistral.setWordWrap(True)
+        self.lbl_status_mistral.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_status_mistral.setStyleSheet("color: #64748b; font-size: 11px;")
+        m_test_lay.addWidget(self.btn_test_mistral)
+        m_test_lay.addWidget(self.lbl_status_mistral)
+        kf_lay.addLayout(m_test_lay)
+        
+        kf_lay.addWidget(QLabel("Google Speech API Key", self.keys_frame))
+        self.google_key_input = QLineEdit(self.keys_frame)
+        self.google_key_input.setPlaceholderText("AIzaSy...")
+        self.google_key_input.setEchoMode(QLineEdit.Password)
+        self.google_key_input.setText(self.cfg_working.get("google_api_key", ""))
+        self.google_key_input.textChanged.connect(self._save_general_configs)
+        kf_lay.addWidget(self.google_key_input)
+
+        g_test_lay = QHBoxLayout()
+        self.btn_test_google = QPushButton("Test API Key", self.keys_frame)
+        self.btn_test_google.setObjectName("secondaryButton")
+        self.btn_test_google.setStyleSheet("padding: 4px 10px; font-size: 11px;")
+        self.btn_test_google.clicked.connect(self._test_google_key)
+        self.lbl_status_google = QLabel("Not Tested", self.keys_frame)
+        self.lbl_status_google.setWordWrap(True)
+        self.lbl_status_google.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_status_google.setStyleSheet("color: #64748b; font-size: 11px;")
+        g_test_lay.addWidget(self.btn_test_google)
+        g_test_lay.addWidget(self.lbl_status_google)
+        kf_lay.addLayout(g_test_lay)
+        
+        scroll_lay.addWidget(self.keys_frame)
+            
         scroll.setWidget(scroll_content)
         layout.addWidget(scroll)
         return tab
+
+    def _build_mistral_card(self, name, info):
+        card = QFrame()
+        card.setObjectName("cardFrame")
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(14, 14, 14, 14)
+        card_lay.setSpacing(8)
+
+        # Title Row
+        title_row = QHBoxLayout()
+        lbl_name = QLabel(info["name"], card)
+        lbl_name.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        title_row.addWidget(lbl_name)
+        
+        lbl_badge = QLabel(info["badge"], card)
+        lbl_badge.setObjectName("badgeLabel")
+        title_row.addWidget(lbl_badge)
+        
+        title_row.addStretch()
+        
+        # State label
+        lbl_state = QLabel("", card)
+        lbl_state.setObjectName("subtitleLabel")
+        card.lbl_state = lbl_state
+        title_row.addWidget(lbl_state)
+        card_lay.addLayout(title_row)
+
+        # Specs row
+        lbl_specs = QLabel(info["specs"], card)
+        lbl_specs.setObjectName("subtitleLabel")
+        lbl_specs.setWordWrap(True)
+        card_lay.addWidget(lbl_specs)
+        
+        # Description
+        lbl_desc = QLabel(info["description"], card)
+        lbl_desc.setWordWrap(True)
+        lbl_desc.setObjectName("subtitleLabel")
+        card_lay.addWidget(lbl_desc)
+
+        # Action Buttons
+        btn_lay = QHBoxLayout()
+        btn_lay.addStretch()
+        
+        btn_action = QPushButton("Use Model", card)
+        btn_action.clicked.connect(lambda: self._use_mistral(name))
+        card.btn_action = btn_action
+        btn_lay.addWidget(btn_action)
+        
+        card_lay.addLayout(btn_lay)
+        return card
+
+    def _use_mistral(self, name):
+        if self.app:
+            self.cfg_working["backend"] = "mistral"
+            self.cfg_working["mistral_stt_model"] = name
+            
+            # Repopulate UIs
+            for m_name in list(self.whisper_cards.keys()):
+                self._update_whisper_card_ui(m_name)
+            for m_name in list(self.mistral_cards.keys()):
+                self._update_mistral_card_ui(m_name)
+            self._update_google_card_ui()
+
+    def _update_mistral_card_ui(self, name):
+        card = self.mistral_cards.get(name)
+        if not card:
+            return
+            
+        is_selected = (
+            self.cfg_working.get("backend") == "mistral" and 
+            self.cfg_working.get("mistral_stt_model") == name
+        )
+        
+        is_verified = getattr(self, "_mistral_key_verified", False)
+        is_active = is_selected and is_verified
+        
+        if is_active:
+            card.setObjectName("activeCardFrame")
+            card.lbl_state.setText("Active")
+            card.lbl_state.setStyleSheet("color: #22c55e; font-weight: bold;")
+            card.btn_action.setText("Currently Active")
+            card.btn_action.setEnabled(False)
+            card.btn_action.setObjectName("")
+        else:
+            card.setObjectName("cardFrame")
+            if is_selected:
+                card.lbl_state.setText("Selected (Needs Working Key)")
+                card.lbl_state.setStyleSheet("color: #f97316; font-weight: bold;")
+            else:
+                card.lbl_state.setText("Cloud Model")
+                card.lbl_state.setStyleSheet("color: #64748b;")
+            card.btn_action.setText("Use Model")
+            card.btn_action.setEnabled(True)
+            card.btn_action.setObjectName("primaryButton")
+            
+        card.style().unpolish(card)
+        card.style().polish(card)
+        card.btn_action.style().unpolish(card.btn_action)
+        card.btn_action.style().polish(card.btn_action)
+
+    def _build_google_card(self, info):
+        card = QFrame()
+        card.setObjectName("cardFrame")
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(14, 14, 14, 14)
+        card_lay.setSpacing(8)
+
+        # Title Row
+        title_row = QHBoxLayout()
+        lbl_name = QLabel(info["name"], card)
+        lbl_name.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        title_row.addWidget(lbl_name)
+        
+        lbl_badge = QLabel(info["badge"], card)
+        lbl_badge.setObjectName("badgeLabel")
+        title_row.addWidget(lbl_badge)
+        
+        title_row.addStretch()
+        
+        # State label
+        lbl_state = QLabel("", card)
+        lbl_state.setObjectName("subtitleLabel")
+        card.lbl_state = lbl_state
+        title_row.addWidget(lbl_state)
+        card_lay.addLayout(title_row)
+
+        # Specs row
+        lbl_specs = QLabel(info["specs"], card)
+        lbl_specs.setObjectName("subtitleLabel")
+        lbl_specs.setWordWrap(True)
+        card_lay.addWidget(lbl_specs)
+        
+        # Description
+        lbl_desc = QLabel(info["description"], card)
+        lbl_desc.setWordWrap(True)
+        lbl_desc.setObjectName("subtitleLabel")
+        card_lay.addWidget(lbl_desc)
+
+        # Action Buttons
+        btn_lay = QHBoxLayout()
+        btn_lay.addStretch()
+        
+        btn_action = QPushButton("Use Model", card)
+        btn_action.clicked.connect(self._use_google)
+        card.btn_action = btn_action
+        btn_lay.addWidget(btn_action)
+        
+        card_lay.addLayout(btn_lay)
+        return card
+
+    def _use_google(self):
+        if self.app:
+            self.cfg_working["backend"] = "google"
+            
+            # Repopulate UIs
+            for m_name in list(self.whisper_cards.keys()):
+                self._update_whisper_card_ui(m_name)
+            if hasattr(self, "mistral_cards"):
+                for m_name in list(self.mistral_cards.keys()):
+                    self._update_mistral_card_ui(m_name)
+            self._update_google_card_ui()
+
+    def _update_google_card_ui(self):
+        card = getattr(self, "google_card", None)
+        if not card:
+            return
+            
+        is_selected = (self.cfg_working.get("backend") == "google")
+        is_verified = getattr(self, "_google_key_verified", False)
+        is_active = is_selected and is_verified
+        
+        if is_active:
+            card.setObjectName("activeCardFrame")
+            card.lbl_state.setText("Active")
+            card.lbl_state.setStyleSheet("color: #22c55e; font-weight: bold;")
+            card.btn_action.setText("Currently Active")
+            card.btn_action.setEnabled(False)
+            card.btn_action.setObjectName("")
+        else:
+            card.setObjectName("cardFrame")
+            if is_selected:
+                card.lbl_state.setText("Selected (Needs Working Key)")
+                card.lbl_state.setStyleSheet("color: #f97316; font-weight: bold;")
+            else:
+                card.lbl_state.setText("Cloud Model")
+                card.lbl_state.setStyleSheet("color: #64748b;")
+            card.btn_action.setText("Use Model")
+            card.btn_action.setEnabled(True)
+            card.btn_action.setObjectName("primaryButton")
+            
+        if card:
+            card.style().unpolish(card)
+            card.style().polish(card)
+            if hasattr(card, "btn_action"):
+                card.btn_action.style().unpolish(card.btn_action)
+                card.btn_action.style().polish(card.btn_action)
+
+    def _test_mistral_key(self):
+        key = self.mistral_key_input.text().strip()
+        if not key:
+            self.lbl_status_mistral.setText("✗ Error: Key is empty")
+            self.lbl_status_mistral.setStyleSheet("color: #ef4444; font-size: 11px; font-weight: bold;")
+            return
+            
+        self.lbl_status_mistral.setText("Testing...")
+        self.lbl_status_mistral.setStyleSheet("color: #3b82f6; font-size: 11px; font-weight: bold;")
+        self.btn_test_mistral.setEnabled(False)
+        
+        def worker():
+            import requests
+            try:
+                headers = {"Authorization": f"Bearer {key}"}
+                resp = requests.get("https://api.mistral.ai/v1/models", headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    self.mistral_test_finished.emit(True, "Working!")
+                else:
+                    err_msg = f"HTTP {resp.status_code}"
+                    try:
+                        err_json = resp.json()
+                        if "message" in err_json:
+                            err_msg = err_json["message"]
+                        elif "detail" in err_json:
+                            err_msg = str(err_json["detail"])
+                    except:
+                        if resp.text:
+                            err_msg = resp.text[:50]
+                    self.mistral_test_finished.emit(False, f"Invalid: {err_msg}")
+            except Exception as e:
+                self.mistral_test_finished.emit(False, f"Connection error: {str(e)[:50]}")
+                
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _test_google_key(self):
+        key = self.google_key_input.text().strip()
+        if not key:
+            self.lbl_status_google.setText("✗ Error: Key is empty")
+            self.lbl_status_google.setStyleSheet("color: #ef4444; font-size: 11px; font-weight: bold;")
+            return
+            
+        self.lbl_status_google.setText("Testing...")
+        self.lbl_status_google.setStyleSheet("color: #3b82f6; font-size: 11px; font-weight: bold;")
+        self.btn_test_google.setEnabled(False)
+        
+        def worker():
+            import requests
+            try:
+                url = f"https://speech.googleapis.com/v1/speech:recognize?key={key}"
+                payload = {
+                    "config": {
+                        "encoding": "LINEAR16",
+                        "sampleRateHertz": 16000,
+                        "languageCode": "en-US"
+                    },
+                    "audio": {
+                        "content": "AAAA"
+                    }
+                }
+                resp = requests.post(url, json=payload, timeout=10)
+                if resp.status_code == 200:
+                    self.google_test_finished.emit(True, "Working!")
+                else:
+                    err_msg, status = "", ""
+                    try:
+                        err_obj = resp.json().get("error", {})
+                        err_msg = err_obj.get("message", "")
+                        status = err_obj.get("status", "")
+                    except Exception:
+                        err_msg = (resp.text or "")[:80]
+
+                    low = err_msg.lower()
+                    if "api key not valid" in low or "api_key_invalid" in low:
+                        self.google_test_finished.emit(False, "Invalid API Key")
+                    elif status == "PERMISSION_DENIED" or "disabled" in low or "has not been used" in low:
+                        self.google_test_finished.emit(False, f"API key valid, but: {err_msg[:60]}")
+                    elif resp.status_code == 400:
+                        # Auth succeeded; the request was rejected only because of
+                        # the dummy test audio — the key itself works.
+                        self.google_test_finished.emit(True, "Working!")
+                    else:
+                        self.google_test_finished.emit(False, f"HTTP {resp.status_code}: {err_msg[:50]}")
+            except Exception as e:
+                self.google_test_finished.emit(False, f"Connection error: {str(e)[:50]}")
+                
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_mistral_test_finished(self, success, message):
+        self.btn_test_mistral.setEnabled(True)
+        if success:
+            self._mistral_key_verified = True
+            self.lbl_status_mistral.setText("✓ Working")
+            self.lbl_status_mistral.setStyleSheet("color: #22c55e; font-size: 11px; font-weight: bold;")
+        else:
+            self._mistral_key_verified = False
+            self.lbl_status_mistral.setText(f"✗ {message}")
+            self.lbl_status_mistral.setStyleSheet("color: #ef4444; font-size: 11px; font-weight: bold;")
+            
+        if hasattr(self, "mistral_cards"):
+            for m_name in list(self.mistral_cards.keys()):
+                self._update_mistral_card_ui(m_name)
+
+    def _on_google_test_finished(self, success, message):
+        self.btn_test_google.setEnabled(True)
+        if success:
+            self._google_key_verified = True
+            self.lbl_status_google.setText("✓ Working")
+            self.lbl_status_google.setStyleSheet("color: #22c55e; font-size: 11px; font-weight: bold;")
+        else:
+            self._google_key_verified = False
+            self.lbl_status_google.setText(f"✗ {message}")
+            self.lbl_status_google.setStyleSheet("color: #ef4444; font-size: 11px; font-weight: bold;")
+            
+        self._update_google_card_ui()
 
     def _build_whisper_card(self, name, info):
         card = QFrame()
@@ -344,6 +914,7 @@ class Settings(QDialog):
             specs += f"  ·  {info.get('armenian')}"
         lbl_specs = QLabel(specs, card)
         lbl_specs.setObjectName("subtitleLabel")
+        lbl_specs.setWordWrap(True)
         card_lay.addWidget(lbl_specs)
 
         # Progress bar
@@ -378,7 +949,7 @@ class Settings(QDialog):
             
         state = self._model_states.get(name, "missing")
         is_active = False
-        if self.app and self.cfg_working.get("whisper_model") == name:
+        if self.app and self.cfg_working.get("backend") == "local" and self.cfg_working.get("whisper_model") == name:
             is_active = True
         
         # Configure matching visuals
@@ -535,14 +1106,14 @@ class Settings(QDialog):
         engine_lay.addWidget(QLabel("Primary Action Engine", engine_frame))
         
         self.combo_engine = QComboBox(engine_frame)
+        self.combo_engine.addItem("Local Offline LLM Engine (Qwen / Gemma)", "local_llm")
         self.combo_engine.addItem("Rule-based Formatter (Fast, Local, Offline)", actions.RULE_BASED_ID)
         self.combo_engine.addItem("Google Gemini API (Cloud Engine)", actions.API_GEMINI_ID)
         self.combo_engine.addItem("OpenAI-compatible API (Cloud Engine)", actions.API_OPENAI_ID)
         self.combo_engine.addItem("Anthropic Claude API (Cloud Engine)", actions.API_ANTHROPIC_ID)
-        self.combo_engine.addItem("Local Offline LLM Engine (Qwen / Gemma)", "local_llm")
         
         if self.app:
-            provider = self.app.cfg.get("action_model", "rule_based")
+            provider = self.cfg_working.get("action_model", "local_llm")
             # Convert legacy values if present
             if provider in (local_llm.QWEN_TINY_ID, local_llm.QWEN_3B_ID, local_llm.QWEN_7B_ID, local_llm.GEMMA_2B_ID):
                 provider = "local_llm"
@@ -1058,12 +1629,117 @@ class Settings(QDialog):
         self.cfg_working["language"] = self.combo_lang.currentData()
         self.cfg_working["initial_prompt"] = self.vocab_input.toPlainText().strip()
         self.cfg_working["privacy_mode"] = self.chk_privacy.isChecked()
+        if hasattr(self, "combo_device"):
+            self.cfg_working["meeting_audio_mode"] = self.combo_device.currentData()
+        if hasattr(self, "google_key_input"):
+            val = self.google_key_input.text().strip()
+            prev_val = self.cfg_working.get("google_api_key", "").strip()
+            self.cfg_working["google_api_key"] = val
+            self.google_key_input.setStyleSheet("")
+            if val != prev_val:
+                self._google_key_verified = True if val else False
+                if hasattr(self, "lbl_status_google"):
+                    self.lbl_status_google.setText("Not Tested" if val else "Not Configured")
+                    self.lbl_status_google.setStyleSheet("color: #64748b; font-size: 11px;")
+                self._update_google_card_ui()
+        if hasattr(self, "mistral_key_input"):
+            val = self.mistral_key_input.text().strip()
+            prev_val = self.cfg_working.get("mistral_api_key", "").strip()
+            self.cfg_working["mistral_api_key"] = val
+            self.mistral_key_input.setStyleSheet("")
+            if val != prev_val:
+                self._mistral_key_verified = True if val else False
+                if hasattr(self, "lbl_status_mistral"):
+                    self.lbl_status_mistral.setText("Not Tested" if val else "Not Configured")
+                    self.lbl_status_mistral.setStyleSheet("color: #64748b; font-size: 11px;")
+                if hasattr(self, "mistral_cards"):
+                    for m_name in list(self.mistral_cards.keys()):
+                        self._update_mistral_card_ui(m_name)
         if self.chk_privacy.isChecked():
             self.cfg_working["save_history"] = False
             if hasattr(self, "chk_history"):
                 self.chk_history.blockSignals(True)
                 self.chk_history.setChecked(False)
                 self.chk_history.blockSignals(False)
+            
+            # Force backend to local offline Whisper if privacy is on
+            if self.cfg_working.get("backend") in ("mistral", "google"):
+                self.cfg_working["backend"] = "local"
+                if not self.cfg_working.get("whisper_model"):
+                    self.cfg_working["whisper_model"] = "small"
+                for m_name in list(self.whisper_cards.keys()):
+                    self._update_whisper_card_ui(m_name)
+                if hasattr(self, "mistral_cards"):
+                    for m_name in list(self.mistral_cards.keys()):
+                        self._update_mistral_card_ui(m_name)
+                self._update_google_card_ui()
+
+            # Force action model to local if privacy is on and a cloud LLM was active
+            current_action_model = self.cfg_working.get("action_model", "rule_based")
+            if actions.ACTION_MODELS.get(actions.normalize_action_model(current_action_model), {}).get("kind") == "cloud":
+                self.cfg_working["action_model"] = actions.RULE_BASED_ID
+                if hasattr(self, "combo_engine"):
+                    self.combo_engine.blockSignals(True)
+                    idx = self.combo_engine.findData(actions.RULE_BASED_ID)
+                    if idx >= 0:
+                        self.combo_engine.setCurrentIndex(idx)
+                    self.combo_engine.blockSignals(False)
+                    self._on_engine_changed(idx)
+        self._update_privacy_ui_state()
+
+    def _update_privacy_ui_state(self):
+        is_private = self.chk_privacy.isChecked() if hasattr(self, "chk_privacy") else False
+        
+        # Disable/grey out Mistral cards
+        if hasattr(self, "mistral_cards"):
+            for name, card in self.mistral_cards.items():
+                card.setEnabled(not is_private)
+                if is_private:
+                    card.setStyleSheet("background-color: #f1f5f9; border: 1px dashed #cbd5e1;")
+                else:
+                    self._update_mistral_card_ui(name)
+                    
+        # Disable/grey out Google card
+        if hasattr(self, "google_card") and self.google_card:
+            self.google_card.setEnabled(not is_private)
+            if is_private:
+                self.google_card.setStyleSheet("background-color: #f1f5f9; border: 1px dashed #cbd5e1;")
+            else:
+                self._update_google_card_ui()
+                
+        # Disable/grey out API credentials frame
+        if hasattr(self, "keys_frame") and self.keys_frame:
+            self.keys_frame.setEnabled(not is_private)
+            if is_private:
+                self.keys_frame.setStyleSheet("background-color: #f1f5f9; border: 1px dashed #cbd5e1;")
+            else:
+                self.keys_frame.setStyleSheet("")
+
+        # Disable/grey out cloud options in combo_engine dropdown
+        if hasattr(self, "combo_engine") and self.combo_engine:
+            model = self.combo_engine.model()
+            # Indexes 2, 3, and 4 in self.combo_engine are the cloud engines:
+            # Index 2: Google Gemini API
+            # Index 3: OpenAI-compatible API
+            # Index 4: Anthropic Claude API
+            for i in (2, 3, 4):
+                item = model.item(i)
+                if item:
+                    item.setEnabled(not is_private)
+                    if is_private:
+                        item.setForeground(QColor("#cbd5e1"))
+                    else:
+                        item.setForeground(QColor("#1e293b"))
+            if is_private and self.combo_engine.currentIndex() in (2, 3, 4):
+                self.combo_engine.setCurrentIndex(1) # Switch to Rule-based Formatter
+
+        # Disable/grey out card_cloud API config frame
+        if hasattr(self, "card_cloud") and self.card_cloud:
+            self.card_cloud.setEnabled(not is_private)
+            if is_private:
+                self.card_cloud.setStyleSheet("background-color: #f1f5f9; border: 1px dashed #cbd5e1;")
+            else:
+                self.card_cloud.setStyleSheet("")
 
     def _save_action_configs(self):
         if not self.app:
@@ -1178,9 +1854,18 @@ class Settings(QDialog):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        
+        scroll = QScrollArea(tab)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        
+        scroll_content = QWidget()
+        scroll_lay = QVBoxLayout(scroll_content)
+        scroll_lay.setContentsMargins(0, 0, 0, 0)
+        scroll_lay.setSpacing(12)
 
-        logo_frame = QFrame(tab)
+        logo_frame = QFrame(scroll_content)
         logo_frame.setObjectName("cardFrame")
         l_lay = QVBoxLayout(logo_frame)
         l_lay.setAlignment(Qt.AlignCenter)
@@ -1193,30 +1878,39 @@ class Settings(QDialog):
         lbl_ver = QLabel(f"Version {APP_VERSION}", logo_frame)
         lbl_ver.setObjectName("subtitleLabel")
         l_lay.addWidget(lbl_ver)
-        layout.addWidget(logo_frame)
+        scroll_lay.addWidget(logo_frame)
 
         desc_label = QLabel(
             "An always-on private dictation tool optimized for Armenian, English, and Russian speakers.\n"
             "Runs offline using Whisper AI or integrates with Google Cloud Speech API.",
-            tab
+            scroll_content
         )
         desc_label.setWordWrap(True)
         desc_label.setObjectName("subtitleLabel")
         desc_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(desc_label)
+        scroll_lay.addWidget(desc_label)
 
         # AIBUBEN Community & Founder Card
-        aibuben_frame = QFrame(tab)
+        aibuben_frame = QFrame(scroll_content)
         aibuben_frame.setObjectName("cardFrame")
+        aibuben_frame.setMinimumHeight(180)
         aibuben_lay = QVBoxLayout(aibuben_frame)
-        aibuben_lay.setContentsMargins(14, 14, 14, 14)
-        aibuben_lay.setSpacing(8)
-        aibuben_lay.setAlignment(Qt.AlignCenter)
+        aibuben_lay.setContentsMargins(18, 18, 18, 18)
+        aibuben_lay.setSpacing(10)
 
-        lbl_aibuben_title = QLabel("Powered by AIBUBEN", aibuben_frame)
-        lbl_aibuben_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #3b82f6;")
-        lbl_aibuben_title.setAlignment(Qt.AlignCenter)
-        aibuben_lay.addWidget(lbl_aibuben_title)
+        import os
+        from PySide6.QtGui import QPixmap
+
+        lbl_aibuben_logo = QLabel(aibuben_frame)
+        logo_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "aibuben_logo.png")
+        pixmap = QPixmap(logo_path)
+        if not pixmap.isNull():
+            lbl_aibuben_logo.setPixmap(pixmap.scaledToHeight(55, Qt.SmoothTransformation))
+        else:
+            lbl_aibuben_logo.setText("Powered by AIBUBEN")
+            lbl_aibuben_logo.setStyleSheet("font-size: 14px; font-weight: bold; color: #3b82f6;")
+        lbl_aibuben_logo.setAlignment(Qt.AlignCenter)
+        aibuben_lay.addWidget(lbl_aibuben_logo)
 
         lbl_aibuben_desc = QLabel(
             "This project is proud to be part of the <b>AIBUBEN</b> AI community in Yerevan—"
@@ -1224,7 +1918,8 @@ class Settings(QDialog):
             aibuben_frame
         )
         lbl_aibuben_desc.setWordWrap(True)
-        lbl_aibuben_desc.setStyleSheet("font-size: 12px; color: #475569; line-height: 18px;")
+        lbl_aibuben_desc.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        lbl_aibuben_desc.setStyleSheet("font-size: 12px; color: #475569;")
         lbl_aibuben_desc.setAlignment(Qt.AlignCenter)
         aibuben_lay.addWidget(lbl_aibuben_desc)
 
@@ -1246,18 +1941,55 @@ class Settings(QDialog):
         links_layout.addWidget(lbl_linkedin_link)
 
         aibuben_lay.addLayout(links_layout)
-        layout.addWidget(aibuben_frame)
+        scroll_lay.addWidget(aibuben_frame)
+
+        # Open Source & Contribution Card
+        contrib_frame = QFrame(scroll_content)
+        contrib_frame.setObjectName("cardFrame")
+        contrib_lay = QVBoxLayout(contrib_frame)
+        contrib_lay.setContentsMargins(18, 18, 18, 18)
+        contrib_lay.setSpacing(10)
+
+        lbl_contrib_title = QLabel("Open Source & Contributions", contrib_frame)
+        lbl_contrib_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #22c55e;")
+        lbl_contrib_title.setAlignment(Qt.AlignCenter)
+        contrib_lay.addWidget(lbl_contrib_title)
+
+        lbl_contrib_desc = QLabel(
+            "Transcribe App is <b>100% Open Source</b>! We are passionate about community-driven "
+            "development and welcome developers, designers, and testers to collaborate. "
+            "Help us build the next generation of private voice-to-text tools!",
+            contrib_frame
+        )
+        lbl_contrib_desc.setWordWrap(True)
+        lbl_contrib_desc.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        lbl_contrib_desc.setStyleSheet("font-size: 12px; color: #475569;")
+        lbl_contrib_desc.setAlignment(Qt.AlignCenter)
+        contrib_lay.addWidget(lbl_contrib_desc)
+
+        lbl_github_link = QLabel(contrib_frame)
+        lbl_github_link.setText(
+            "<a href='https://github.com/Aram2K/transcribe-app' style='color: #22c55e; text-decoration: none; font-weight: bold;'>💻 Contribute on GitHub / Aram2K/transcribe-app</a>"
+        )
+        lbl_github_link.setOpenExternalLinks(True)
+        lbl_github_link.setStyleSheet("font-size: 12px;")
+        lbl_github_link.setAlignment(Qt.AlignCenter)
+        contrib_lay.addWidget(lbl_github_link)
+
+        scroll_lay.addWidget(contrib_frame)
 
         # Update checking button
-        self.btn_update = QPushButton("Check for Updates", tab)
+        self.btn_update = QPushButton("Check for Updates", scroll_content)
         if self.app and self.cfg_working.get("pending_update_version"):
             tag = self.cfg_working.get("pending_update_version")
             self.btn_update.setText(f"Install Update {tag}")
             self.btn_update.setObjectName("primaryButton")
         self.btn_update.clicked.connect(self._check_for_updates)
-        layout.addWidget(self.btn_update)
+        scroll_lay.addWidget(self.btn_update)
 
-        layout.addStretch()
+        scroll_lay.addStretch()
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll)
         return tab
 
     def _check_for_updates(self):
@@ -1297,9 +2029,14 @@ class Settings(QDialog):
     def _download_whisper(self, name):
         if self._model_states.get(name) == "downloaded":
             if self.app:
+                self.cfg_working["backend"] = "local"
                 self.cfg_working["whisper_model"] = name
             for m_name in list(self.whisper_cards.keys()):
                 self._update_whisper_card_ui(m_name)
+            if hasattr(self, "mistral_cards"):
+                for m_name in list(self.mistral_cards.keys()):
+                    self._update_mistral_card_ui(m_name)
+            self._update_google_card_ui()
             return
 
         if self._model_states.get(name) == "downloading":
@@ -1486,6 +2223,24 @@ class Settings(QDialog):
                 QMessageBox.information(self, "Download Complete", f"Whisper {model_name.upper()} model is ready for local offline dictation!")
 
     # ── Hotkey Capturing Logic ───────────────────────────────────────────────
+    def eventFilter(self, obj, event):
+        if self.capturing and event.type() == QEvent.MouseButtonPress:
+            btn = event.button()
+            btn_map = {
+                Qt.MiddleButton: "mouse:middle",
+                Qt.BackButton: "mouse:x1",
+                Qt.ForwardButton: "mouse:x2"
+            }
+            if btn in btn_map:
+                hotkey_str = btn_map[btn]
+                if self.app:
+                    self.cfg_working["hotkey"] = hotkey_str
+                self.capturing = False
+                self.btn_hotkey.setText(self._fmt_hotkey(None, hotkey_str).upper())
+                self.btn_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; border-color: #3b82f6;")
+                return True # swallow event
+        return super().eventFilter(obj, event)
+
     def _toggle_capture(self):
         if self.capturing:
             self.capturing = False
@@ -1498,6 +2253,11 @@ class Settings(QDialog):
             self.setFocus() # Pull focus away so keyPressEvent captures keypresses
 
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            if not self.capturing:
+                event.ignore()
+                return
+
         if not self.capturing:
             super().keyPressEvent(event)
             return
@@ -1547,17 +2307,26 @@ class Settings(QDialog):
         else:
             return
 
-        if not mods:
-            QMessageBox.warning(self, "Invalid Hotkey", "Dictation hotkeys require at least one modifier key (e.g. Alt or Ctrl).")
+        # Modifier-less binding is only safe for Function keys (F1–F12); a bare
+        # typing/navigation key would fire during normal use. Require a modifier
+        # otherwise (mouse buttons are handled separately in eventFilter).
+        is_function_key = len(key_str) >= 2 and key_str[0] == "f" and key_str[1:].isdigit()
+        if not mods and not is_function_key:
+            QMessageBox.warning(
+                self, "Modifier Required",
+                "Use at least one modifier (Ctrl, Alt, Shift, or Win), a Function "
+                "key (F1–F12), or a mouse button.\n\nA single typing key can't be a "
+                "hotkey because it would trigger while you type."
+            )
             return
-            
-        hotkey_str = "+".join(mods + [key_str])
-        
+
+        hotkey_str = "+".join(mods + [key_str]) if mods else key_str
+
         if self.app:
             self.cfg_working["hotkey"] = hotkey_str
             
         self.capturing = False
-        self.btn_hotkey.setText(hotkey_str.upper())
+        self.btn_hotkey.setText(self._fmt_hotkey(None, hotkey_str).upper())
         self.btn_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; border-color: #3b82f6;")
 
     @staticmethod

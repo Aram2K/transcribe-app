@@ -10,7 +10,7 @@ from PySide6.QtCore import Qt, QTimer, Signal, QObject
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, 
     QLineEdit, QTextEdit, QFrame, QMessageBox, QSplitter, QProgressBar,
-    QStackedWidget, QFileDialog, QWidget
+    QStackedWidget, QFileDialog, QWidget, QApplication
 )
 from PySide6.QtGui import QFont, QColor
 import storage
@@ -135,7 +135,7 @@ class MeetingsWindow(QDialog):
         d_lay.setContentsMargins(18, 18, 18, 18)
         d_lay.setSpacing(12)
         
-        d_lay.addWidget(QLabel("Select Loopback Audio Input (Captures other callers)", dev_frame))
+        d_lay.addWidget(QLabel("Meeting Recording Mode", dev_frame))
         self.combo_device = QComboBox(dev_frame)
         d_lay.addWidget(self.combo_device)
         lay.addWidget(dev_frame)
@@ -180,7 +180,6 @@ class MeetingsWindow(QDialog):
         t_lay.addWidget(QLabel("Live Transcription", trans_frame))
         self.live_trans_log = QTextEdit(trans_frame)
         self.live_trans_log.setReadOnly(True)
-        self.live_trans_log.setStyleSheet("background-color: #121214;")
         t_lay.addWidget(self.live_trans_log)
         splitter.addWidget(trans_frame)
 
@@ -191,7 +190,6 @@ class MeetingsWindow(QDialog):
         n_lay.addWidget(QLabel("Your Notes (type bullets during meeting)", notes_frame))
         self.input_live_notes = QTextEdit(notes_frame)
         self.input_live_notes.setPlaceholderText("- Decided to use PySide6 for desktop client\n- Aram to finalize setup instructions\n- Sprint ends on Monday")
-        self.input_live_notes.setStyleSheet("background-color: #121214;")
         n_lay.addWidget(self.input_live_notes)
         splitter.addWidget(notes_frame)
         
@@ -269,7 +267,6 @@ class MeetingsWindow(QDialog):
         s_lay = QVBoxLayout(summary_frame)
         s_lay.addWidget(QLabel("AI Summary & Action Items", summary_frame))
         self.txt_summary = QTextEdit(summary_frame)
-        self.txt_summary.setStyleSheet("background-color: #121214;")
         s_lay.addWidget(self.txt_summary)
         splitter.addWidget(summary_frame)
 
@@ -280,7 +277,6 @@ class MeetingsWindow(QDialog):
         t_lay.addWidget(QLabel("Full Meeting Transcript", trans_frame))
         self.txt_transcript = QTextEdit(trans_frame)
         self.txt_transcript.setReadOnly(True)
-        self.txt_transcript.setStyleSheet("background-color: #121214;")
         t_lay.addWidget(self.txt_transcript)
         splitter.addWidget(trans_frame)
 
@@ -290,34 +286,19 @@ class MeetingsWindow(QDialog):
     # ── Audio Device Scan ──
     def _populate_audio_devices(self):
         self.combo_device.clear()
-        if not self.app or not self.app.recorder:
-            self.combo_device.addItem("Default Input Microphone", "default")
-            return
-            
-        p = self.app.recorder.audio
-        info = p.get_host_api_info_by_index(0)
-        num_devices = info.get('deviceCount', 0)
+        self.combo_device.addItem("🔊 + 🎙️ Smart Meeting Mode (Record BOTH Computer Sound + My Microphone)", "smart_meeting")
+        self.combo_device.addItem("🎙️ Standard Mode (Record My Microphone Only)", "default_mic")
         
-        # Scan devices and add standard + WASAPI loopbacks on Windows
-        loopback_idx = None
-        has_default_mic = False
-        
-        for i in range(num_devices):
-            try:
-                dev = p.get_device_info_by_host_api_device_index(0, i)
-                if dev.get('maxInputChannels', 0) > 0:
-                    name = dev.get('name', 'Device')
-                    self.combo_device.addItem(name, str(i))
-                    
-                    # Highlight default recommendation loopback
-                    if "[Loopback]" in name and loopback_idx is None:
-                        loopback_idx = self.combo_device.count() - 1
-            except Exception:
-                pass
+        # Get from active config
+        current_dev = "smart_meeting"
+        if self.app:
+            current_dev = self.app.cfg.get("meeting_audio_mode", "smart_meeting")
+            if current_dev not in ("smart_meeting", "default_mic"):
+                current_dev = "smart_meeting"
                 
-        # Set recommendation
-        if loopback_idx is not None:
-            self.combo_device.setCurrentIndex(loopback_idx)
+        idx = self.combo_device.findData(str(current_dev))
+        if idx >= 0:
+            self.combo_device.setCurrentIndex(idx)
         else:
             self.combo_device.setCurrentIndex(0)
 
@@ -334,9 +315,11 @@ class MeetingsWindow(QDialog):
         self._meeting_title = self.input_title.text().strip() or "Untitled Meeting"
         self._meeting_attendees = self.input_attendees.text().strip()
         
-        # Capture configurations
-        device_idx = self.combo_device.currentData()
-        self.app.cfg["input_device_index"] = device_idx
+        # Capture configurations. This is the meeting capture mode
+        # ("smart_meeting"/"default_mic"), stored under its own key so it stays
+        # independent of the dictation input device.
+        meeting_mode = self.combo_device.currentData()
+        self.app.cfg["meeting_audio_mode"] = meeting_mode
         self.app.save_config()
 
         # Build local timestamp folder for auto-save recovery
@@ -351,10 +334,11 @@ class MeetingsWindow(QDialog):
         
         # Start recording
         self._record_started_at = time.time()
-        self.app.recorder.start_recording()
+        self.app.recorder.start_recording(capture_mode=meeting_mode)
         
         # Swap view tab
         self.container.setCurrentIndex(1)
+        from main import APP_VERSION
         telemetry.track("meeting_recording_started", {}, self.app.cfg, APP_VERSION)
 
     def _on_chunk_transcribed(self, idx, text, lang):
@@ -485,6 +469,7 @@ class MeetingsWindow(QDialog):
         self.txt_transcript.setPlainText(self._final_transcript)
         
         self.container.setCurrentIndex(3)
+        from main import APP_VERSION
         telemetry.track("meeting_notes_completed", {}, self.app.cfg, APP_VERSION)
 
     def _copy_markdown(self):
@@ -522,18 +507,43 @@ class MeetingsWindow(QDialog):
 
     def closeEvent(self, event):
         if self.state == self.STATE_RECORDING:
-            reply = QMessageBox.question(
-                self, "Stop recording?",
-                "A meeting is being recorded. Closing the window will stop the recording and discard it. Stop and discard?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-            )
-            if reply == QMessageBox.Yes:
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Record Meeting Active")
+            msg_box.setText("A meeting is actively being recorded. What would you like to do?")
+            
+            btn_minimize = msg_box.addButton("Minimize to Tray (Keep Recording)", QMessageBox.AcceptRole)
+            btn_stop = msg_box.addButton("Stop & Generate Notes", QMessageBox.AcceptRole)
+            btn_abort = msg_box.addButton("Abort & Discard", QMessageBox.DestructiveRole)
+            btn_cancel = msg_box.addButton("Cancel", QMessageBox.RejectRole)
+            
+            msg_box.setDefaultButton(btn_minimize)
+            msg_box.exec()
+            
+            clicked = msg_box.clickedButton()
+            if clicked == btn_minimize:
+                self.hide()
+                if self.app and hasattr(self.app, "show_tray_hint"):
+                    self.app.show_tray_hint(
+                        "Meeting Recording Active",
+                        "Transcribe is still recording in the background. Right-click the tray icon to restore."
+                    )
+                event.ignore()
+            elif clicked == btn_stop:
+                self._stop_meeting()
+                event.ignore()
+            elif clicked == btn_abort:
                 self._abort()
                 event.accept()
             else:
                 event.ignore()
         else:
             event.accept()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            event.ignore()
+        else:
+            super().keyPressEvent(event)
 
     def _build_transcript_with_markers(self, chunks):
         parts = []

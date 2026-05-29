@@ -77,6 +77,7 @@ DEFAULT = {
     "action_api_model": "",
     "translate_target": "en",
     "input_device_index": None,
+    "meeting_audio_mode": "smart_meeting",
     "silence_trigger_sec": 0.8,
     "min_speech_sec": 1.5,
     "max_speech_sec": 25.0,
@@ -454,7 +455,80 @@ class AudioRecorder:
                 self._model = None
                 self._model_name = None
 
-    def start_recording(self):
+    def _find_default_loopback_device(self):
+        """
+        Dynamically scans host APIs and devices to find the WASAPI loopback device
+        associated with the active default system playback/output device.
+        If no exact match is found, falls back to the first WASAPI loopback or any loopback device.
+        """
+        out_name = ""
+        try:
+            default_out = self.audio.get_default_output_device_info()
+            out_name = default_out.get("name", "")
+            if isinstance(out_name, bytes):
+                out_name = out_name.decode("utf-8", errors="ignore")
+            logger.info("Active system default output device: %s", out_name)
+        except Exception as e:
+            logger.warning("Could not get default output device info: %s", e)
+
+        # Extract core name to match loopbacks, e.g. "Speakers" or "Headphones"
+        core_name = ""
+        if out_name:
+            core_name = out_name.split("(")[0].strip() if "(" in out_name else out_name.strip()
+            if len(core_name) <= 3 and "(" in out_name:
+                parts = out_name.split("(")
+                if len(parts) > 1:
+                    core_name = parts[1].split(")")[0].strip()
+
+        num_devices = self.audio.get_device_count()
+        wasapi_loopbacks = []
+        any_loopbacks = []
+        
+        for i in range(num_devices):
+            try:
+                dev = self.audio.get_device_info_by_index(i)
+                if dev.get('maxInputChannels', 0) <= 0:
+                    continue
+                name = dev.get('name', '')
+                if isinstance(name, bytes):
+                    name = name.decode('utf-8', errors='ignore')
+                
+                host_idx = dev.get('hostApi', 0)
+                host_api_name = self.audio.get_host_api_info_by_index(host_idx).get('name', '')
+                
+                is_wasapi = "wasapi" in host_api_name.lower()
+                is_loop = "loopback" in name.lower() or dev.get('isLoopback', False) or dev.get('is_loopback', False)
+                is_stereo_mix = "stereo mix" in name.lower() or "wave out" in name.lower() or "monitor" in name.lower()
+                
+                if is_wasapi and (is_loop or is_stereo_mix):
+                    wasapi_loopbacks.append((i, name))
+                elif is_loop or is_stereo_mix:
+                    any_loopbacks.append((i, name))
+            except Exception as e:
+                logger.debug("Error scanning audio device %d: %s", i, e)
+                
+        if wasapi_loopbacks:
+            if core_name:
+                for idx, name in wasapi_loopbacks:
+                    if core_name.lower() in name.lower():
+                        logger.info("Matched WASAPI loopback device: '%s' (index %d) for output '%s'", name, idx, out_name)
+                        return idx
+            logger.info("Using first available WASAPI loopback device: '%s' (index %d)", wasapi_loopbacks[0][1], wasapi_loopbacks[0][0])
+            return wasapi_loopbacks[0][0]
+            
+        if any_loopbacks:
+            if core_name:
+                for idx, name in any_loopbacks:
+                    if core_name.lower() in name.lower():
+                        logger.info("Matched fallback loopback device: '%s' (index %d)", name, idx)
+                        return idx
+            logger.info("Using first available loopback device: '%s' (index %d)", any_loopbacks[0][1], any_loopbacks[0][0])
+            return any_loopbacks[0][0]
+            
+        logger.warning("No loopback audio devices found on the system.")
+        return None
+
+    def start_recording(self, capture_mode=None):
         self.recording = True
         with self._chunk_lock:
             self._chunk_frames     = []
@@ -475,13 +549,76 @@ class AudioRecorder:
             "input": True,
             "frames_per_buffer": cfg["chunk_size"],
         }
-        device_index = cfg.get("input_device_index")
-        if device_index not in (None, "", "default"):
-            open_args["input_device_index"] = int(device_index)
-        self.stream = self.audio.open(**open_args)
-        threading.Thread(target=self._record, daemon=True).start()
+        # Resolve what to capture. `capture_mode` is passed explicitly by the
+        # caller: the meetings window passes "smart_meeting"/"default_mic"; plain
+        # hotkey dictation passes nothing and just uses the configured mic. This
+        # keeps loopback/system-audio capture scoped to meetings — it can never
+        # leak into ordinary dictation via a shared config key.
+        self.mic_stream = None
+        is_loopback = False
+        self._loopback_rate = cfg["sample_rate"]
+        self._loopback_channels = 1
 
-    def _record(self):
+        actual_device_index = None
+
+        if capture_mode == "smart_meeting":
+            discovered = self._find_default_loopback_device()
+            if discovered is not None:
+                actual_device_index = discovered
+                is_loopback = True
+                try:
+                    dev_info = self.audio.get_device_info_by_index(actual_device_index)
+                    self._loopback_rate = int(dev_info.get("defaultSampleRate", 48000))
+                    self._loopback_channels = int(dev_info.get("maxInputChannels", 2))
+                except Exception as e:
+                    logger.warning("Could not query loopback device rate/channels: %s", e)
+                    self._loopback_rate = 48000
+                    self._loopback_channels = 2
+            else:
+                logger.warning("Smart Meeting Mode selected but no loopback device discovered. Recording default microphone only.")
+        elif capture_mode in ("default_mic", "default"):
+            actual_device_index = None
+        else:
+            # Dictation / legacy: input_device_index may name a specific input
+            # device. Meeting-mode sentinels left over in this key are treated as
+            # the default microphone so a stale config never makes plain
+            # dictation start capturing system audio.
+            device_index = cfg.get("input_device_index")
+            if device_index not in (None, "", "default", "default_mic", "smart_meeting"):
+                try:
+                    actual_device_index = int(device_index)
+                except (TypeError, ValueError):
+                    actual_device_index = None
+
+        # Open primary stream
+        if actual_device_index is not None:
+            open_args["input_device_index"] = actual_device_index
+            
+        if is_loopback:
+            open_args["rate"] = self._loopback_rate
+            open_args["channels"] = self._loopback_channels
+            open_args["frames_per_buffer"] = int(cfg["chunk_size"] * (self._loopback_rate / cfg["sample_rate"]))
+            
+        self.stream = self.audio.open(**open_args)
+        
+        # If primary stream is a loopback, open a secondary stream for default microphone!
+        if is_loopback:
+            try:
+                mic_args = {
+                    "format": pyaudio.paFloat32,
+                    "channels": 1,
+                    "rate": cfg["sample_rate"],
+                    "input": True,
+                    "frames_per_buffer": cfg["chunk_size"],
+                }
+                self.mic_stream = self.audio.open(**mic_args)
+                logger.info("Successfully opened secondary default mic stream to mix with loopback!")
+            except Exception as me:
+                logger.warning("Could not open secondary mic stream: %s", me)
+                
+        threading.Thread(target=self._record, args=(is_loopback,), daemon=True).start()
+
+    def _record(self, is_loopback):
         sr          = cfg["sample_rate"]
         frame_dur   = cfg["chunk_size"] / sr
         silence_trigger_sec = cfg_float("silence_trigger_sec", SILENCE_TRIGGER_SEC, 0.2, 5.0)
@@ -496,7 +633,44 @@ class AudioRecorder:
 
         while self.recording:
             try:
-                data = self.stream.read(cfg["chunk_size"], exception_on_overflow=False)
+                if is_loopback:
+                    read_len = int(cfg["chunk_size"] * (self._loopback_rate / cfg["sample_rate"]))
+                    raw_data = self.stream.read(read_len, exception_on_overflow=False)
+                    arr_loopback = np.frombuffer(raw_data, dtype=np.float32)
+                    
+                    # Convert stereo to mono. Truncate to a whole number of
+                    # frames first so a short/misaligned read can't crash reshape.
+                    if self._loopback_channels > 1 and len(arr_loopback) > 0:
+                        usable = len(arr_loopback) - (len(arr_loopback) % self._loopback_channels)
+                        if usable > 0:
+                            arr_loopback = arr_loopback[:usable].reshape(-1, self._loopback_channels).mean(axis=1)
+                        
+                    # Resample to 16000 Hz
+                    if self._loopback_rate != cfg["sample_rate"] and len(arr_loopback) > 0:
+                        duration = len(arr_loopback) / self._loopback_rate
+                        target_samples = int(duration * cfg["sample_rate"])
+                        indices = np.linspace(0, len(arr_loopback) - 1, target_samples)
+                        arr_loopback = np.interp(indices, np.arange(len(arr_loopback)), arr_loopback).astype(np.float32)
+                        
+                    data = arr_loopback.tobytes()
+                else:
+                    data = self.stream.read(cfg["chunk_size"], exception_on_overflow=False)
+                
+                # If we have a mic stream open, read from it and mix!
+                if hasattr(self, "mic_stream") and self.mic_stream is not None:
+                    try:
+                        mic_data = self.mic_stream.read(cfg["chunk_size"], exception_on_overflow=False)
+                        arr_loopback = np.frombuffer(data, dtype=np.float32)
+                        arr_mic = np.frombuffer(mic_data, dtype=np.float32)
+                        
+                        min_len = min(len(arr_loopback), len(arr_mic))
+                        if min_len > 0:
+                            mixed_arr = (arr_loopback[:min_len] + arr_mic[:min_len]) * 0.75
+                            mixed_arr = np.clip(mixed_arr, -1.0, 1.0)
+                            data = mixed_arr.tobytes()
+                    except Exception as me:
+                        logger.warning("Failed to read/mix mic stream: %s", me)
+                        
                 read_errors = 0
 
                 arr = np.frombuffer(data, dtype=np.float32)
@@ -573,6 +747,8 @@ class AudioRecorder:
         try:
             if cfg["backend"] == "google" and cfg["google_api_key"]:
                 text, lang = self._run_google(audio)
+            elif cfg["backend"] == "mistral" and cfg.get("mistral_api_key"):
+                text, lang = self._run_mistral(audio)
             else:
                 text, lang = self._run_local(audio)
 
@@ -609,6 +785,13 @@ class AudioRecorder:
             self.stream.close()
         except Exception:
             pass
+        if hasattr(self, "mic_stream") and self.mic_stream is not None:
+            try:
+                self.mic_stream.stop_stream()
+                self.mic_stream.close()
+            except Exception:
+                pass
+            self.mic_stream = None
 
     def transcribe(self):
         pending = list(self._chunk_threads)
@@ -635,14 +818,17 @@ class AudioRecorder:
         remaining = np.frombuffer(b"".join(self._chunk_frames), dtype=np.float32).copy()
         last_text, detected = "", ""
 
-        min_samples = cfg["sample_rate"] // 4 if (cfg["backend"] == "google" and cfg["google_api_key"]) else cfg["sample_rate"] // 2
+        is_cloud = (cfg["backend"] == "google" and cfg["google_api_key"]) or (cfg["backend"] == "mistral" and cfg.get("mistral_api_key"))
+        min_samples = cfg["sample_rate"] // 4 if is_cloud else cfg["sample_rate"] // 2
         if len(remaining) >= min_samples:
             if cfg["backend"] == "google" and cfg["google_api_key"]:
                 last_text, detected = self._run_google(remaining)
+            elif cfg["backend"] == "mistral" and cfg.get("mistral_api_key"):
+                last_text, detected = self._run_mistral(remaining)
             else:
                 last_text, detected = self._run_local(remaining)
 
-        if detected and detected.startswith("!google:"):
+        if detected and (detected.startswith("!google:") or detected.startswith("!mistral:")):
             return "", detected
 
         with self._chunk_lock:
@@ -747,6 +933,46 @@ class AudioRecorder:
         except Exception as e:
             return "", f"!google:{e}"
 
+    def _run_mistral(self, audio):
+        try:
+            import requests
+            import io
+            
+            api_key = cfg.get("mistral_api_key", "")
+            if not api_key:
+                return "", "!mistral:API key not configured"
+                
+            model = cfg.get("mistral_stt_model", "voxtral-mini-latest")
+            lang_setting = cfg.get("language", "auto")
+            
+            wav_bytes = self._float_to_wav(audio)
+            wav_io = io.BytesIO(wav_bytes)
+            
+            url = "https://api.mistral.ai/v1/audio/transcriptions"
+            headers = {
+                "Authorization": f"Bearer {api_key}"
+            }
+            files = {
+                "file": ("audio.wav", wav_io, "audio/wav")
+            }
+            data = {
+                "model": model
+            }
+            if lang_setting and lang_setting != "auto":
+                data["language"] = lang_setting
+                
+            resp = requests.post(url, headers=headers, files=files, data=data, timeout=20)
+            if resp.status_code != 200:
+                return "", f"!mistral:HTTP {resp.status_code}: {resp.text[:80]}"
+                
+            resp_data = resp.json()
+            text = resp_data.get("text", "").strip()
+            detected_lang = resp_data.get("language", lang_setting if lang_setting != "auto" else "en")
+            
+            return text, detected_lang
+        except Exception as e:
+            return "", f"!mistral:{e}"
+
     def _float_to_wav(self, audio_float):
         int_data = (audio_float * 32767).astype(np.int16)
         buf = io.BytesIO()
@@ -762,6 +988,12 @@ class AudioRecorder:
             self.stream.close()
         except Exception:
             pass
+        if hasattr(self, "mic_stream") and self.mic_stream is not None:
+            try:
+                self.mic_stream.stop_stream()
+                self.mic_stream.close()
+            except Exception:
+                pass
         self.audio.terminate()
 
 # ── Dynamic Pillow Tray Icon Generator ───────────────────────────────────────
@@ -821,9 +1053,12 @@ class AppController(QObject):
         self.qapp = qapp
         self.cfg = cfg
 
-        # Load stylesheet
+        # Load stylesheet. Resolve the checkbox tick asset to an absolute path
+        # so it renders regardless of the process working directory (packaged
+        # builds and autostart can launch from an arbitrary CWD).
         from ui.styles import STYLESHEET
-        self.style_content = STYLESHEET
+        _check_svg = resource_path("assets", "check.svg").replace("\\", "/")
+        self.style_content = STYLESHEET.replace('url("assets/check.svg")', f'url("{_check_svg}")')
 
         # Setup pure business Audio Recorder
         self.recorder = AudioRecorder()

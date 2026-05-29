@@ -125,6 +125,17 @@ class TestActions(unittest.TestCase):
         self.assertEqual(out, "Bonjour")
         run_action.assert_called_once()
 
+    def test_privacy_mode_forces_rule_based_actions(self):
+        with patch.object(actions.action_api, "run_action") as run_action:
+            out = actions.process(
+                "send the report today",
+                "write_email",
+                model=actions.API_OPENAI_ID,
+                config={"action_api_key": "secret", "privacy_mode": True},
+            )
+        self.assertIn("Subject:", out)
+        run_action.assert_not_called()
+
 
 class TestMeetingNotes(unittest.TestCase):
     SAMPLE = (

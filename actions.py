@@ -147,6 +147,9 @@ def normalize_translate_target(code):
 def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_ID, config=None):
     mode = normalize_action_mode(mode)
     model = normalize_action_model(model)
+    if config and config.get("privacy_mode"):
+        if ACTION_MODELS.get(model, {}).get("kind") == "cloud":
+            model = RULE_BASED_ID
     text = (text or "").strip()
     if not text:
         return ""

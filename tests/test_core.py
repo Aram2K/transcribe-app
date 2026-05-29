@@ -550,5 +550,299 @@ class TestMeetingsWindowHelpers(unittest.TestCase):
         self.assertEqual(mw._format_share("markdown"), "## Hello\n**bold**\n- item")
 
 
+class TestMistral(unittest.TestCase):
+    @patch("requests.post")
+    def test_run_mistral_success(self, mock_post):
+        import main
+        from main import AudioRecorder
+        
+        # Configure mock response
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"text": "hello from mistral", "language": "en"}
+        mock_post.return_value = mock_resp
+        
+        # Create recorder and stub dependencies
+        recorder = AudioRecorder()
+        recorder._float_to_wav = MagicMock(return_value=b"fake-wav")
+        
+        # Setup config mock
+        with patch.dict(main.cfg, {
+            "backend": "mistral",
+            "mistral_api_key": "fake-key",
+            "mistral_stt_model": "voxtral-mini-latest",
+            "language": "en",
+            "sample_rate": 16000
+        }):
+            import numpy as np
+            audio = np.array([0.0]*1000, dtype=np.float32)
+            text, lang = recorder._run_mistral(audio)
+            
+            self.assertEqual(text, "hello from mistral")
+            self.assertEqual(lang, "en")
+            
+            mock_post.assert_called_once()
+            args, kwargs = mock_post.call_args
+            self.assertEqual(args[0], "https://api.mistral.ai/v1/audio/transcriptions")
+            self.assertEqual(kwargs["headers"]["Authorization"], "Bearer fake-key")
+            self.assertEqual(kwargs["data"]["model"], "voxtral-mini-latest")
+            self.assertEqual(kwargs["data"]["language"], "en")
+
+
+class TestSettingsValidation(unittest.TestCase):
+    def test_save_clicked_missing_mistral_key(self):
+        from ui.settings import Settings
+        from PySide6.QtWidgets import QMessageBox
+
+        dialog = MagicMock()
+        dialog.cfg_working = {"backend": "mistral", "mistral_api_key": ""}
+        dialog.tabs = MagicMock()
+        dialog.mistral_key_input = MagicMock()
+        dialog.mistral_key_input.text.return_value = ""
+        dialog.accept = MagicMock()
+        
+        with patch.object(QMessageBox, "warning") as mock_warning:
+            Settings._on_save_clicked(dialog)
+            
+            dialog._sync_action_settings_from_widgets.assert_called_once()
+            dialog.tabs.setCurrentIndex.assert_called_once_with(1)
+            dialog.mistral_key_input.setFocus.assert_called_once()
+            dialog.mistral_key_input.setStyleSheet.assert_called_once_with(
+                "border: 2px solid #ef4444; background-color: #fef2f2;"
+            )
+            mock_warning.assert_called_once()
+            dialog.accept.assert_not_called()
+
+    def test_save_clicked_missing_google_key(self):
+        from ui.settings import Settings
+        from PySide6.QtWidgets import QMessageBox
+
+        dialog = MagicMock()
+        dialog.cfg_working = {"backend": "google", "google_api_key": ""}
+        dialog.tabs = MagicMock()
+        dialog.google_key_input = MagicMock()
+        dialog.google_key_input.text.return_value = ""
+        dialog.accept = MagicMock()
+        
+        with patch.object(QMessageBox, "warning") as mock_warning:
+            Settings._on_save_clicked(dialog)
+            
+            dialog._sync_action_settings_from_widgets.assert_called_once()
+            dialog.tabs.setCurrentIndex.assert_called_once_with(1)
+            dialog.google_key_input.setFocus.assert_called_once()
+            dialog.google_key_input.setStyleSheet.assert_called_once_with(
+                "border: 2px solid #ef4444; background-color: #fef2f2;"
+            )
+            mock_warning.assert_called_once()
+            dialog.accept.assert_not_called()
+
+    def test_save_clicked_valid(self):
+        from ui.settings import Settings
+
+        dialog = MagicMock()
+        dialog.cfg_working = {"backend": "mistral", "mistral_api_key": "some-key"}
+        dialog._mistral_key_verified = True
+        dialog.tabs = MagicMock()
+        dialog.mistral_key_input = MagicMock()
+        dialog.mistral_key_input.text.return_value = "some-key"
+        dialog.accept = MagicMock()
+        dialog.app = MagicMock()
+        dialog.app.cfg = {}
+        
+        Settings._on_save_clicked(dialog)
+        
+        dialog._sync_action_settings_from_widgets.assert_called_once()
+        dialog.accept.assert_called_once()
+        dialog.tabs.setCurrentIndex.assert_not_called()
+
+    def test_save_clicked_invalid_mistral_key(self):
+        from ui.settings import Settings
+        from PySide6.QtWidgets import QMessageBox
+
+        dialog = MagicMock()
+        dialog.cfg_working = {"backend": "mistral", "mistral_api_key": "bad-key"}
+        dialog._mistral_key_verified = False
+        dialog.tabs = MagicMock()
+        dialog.mistral_key_input = MagicMock()
+        dialog.mistral_key_input.text.return_value = "bad-key"
+        dialog.accept = MagicMock()
+        
+        with patch.object(QMessageBox, "warning") as mock_warning:
+            Settings._on_save_clicked(dialog)
+            
+            dialog.tabs.setCurrentIndex.assert_called_once_with(1)
+            dialog.mistral_key_input.setFocus.assert_called_once()
+            mock_warning.assert_called_once()
+            dialog.accept.assert_not_called()
+
+    def test_text_changed_invalidates_state(self):
+        from ui.settings import Settings
+
+        dialog = MagicMock()
+        dialog.app = MagicMock()
+        dialog.cfg_working = {"backend": "mistral", "mistral_api_key": "old-key"}
+        dialog._mistral_key_verified = True
+        dialog.chk_privacy.isChecked.return_value = False
+
+        dialog.mistral_key_input = MagicMock()
+        dialog.mistral_key_input.text.return_value = ""  # Changed to empty!
+        
+        dialog.lbl_status_mistral = MagicMock()
+        dialog.mistral_cards = {}
+        
+        Settings._save_general_configs(dialog)
+        
+        self.assertFalse(dialog._mistral_key_verified)
+        dialog.lbl_status_mistral.setText.assert_called_with("Not Configured")
+
+    def test_text_changed_sets_untested_but_valid(self):
+        from ui.settings import Settings
+
+        dialog = MagicMock()
+        dialog.app = MagicMock()
+        dialog.cfg_working = {"backend": "mistral", "mistral_api_key": "old-key"}
+        dialog._mistral_key_verified = False
+        dialog.chk_privacy.isChecked.return_value = False
+
+        dialog.mistral_key_input = MagicMock()
+        dialog.mistral_key_input.text.return_value = "new-key"  # Changed to non-empty!
+        
+        dialog.lbl_status_mistral = MagicMock()
+        dialog.mistral_cards = {}
+        
+        Settings._save_general_configs(dialog)
+        
+        self.assertTrue(dialog._mistral_key_verified)
+        dialog.lbl_status_mistral.setText.assert_called_with("Not Tested")
+
+    def test_mistral_test_key_success(self):
+        from ui.settings import Settings
+        
+        dialog = MagicMock()
+        dialog.mistral_key_input = MagicMock()
+        dialog.mistral_key_input.text.return_value = "valid-key"
+        dialog.lbl_status_mistral = MagicMock()
+        dialog.btn_test_mistral = MagicMock()
+        dialog.mistral_test_finished = MagicMock()
+        
+        with patch("requests.get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_get.return_value = mock_resp
+            
+            with patch("threading.Thread") as mock_thread:
+                Settings._test_mistral_key(dialog)
+                
+                worker_func = mock_thread.call_args[1]["target"]
+                worker_func()
+                
+                mock_get.assert_called_once_with(
+                    "https://api.mistral.ai/v1/models",
+                    headers={"Authorization": "Bearer valid-key"},
+                    timeout=10
+                )
+                dialog.mistral_test_finished.emit.assert_called_once_with(True, "Working!")
+
+
+class TestCaptureMode(unittest.TestCase):
+    """Plain dictation must never trigger loopback/system-audio capture; only an
+    explicit meeting capture_mode="smart_meeting" does."""
+
+    @patch("threading.Thread")
+    def test_dictation_default_is_mic_only(self, _mock_thread):
+        import main
+        from main import AudioRecorder
+        rec = AudioRecorder()
+        rec.audio = MagicMock()
+        rec._find_default_loopback_device = MagicMock(return_value=7)
+        try:
+            with patch.dict(main.cfg, {"sample_rate": 16000, "chunk_size": 1024,
+                                       "input_device_index": None}):
+                rec.start_recording()  # no capture_mode → plain dictation
+            rec._find_default_loopback_device.assert_not_called()
+            self.assertIsNone(rec.mic_stream)
+            self.assertEqual(rec.audio.open.call_count, 1)  # primary mic only
+        finally:
+            rec.recording = False
+
+    @patch("threading.Thread")
+    def test_dictation_ignores_stale_smart_meeting_in_config(self, _mock_thread):
+        # A "smart_meeting" sentinel left in input_device_index by an older build
+        # must not make ordinary dictation capture system audio.
+        import main
+        from main import AudioRecorder
+        rec = AudioRecorder()
+        rec.audio = MagicMock()
+        rec._find_default_loopback_device = MagicMock(return_value=7)
+        try:
+            with patch.dict(main.cfg, {"sample_rate": 16000, "chunk_size": 1024,
+                                       "input_device_index": "smart_meeting"}):
+                rec.start_recording()
+            rec._find_default_loopback_device.assert_not_called()
+            self.assertIsNone(rec.mic_stream)
+            self.assertEqual(rec.audio.open.call_count, 1)
+        finally:
+            rec.recording = False
+
+    @patch("threading.Thread")
+    def test_smart_meeting_uses_loopback_and_mic(self, _mock_thread):
+        import main
+        from main import AudioRecorder
+        rec = AudioRecorder()
+        rec.audio = MagicMock()
+        rec.audio.get_device_info_by_index.return_value = {
+            "defaultSampleRate": 48000, "maxInputChannels": 2}
+        rec._find_default_loopback_device = MagicMock(return_value=7)
+        try:
+            with patch.dict(main.cfg, {"sample_rate": 16000, "chunk_size": 1024}):
+                rec.start_recording(capture_mode="smart_meeting")
+            rec._find_default_loopback_device.assert_called_once()
+            self.assertIsNotNone(rec.mic_stream)              # secondary mic opened
+            self.assertEqual(rec.audio.open.call_count, 2)    # loopback + mic
+        finally:
+            rec.recording = False
+
+
+class TestGoogleKeyTest(unittest.TestCase):
+    def _run_worker(self, status_code, json_data):
+        from ui.settings import Settings
+        dialog = MagicMock()
+        dialog.google_key_input.text.return_value = "some-key"
+        with patch("requests.post") as mock_post:
+            mock_resp = MagicMock()
+            mock_resp.status_code = status_code
+            mock_resp.json.return_value = json_data
+            mock_post.return_value = mock_resp
+            with patch("threading.Thread") as mock_thread:
+                Settings._test_google_key(dialog)
+                worker = mock_thread.call_args[1]["target"]
+                worker()
+        return dialog.google_test_finished.emit
+
+    def test_dummy_audio_400_reports_working(self):
+        # Valid key + intentional dummy audio → auth passed, key works.
+        emit = self._run_worker(400, {"error": {
+            "status": "INVALID_ARGUMENT", "message": "Invalid recognition audio"}})
+        emit.assert_called_once_with(True, "Working!")
+
+    def test_invalid_key_reports_invalid(self):
+        emit = self._run_worker(400, {"error": {
+            "status": "INVALID_ARGUMENT",
+            "message": "API key not valid. Please pass a valid API key."}})
+        emit.assert_called_once_with(False, "Invalid API Key")
+
+    def test_permission_denied_not_reported_as_working(self):
+        emit = self._run_worker(403, {"error": {
+            "status": "PERMISSION_DENIED",
+            "message": "Cloud Speech-to-Text API has not been used in project X or it is disabled"}})
+        self.assertFalse(emit.call_args[0][0])
+
+    def test_server_error_not_reported_as_working(self):
+        # A 5xx must not be misread as a passing key.
+        emit = self._run_worker(500, {"error": {
+            "status": "INTERNAL", "message": "backend error"}})
+        self.assertFalse(emit.call_args[0][0])
+
+
 if __name__ == "__main__":
     unittest.main()
