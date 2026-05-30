@@ -240,6 +240,23 @@ jobs:
             --exclude-module IPython \
             main.py
 
+      - name: Patch Info.plist (usage strings + permissions)
+        # macOS shows the value of these strings in the system permission
+        # prompts. Without them, the prompt is generic / sometimes doesn't
+        # appear at all and the underlying API silently fails — which was
+        # the root cause of "the hotkey doesn't work on Mac" reports.
+        # Must run BEFORE code-signing so the signature seals the patched bundle.
+        run: |
+          PLIST="dist/TranscribeApp.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string 'Transcribe records your microphone to turn speech into text. Audio never leaves your device unless you opt into the Google Cloud backend with your own API key.'" "$PLIST" || \
+          /usr/libexec/PlistBuddy -c "Set :NSMicrophoneUsageDescription 'Transcribe records your microphone to turn speech into text. Audio never leaves your device unless you opt into the Google Cloud backend with your own API key.'" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string 'Transcribe pastes transcribed text into the focused window via simulated keystrokes.'" "$PLIST" || \
+          /usr/libexec/PlistBuddy -c "Set :NSAppleEventsUsageDescription 'Transcribe pastes transcribed text into the focused window via simulated keystrokes.'" "$PLIST"
+          # Surface the global-hotkey requirement so macOS shows a clear
+          # prompt under Privacy & Security → Accessibility.
+          /usr/libexec/PlistBuddy -c "Add :NSInputMonitoringUsageDescription string 'Transcribe needs to listen for your global hotkey (default: Option+R) so you can start dictation from any app.'" "$PLIST" || \
+          /usr/libexec/PlistBuddy -c "Set :NSInputMonitoringUsageDescription 'Transcribe needs to listen for your global hotkey (default: Option+R) so you can start dictation from any app.'" "$PLIST"
+
       - name: Ad-hoc sign the .app
         # Without an Apple Developer ID we can only sign ad-hoc. This still
         # produces a valid signature (so the hardened runtime and library

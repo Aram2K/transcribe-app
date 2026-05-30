@@ -69,12 +69,14 @@ It was built especially for **Armenian speakers** who need accurate, native-scri
 
 1. Download **[TranscribeApp-Mac.dmg](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Mac.dmg)**
 2. Open the `.dmg` and drag the app to your Applications folder
-3. **On first launch**, macOS will block the app with *"Apple could not verify TranscribeApp is free of malware"*. This is because the app is not notarized (notarization requires a paid Apple Developer ID — the app is open-source and safe). Use **one** of these to bypass the warning:
-   - **Easiest:** Open **System Settings → Privacy & Security**, scroll to the bottom and click **Open Anyway** next to the TranscribeApp message, then confirm.
+3. **First launch — Gatekeeper warning.** macOS will block the app with *"Apple could not verify TranscribeApp is free of malware"* because it isn't notarized (notarization needs a paid Apple Developer ID — the app is open-source and safe). Use **one** of these:
+   - **Easiest:** Open **System Settings → Privacy & Security**, scroll to the bottom and click **Open Anyway** next to the TranscribeApp message.
    - **Or:** In Finder, right-click (or Control-click) **TranscribeApp.app → Open**, then click **Open** in the dialog.
    - **Or via Terminal:** `xattr -dr com.apple.quarantine /Applications/TranscribeApp.app` then launch normally.
-4. Grant **Accessibility** permission when prompted (required for global hotkeys):
-   `System Settings → Privacy & Security → Accessibility → add TranscribeApp`
+4. **Where did the app go?** Transcribe has no Dock window — it runs as a **microphone icon in the menu bar** at the top-right of your screen, next to the wifi/battery icons. Click it any time to reach Settings, History, Record Meeting, and Quit.
+5. **Grant Accessibility permission** — required for the global hotkey:
+   - The first time you press your hotkey, macOS prompts you to allow Transcribe under **System Settings → Privacy & Security → Accessibility**. Toggle TranscribeApp **on**. Until you do, the hotkey silently won't fire.
+6. **Hotkey:** the default is **Option + R** (`alt+r`). To change it: menu bar icon → Settings → Hotkey → click the field and press any combination of `⌘ ⌥ ⌃ ⇧` plus a key. It's read by physical key code, so any keyboard layout (French, German, Armenian, …) works.
 
 ---
 
