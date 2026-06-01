@@ -403,6 +403,8 @@ def cfg_float(name, default, minimum=None, maximum=None):
 class AudioRecorder:
     def __init__(self):
         self.recording        = False
+        self.stop_requested   = False
+        self._record_thread   = None
         self.audio            = pyaudio.PyAudio()
         self._model           = None
         self._model_name      = None
@@ -616,7 +618,9 @@ class AudioRecorder:
             except Exception as me:
                 logger.warning("Could not open secondary mic stream: %s", me)
                 
-        threading.Thread(target=self._record, args=(is_loopback,), daemon=True).start()
+        self.stop_requested = False
+        self._record_thread = threading.Thread(target=self._record, args=(is_loopback,), daemon=True)
+        self._record_thread.start()
 
     def _record(self, is_loopback):
         sr          = cfg["sample_rate"]
@@ -630,8 +634,19 @@ class AudioRecorder:
         silence_sec  = 0.0
         noise_hist   = []
         read_errors   = 0
+ 
+        post_roll_chunks = 0
+        max_post_roll = 4  # ~256ms post-roll to catch final spoken syllables in flight
 
-        while self.recording:
+        while self.recording or post_roll_chunks > 0:
+            if self.stop_requested and post_roll_chunks == 0:
+                post_roll_chunks = max_post_roll
+
+            if post_roll_chunks > 0:
+                post_roll_chunks -= 1
+                if post_roll_chunks == 0:
+                    self.recording = False
+
             try:
                 if is_loopback:
                     read_len = int(cfg["chunk_size"] * (self._loopback_rate / cfg["sample_rate"]))
@@ -719,6 +734,11 @@ class AudioRecorder:
                     or total_sec >= max_speech_sec
                 )
 
+                # During background post-roll, accumulate everything into remaining frames
+                # rather than starting new parallel chunk transcription threads.
+                if post_roll_chunks > 0:
+                    should_chunk = False
+
                 if should_chunk and speech_sec >= min_speech_sec:
                     with self._chunk_lock:
                         chunk_audio = np.frombuffer(
@@ -778,8 +798,36 @@ class AudioRecorder:
                 self._chunk_errors.append(f"!transcribe:{e}")
 
     def stop_recording(self):
+        self.stop_requested = True
+        
+        # Wait for the recording thread to cleanly complete the post-roll phase (max 400ms)
+        if hasattr(self, "_record_thread") and self._record_thread is not None:
+            self._record_thread.join(timeout=0.4)
+            
         self.recording = False
-        time.sleep(0.15)
+        
+        # Drain any lingering frames from PortAudio device input buffers
+        try:
+            avail = self.stream.get_read_available()
+            if avail > 0:
+                extra_data = self.stream.read(avail, exception_on_overflow=False)
+                if extra_data:
+                    with self._chunk_lock:
+                        self._chunk_frames.append(extra_data)
+        except Exception as e:
+            logger.debug("Failed to drain primary stream: %s", e)
+            
+        if hasattr(self, "mic_stream") and self.mic_stream is not None:
+            try:
+                avail = self.mic_stream.get_read_available()
+                if avail > 0:
+                    extra_mic = self.mic_stream.read(avail, exception_on_overflow=False)
+                    if extra_mic:
+                        with self._chunk_lock:
+                            self._chunk_frames.append(extra_mic)
+            except Exception as e:
+                logger.debug("Failed to drain secondary mic stream: %s", e)
+
         try:
             self.stream.stop_stream()
             self.stream.close()
@@ -820,6 +868,13 @@ class AudioRecorder:
 
         is_cloud = (cfg["backend"] == "google" and cfg["google_api_key"]) or (cfg["backend"] == "mistral" and cfg.get("mistral_api_key"))
         min_samples = cfg["sample_rate"] // 4 if is_cloud else cfg["sample_rate"] // 2
+
+        # Smart Audio Padding: Pad short final audio snippets with silence (zeros) 
+        # to satisfy the backend's minimum length requirement rather than discarding them.
+        if 0 < len(remaining) < min_samples:
+            padding_len = min_samples - len(remaining)
+            remaining = np.concatenate([remaining, np.zeros(padding_len, dtype=np.float32)])
+
         if len(remaining) >= min_samples:
             if cfg["backend"] == "google" and cfg["google_api_key"]:
                 last_text, detected = self._run_google(remaining)
