@@ -26,6 +26,12 @@ class MeetingsWindow(QDialog):
     STATE_PROCESSING = "processing"
     STATE_DONE = "done"
 
+    # Emitted from the background transcription worker thread with each finished
+    # chunk of text. Connected to a main-thread slot so the live transcript
+    # QTextEdit is only ever touched on the Qt GUI thread (touching widgets from
+    # worker threads causes intermittent crashes on Windows).
+    sig_chunk = Signal(str)
+
     def __init__(self, parent=None, main_app=None):
         super().__init__(parent)
         self.app = main_app
@@ -54,6 +60,8 @@ class MeetingsWindow(QDialog):
         # Signals for thread-safe processing
         self.proc_signals = MeetingProcessingSignal()
         self.proc_signals.finished.connect(self._on_processing_finished)
+        # Live transcript chunks arrive on a worker thread; marshal to GUI thread.
+        self.sig_chunk.connect(self._append_live_line)
         
         # Timer for duration and visualizer ticking
         self.timer = QTimer(self)
@@ -306,15 +314,21 @@ class MeetingsWindow(QDialog):
     def _start_meeting(self):
         if not self.app or not self.app.recorder:
             return
-            
-        self.state = self.STATE_RECORDING
-        self._chunks = []
-        self.live_trans_log.clear()
-        self.input_live_notes.clear()
-        
+
+        # A plain Alt-R dictation shares this same AudioRecorder + audio device.
+        # If one is running, stop it first (and tell the user) so the two don't
+        # fight over the device — which crashes — or leak dictation audio into
+        # the meeting recording.
+        dictation_was_running = False
+        try:
+            if getattr(self.app, "is_rec", False) and hasattr(self.app, "force_stop_dictation"):
+                dictation_was_running = bool(self.app.force_stop_dictation())
+        except Exception:
+            pass
+
         self._meeting_title = self.input_title.text().strip() or "Untitled Meeting"
         self._meeting_attendees = self.input_attendees.text().strip()
-        
+
         # Capture configurations. This is the meeting capture mode
         # ("smart_meeting"/"default_mic"), stored under its own key so it stays
         # independent of the dictation input device.
@@ -324,27 +338,74 @@ class MeetingsWindow(QDialog):
 
         # Build local timestamp folder for auto-save recovery
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self._meeting_dir = storage.path_for("meetings") / timestamp
-        self._meeting_dir.mkdir(parents=True, exist_ok=True)
-        self._chunks_path = self._meeting_dir / "chunks.jsonl"
+        try:
+            self._meeting_dir = storage.path_for("meetings") / timestamp
+            self._meeting_dir.mkdir(parents=True, exist_ok=True)
+            self._chunks_path = self._meeting_dir / "chunks.jsonl"
+        except OSError as e:
+            QMessageBox.critical(self, "Recording Error",
+                                 f"Could not create the meeting folder:\n{e}")
+            return
 
-        # Configure AudioRecorder callbacks safely
+        # Save the recorder's existing (dictation/overlay) callbacks so they can
+        # be restored when the meeting ends — otherwise dictation's live level
+        # meter and partials stay broken after a meeting. While the meeting owns
+        # the recorder, silence the overlay callbacks so the dictation overlay
+        # never pops up mid-meeting.
+        self._saved_on_chunk   = self.app.recorder.on_chunk_complete
+        self._saved_on_levels  = self.app.recorder.on_levels
+        self._saved_on_partial = self.app.recorder.on_partial
+        self._saved_on_lang    = self.app.recorder.on_lang_detected
+
         self.app.recorder.on_chunk_complete = self._on_chunk_transcribed
-        self.app.recorder.on_levels = self._on_audio_levels
-        
-        # Start recording
+        self.app.recorder.on_levels         = self._on_audio_levels
+        self.app.recorder.on_partial        = lambda *a, **k: None
+        self.app.recorder.on_lang_detected  = lambda *a, **k: None
+
+        # Commit to the recording state before starting so early chunks aren't
+        # dropped by the state guard.
+        self.state = self.STATE_RECORDING
+        self._chunks = []
+        self.live_trans_log.clear()
+        self.input_live_notes.clear()
         self._record_started_at = time.time()
-        self.app.recorder.start_recording(capture_mode=meeting_mode)
-        
+
+        # Start recording — guard against device-open failures (busy mic, no
+        # loopback device, driver errors) so a failure never crashes the app or
+        # leaves the window stuck in a fake "recording" state.
+        try:
+            self.app.recorder.start_recording(capture_mode=meeting_mode)
+        except Exception as e:
+            self._restore_recorder_callbacks()
+            self.state = self.STATE_IDLE
+            self._record_started_at = None
+            self.container.setCurrentIndex(0)
+            QMessageBox.critical(
+                self, "Recording Error",
+                f"Could not start the meeting recording:\n\n{e}\n\n"
+                "Close any other app that may be using the microphone or audio "
+                "device and try again."
+            )
+            return
+
         # Swap view tab
         self.container.setCurrentIndex(1)
+
+        if dictation_was_running and hasattr(self.app, "show_tray_hint"):
+            self.app.show_tray_hint(
+                "Dictation Stopped",
+                "Your Alt-R dictation was stopped so it isn't mixed into this "
+                "meeting recording."
+            )
+
         from main import APP_VERSION
         telemetry.track("meeting_recording_started", {}, self.app.cfg, APP_VERSION)
 
     def _on_chunk_transcribed(self, idx, text, lang):
+        # NOTE: this runs on a background transcription worker thread.
         if self.state != self.STATE_RECORDING:
             return
-            
+
         # Log to in-memory cache
         chunk = {
             "index": idx,
@@ -354,7 +415,7 @@ class MeetingsWindow(QDialog):
         }
         with self._chunks_lock:
             self._chunks.append(chunk)
-            
+
         # Recoverable write to JSONL log
         try:
             with open(self._chunks_path, "a", encoding="utf-8") as f:
@@ -362,8 +423,32 @@ class MeetingsWindow(QDialog):
         except OSError:
             pass
 
-        # Thread-safe log text trigger
+        # Hand the text to the GUI thread via a signal. Touching the QTextEdit
+        # directly from this worker thread is what was crashing the meeting
+        # recorder on Windows.
+        if text:
+            try:
+                self.sig_chunk.emit(text)
+            except RuntimeError:
+                pass  # window already destroyed
+
+    def _append_live_line(self, text):
+        # Runs on the Qt GUI thread (connected to sig_chunk).
+        if self.state != self.STATE_RECORDING:
+            return
         self.live_trans_log.append(f"[{time.strftime('%H:%M:%S')}]  {text}")
+
+    def _restore_recorder_callbacks(self):
+        """Restore the recorder callbacks that were active before the meeting
+        took over (the dictation/overlay handlers). Falls back to safe no-ops so
+        a missing saved handler can never leave a dangling reference."""
+        if not (self.app and getattr(self.app, "recorder", None)):
+            return
+        rec = self.app.recorder
+        rec.on_chunk_complete = getattr(self, "_saved_on_chunk", None) or (lambda idx, text, lang: None)
+        rec.on_levels         = getattr(self, "_saved_on_levels", None) or (lambda lvls: None)
+        rec.on_partial        = getattr(self, "_saved_on_partial", None) or (lambda text: None)
+        rec.on_lang_detected  = getattr(self, "_saved_on_lang", None) or (lambda code, name: None)
 
     def _on_audio_levels(self, levels):
         pass # Optional viz level capture if visual painting needed
@@ -388,13 +473,13 @@ class MeetingsWindow(QDialog):
         
         # Stop recording
         self.app.recorder.stop_recording()
-        
+
         # Retrieve notes text in-meeting notepad
         self._user_notes = self.input_live_notes.toPlainText().strip()
-        
-        # Remove recording callbacks
-        self.app.recorder.on_chunk_complete = None
-        self.app.recorder.on_levels = None
+
+        # Restore the recorder's dictation/overlay callbacks so plain Alt-R
+        # dictation works normally after the meeting.
+        self._restore_recorder_callbacks()
 
         # Start LLM summaries generator thread safely
         threading.Thread(target=self._process_meeting_notes, daemon=True).start()
@@ -501,8 +586,7 @@ class MeetingsWindow(QDialog):
     def _abort(self):
         if self.app and self.app.recorder:
             self.app.recorder.stop_recording()
-            self.app.recorder.on_chunk_complete = None
-            self.app.recorder.on_levels = None
+            self._restore_recorder_callbacks()
         self._reset()
 
     def closeEvent(self, event):
