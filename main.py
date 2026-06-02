@@ -1455,9 +1455,46 @@ class AppController(QObject):
     def _on_hotkey(self):
         logger.info("[main] _on_hotkey fired (is_rec=%s)", self.is_rec)
         if not self.is_rec:
+            # Dictation and the meeting recorder share one AudioRecorder + audio
+            # device. Don't let the hotkey start a dictation on top of an active
+            # meeting — it would clobber the meeting's audio stream. Tell the
+            # user instead.
+            if self._is_meeting_busy():
+                self.show_tray_hint(
+                    "Meeting Recording Active",
+                    "Alt-R dictation is paused while a meeting is recording so "
+                    "the two don't mix. Stop the meeting to dictate again.",
+                )
+                return
             self._start()
         else:
             threading.Thread(target=self._stop, daemon=True).start()
+
+    def _is_meeting_busy(self):
+        """True while the meeting window is actively recording or processing —
+        i.e. while it owns the shared AudioRecorder."""
+        win = getattr(self, "meetings_win", None)
+        if win is None:
+            return False
+        return getattr(win, "state", None) in (win.STATE_RECORDING, win.STATE_PROCESSING)
+
+    def force_stop_dictation(self):
+        """Cancel an in-progress Alt-R dictation (discarding it). Called when a
+        meeting starts so the two don't share/clobber the audio device. Returns
+        True if a dictation was actually running."""
+        if not self.is_rec:
+            return False
+        try:
+            self.recorder.stop_recording()
+        except Exception as e:
+            logger.warning("force_stop_dictation: stop_recording failed: %s", e)
+        self.is_rec = False
+        self._unregister_transient_keys()
+        try:
+            self.overlay.call_soon(self.overlay.hide_overlay)
+        except Exception:
+            pass
+        return True
 
     def _on_enter(self):
         logger.info("[main] _on_enter fired (is_rec=%s)", self.is_rec)

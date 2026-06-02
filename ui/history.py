@@ -159,16 +159,43 @@ class HistoryWindow(QDialog):
     def _clear(self):
         if not self.all_entries:
             return
-        
+
         reply = QMessageBox.question(
-            self, "Clear History",
-            "Are you sure you want to permanently delete all transcription history?",
+            self, "Clear All History",
+            "Are you sure you want to permanently delete ALL transcription "
+            "history?\n\nThis clears every entry, regardless of what is "
+            "currently selected or filtered.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         )
-        if reply == QMessageBox.Yes:
-            hist.clear()
-            telemetry.track("history_cleared", {"count": len(self.all_entries)}, self.app.cfg if self.app else {}, self.app.version if self.app else "1.0.0")
-            self.refresh_list()
+        if reply != QMessageBox.Yes:
+            return
+
+        count = len(self.all_entries)
+
+        # Clear the underlying store first so the action always completes.
+        hist.clear()
+
+        # Telemetry must never be able to break the clear/refresh. (The previous
+        # code referenced a non-existent ``self.app.version`` here, which raised
+        # AttributeError *after* clearing but *before* refreshing — so the list
+        # appeared to "not work" even though the data was already gone.)
+        try:
+            from main import APP_VERSION
+            version = getattr(self.app, "version", APP_VERSION) if self.app else APP_VERSION
+            telemetry.track(
+                "history_cleared",
+                {"count": count},
+                self.app.cfg if self.app else {},
+                version,
+            )
+        except Exception:
+            pass
+
+        # Drop any active selection so a highlighted row can't keep stale state,
+        # then repaint the now-empty list.
+        self.list_widget.clearSelection()
+        self.list_widget.setCurrentItem(None)
+        self.refresh_list()
 
     def _clear_selection(self):
         selected_items = self.list_widget.selectedItems()
