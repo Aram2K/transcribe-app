@@ -231,6 +231,85 @@ class AuthManager:
         self._notify()
         return True
 
+    # ── Email / password ─────────────────────────────────────────────────────
+    def sign_in_email(self, email, password):
+        """Sign in with email + password.
+        Returns (status, message): ("ok", "") or ("error", <message>)."""
+        try:
+            resp = requests.post(
+                f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
+                headers=self._headers(),
+                json={"email": email, "password": password},
+                timeout=_HTTP_TIMEOUT,
+            )
+        except requests.RequestException:
+            return ("error", "Network error — check your connection and try again.")
+        if resp.status_code == 200:
+            self._apply_session(resp.json())
+            self.refresh_entitlement()
+            self._notify()
+            return ("ok", "")
+        msg = self._error_message(resp)
+        # Friendlier copy for the two most common cases.
+        low = msg.lower()
+        if "not confirmed" in low or "not been confirmed" in low:
+            return ("error", "Please verify your email first — check your inbox.")
+        if "invalid" in low or "credential" in low:
+            return ("error", "Incorrect email or password.")
+        return ("error", msg)
+
+    def sign_up_email(self, email, password):
+        """Create an account with email + password.
+        Returns (status, message):
+          ("ok", "")        — signed in immediately (confirmations disabled)
+          ("verify", email) — a confirmation email was sent
+          ("error", <msg>)  — failed."""
+        try:
+            resp = requests.post(
+                f"{SUPABASE_URL}/auth/v1/signup",
+                headers=self._headers(),
+                json={"email": email, "password": password},
+                timeout=_HTTP_TIMEOUT,
+            )
+        except requests.RequestException:
+            return ("error", "Network error — check your connection and try again.")
+        if resp.status_code in (200, 201):
+            data = resp.json() or {}
+            session = data.get("session") or data
+            if session.get("access_token"):
+                self._apply_session(session)
+                self.refresh_entitlement()
+                self._notify()
+                return ("ok", "")
+            return ("verify", email)
+        return ("error", self._error_message(resp))
+
+    def resend_verification(self, email):
+        try:
+            requests.post(
+                f"{SUPABASE_URL}/auth/v1/resend",
+                headers=self._headers(),
+                json={"type": "signup", "email": email},
+                timeout=_HTTP_TIMEOUT,
+            )
+            return True
+        except requests.RequestException:
+            return False
+
+    @staticmethod
+    def _error_message(resp, fallback="Something went wrong. Please try again."):
+        try:
+            data = resp.json()
+            return (
+                data.get("msg")
+                or data.get("error_description")
+                or data.get("message")
+                or data.get("error")
+                or fallback
+            )
+        except Exception:
+            return fallback
+
     # ── token plumbing ───────────────────────────────────────────────────────
     def _apply_session(self, data):
         with self._lock:

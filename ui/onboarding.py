@@ -1,14 +1,18 @@
 # Modern Onboarding Walkthrough Wizard in PySide6
 
-from PySide6.QtCore import Qt, QEvent
+import threading
+from PySide6.QtCore import Qt, QEvent, Signal
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, 
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QCheckBox, QStackedWidget, QWidget, QLineEdit, QMessageBox, QFrame
 )
 from PySide6.QtGui import QFont, QColor
 import local_llm
 
 class Onboarding(QDialog):
+    # Emitted from the email-auth worker thread → handled on the GUI thread.
+    auth_result = Signal(str, str)  # (status, message)
+
     def __init__(self, main_app=None, account_only=False):
         super().__init__()
         self.app = main_app
@@ -27,6 +31,9 @@ class Onboarding(QDialog):
         self.current_page = 0
         self.capturing = False
         self.guest_mode = True  # default to guest until they choose to sign in
+        self._auth_mode = "signin"
+        self._pending_verify_email = None
+        self.auth_result.connect(self._on_auth_result)
         
         # Onboarding State Config
         self.hotkey_val = self.app.cfg.get("hotkey", "alt+r") if self.app else "alt+r"
@@ -76,23 +83,20 @@ class Onboarding(QDialog):
         self._update_nav()
 
     def _create_account_page(self):
-        """First-run gate: sign in / sign up with Google, or continue as guest.
-        Keeping a low-friction guest path improves activation (see research),
-        while still capturing accounts for those ready to commit."""
+        """First-run gate: a polished sign in / sign up screen (email + password
+        and Google), plus a low-friction guest path. Guest keeps activation high
+        while the account capture drives the funnel."""
         self.page_account = QWidget()
         lay = QVBoxLayout(self.page_account)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(14)
+        lay.setContentsMargins(4, 0, 4, 0)
+        lay.setSpacing(10)
 
         title = QLabel("Welcome to Transcribe", self.page_account)
         title.setObjectName("titleLabel")
         title.setAlignment(Qt.AlignCenter)
         lay.addWidget(title)
 
-        sub = QLabel(
-            "Private, instant voice-to-text anywhere you type.\nChoose how you'd like to start.",
-            self.page_account,
-        )
+        sub = QLabel("Private, instant voice-to-text anywhere you type.", self.page_account)
         sub.setObjectName("subtitleLabel")
         sub.setAlignment(Qt.AlignCenter)
         sub.setWordWrap(True)
@@ -101,29 +105,85 @@ class Onboarding(QDialog):
         card = QFrame(self.page_account)
         card.setObjectName("glassCard")
         cl = QVBoxLayout(card)
-        cl.setContentsMargins(20, 20, 20, 20)
-        cl.setSpacing(10)
+        cl.setContentsMargins(22, 20, 22, 20)
+        cl.setSpacing(11)
 
-        head = QLabel("Create your free account", card)
-        head.setFont(QFont("Segoe UI", 12, QFont.Bold))
-        cl.addWidget(head)
+        # Segmented toggle — Sign in | Sign up
+        seg = QHBoxLayout()
+        seg.setSpacing(6)
+        self._tab_signin = QPushButton("Sign in", card)
+        self._tab_signin.setMinimumHeight(34)
+        self._tab_signin.clicked.connect(lambda: self._set_auth_mode("signin"))
+        self._tab_signup = QPushButton("Sign up", card)
+        self._tab_signup.setMinimumHeight(34)
+        self._tab_signup.clicked.connect(lambda: self._set_auth_mode("signup"))
+        seg.addWidget(self._tab_signin)
+        seg.addWidget(self._tab_signup)
+        cl.addLayout(seg)
 
-        perks = QLabel(
-            "•  Unlimited local dictation\n"
-            "•  Your plan syncs across devices\n"
-            "•  Unlock Pro features anytime",
-            card,
-        )
-        perks.setObjectName("subtitleLabel")
-        cl.addWidget(perks)
+        # Email
+        self._email_input = QLineEdit(card)
+        self._email_input.setPlaceholderText("you@email.com")
+        self._email_input.setMinimumHeight(38)
+        cl.addWidget(self._email_input)
 
-        self.btn_google = QPushButton("✦  Continue with Google", card)
-        self.btn_google.setObjectName("primaryButton")
+        # Password + show/hide toggle
+        pw_row = QHBoxLayout()
+        pw_row.setSpacing(6)
+        self._password_input = QLineEdit(card)
+        self._password_input.setPlaceholderText("Password")
+        self._password_input.setEchoMode(QLineEdit.Password)
+        self._password_input.setMinimumHeight(38)
+        self._password_input.returnPressed.connect(self._submit_email_auth)
+        pw_row.addWidget(self._password_input)
+        self._show_pw_btn = QPushButton("👁", card)
+        self._show_pw_btn.setFixedSize(40, 38)
+        self._show_pw_btn.setToolTip("Show / hide password")
+        self._show_pw_btn.clicked.connect(self._toggle_password_visibility)
+        pw_row.addWidget(self._show_pw_btn)
+        cl.addLayout(pw_row)
+
+        # Inline message (errors / success)
+        self._msg_label = QLabel("", card)
+        self._msg_label.setWordWrap(True)
+        self._msg_label.setVisible(False)
+        cl.addWidget(self._msg_label)
+
+        # Primary submit
+        self._primary_btn = QPushButton("Sign in", card)
+        self._primary_btn.setObjectName("primaryButton")
+        self._primary_btn.setMinimumHeight(42)
+        self._primary_btn.clicked.connect(self._submit_email_auth)
+        cl.addWidget(self._primary_btn)
+
+        # Resend verification (hidden until a sign-up needs confirmation)
+        self._resend_btn = QPushButton("Resend verification email", card)
+        self._resend_btn.setFlat(True)
+        self._resend_btn.setStyleSheet("color: #3b82f6; border: none; font-weight: 600;")
+        self._resend_btn.setVisible(False)
+        self._resend_btn.clicked.connect(self._resend_verification)
+        cl.addWidget(self._resend_btn, alignment=Qt.AlignCenter)
+
+        # Divider — "or"
+        div = QHBoxLayout()
+        div.setSpacing(8)
+        line_l = QFrame(card); line_l.setFrameShape(QFrame.HLine)
+        line_l.setStyleSheet("color: #cbd5e1; max-height: 1px;")
+        line_r = QFrame(card); line_r.setFrameShape(QFrame.HLine)
+        line_r.setStyleSheet("color: #cbd5e1; max-height: 1px;")
+        or_lbl = QLabel("or", card); or_lbl.setObjectName("subtitleLabel")
+        div.addWidget(line_l, 1); div.addWidget(or_lbl); div.addWidget(line_r, 1)
+        cl.addLayout(div)
+
+        # Google
+        self.btn_google = QPushButton("Continue with Google", card)
         self.btn_google.setMinimumHeight(42)
         self.btn_google.clicked.connect(self._choose_google)
         cl.addWidget(self.btn_google)
+
         lay.addWidget(card)
 
+        # Guest
         self.btn_guest = QPushButton("Continue as guest  →", self.page_account)
         self.btn_guest.setFlat(True)
         self.btn_guest.setStyleSheet("color: #475569; border: none; font-weight: 600;")
@@ -141,7 +201,100 @@ class Onboarding(QDialog):
         lay.addWidget(guest_note)
 
         lay.addStretch()
+        self._set_auth_mode("signin")
         self.stack.addWidget(self.page_account)
+
+    # ── Auth form behaviour ──────────────────────────────────────────────────
+    def _set_auth_mode(self, mode):
+        self._auth_mode = mode
+        is_signup = (mode == "signup")
+        self._primary_btn.setText("Create account" if is_signup else "Sign in")
+        self._tab_signin.setObjectName("primaryButton" if not is_signup else "")
+        self._tab_signup.setObjectName("primaryButton" if is_signup else "")
+        for b in (self._tab_signin, self._tab_signup):
+            b.style().unpolish(b); b.style().polish(b)
+        self._msg_label.setVisible(False)
+        self._resend_btn.setVisible(False)
+
+    def _toggle_password_visibility(self):
+        if self._password_input.echoMode() == QLineEdit.Password:
+            self._password_input.setEchoMode(QLineEdit.Normal)
+            self._show_pw_btn.setText("🙈")
+        else:
+            self._password_input.setEchoMode(QLineEdit.Password)
+            self._show_pw_btn.setText("👁")
+
+    def _show_msg(self, text, error=False):
+        self._msg_label.setText(text)
+        self._msg_label.setStyleSheet(
+            f"font-size: 12px; font-weight: 600; color: {'#dc2626' if error else '#16a34a'};"
+        )
+        self._msg_label.setVisible(True)
+
+    def _set_form_busy(self, busy):
+        for w in (self._email_input, self._password_input, self._primary_btn,
+                  self._tab_signin, self._tab_signup, self.btn_google, self._show_pw_btn):
+            w.setEnabled(not busy)
+        if busy:
+            self._primary_btn.setText("Please wait…")
+        else:
+            self._primary_btn.setText("Create account" if self._auth_mode == "signup" else "Sign in")
+
+    def _submit_email_auth(self):
+        email = self._email_input.text().strip()
+        pw = self._password_input.text()
+        if "@" not in email or "." not in email.split("@")[-1]:
+            self._show_msg("Please enter a valid email address.", error=True)
+            return
+        if len(pw) < 6:
+            self._show_msg("Password must be at least 6 characters.", error=True)
+            return
+        self._msg_label.setVisible(False)
+        self._resend_btn.setVisible(False)
+        self._set_form_busy(True)
+        mode = self._auth_mode
+        auth = getattr(self.app, "auth", None)
+
+        def _run():
+            if not auth:
+                self.auth_result.emit("error", "Sign-in is unavailable right now.")
+                return
+            if mode == "signup":
+                status, msg = auth.sign_up_email(email, pw)
+            else:
+                status, msg = auth.sign_in_email(email, pw)
+            self.auth_result.emit(status, msg)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_auth_result(self, status, message):
+        self._set_form_busy(False)
+        if status == "ok":
+            self.guest_mode = False
+            self._proceed_after_auth()
+        elif status == "verify":
+            self._pending_verify_email = message
+            self._set_auth_mode("signin")
+            self._show_msg(
+                f"We emailed a verification link to {message}. Confirm it, then sign in.",
+                error=False,
+            )
+            self._resend_btn.setVisible(True)
+        else:
+            self._show_msg(message or "Something went wrong. Please try again.", error=True)
+
+    def _resend_verification(self):
+        email = self._pending_verify_email or self._email_input.text().strip()
+        auth = getattr(self.app, "auth", None)
+        if email and auth:
+            threading.Thread(target=lambda: auth.resend_verification(email), daemon=True).start()
+            self._show_msg("Verification email resent — check your inbox.", error=False)
+
+    def _proceed_after_auth(self):
+        if self.account_only:
+            self._finish_account_only()
+        else:
+            self._go_to(1)
 
     def _create_pages(self):
         # Page 0: Account gate (sign in / continue as guest)
