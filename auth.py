@@ -121,6 +121,7 @@ class AuthManager:
         self.period_end = None        # ISO string or None
         self.cancel_at_period_end = False
         self.trial_available = False   # true if the one-time trial was never started
+        self.is_admin = False          # server-authoritative admin flag
 
     # ── public state helpers ─────────────────────────────────────────────────
     @property
@@ -416,9 +417,10 @@ class AuthManager:
                 row.get("current_period_end"),
                 bool(row.get("cancel_at_period_end")),
                 bool(row.get("trial_available", False)),
+                bool(row.get("is_admin", False)),
             )
         else:
-            self._set_entitlement(False, None, None, False, False)
+            self._set_entitlement(False, None, None, False, False, False)
         self._notify()
         return True
 
@@ -441,13 +443,15 @@ class AuthManager:
         self.refresh_entitlement()
         return self.is_pro
 
-    def _set_entitlement(self, is_pro, plan, period_end, cancel_at_period_end, trial_available=False):
+    def _set_entitlement(self, is_pro, plan, period_end, cancel_at_period_end,
+                         trial_available=False, is_admin=False):
         with self._lock:
             self.is_pro = is_pro
             self.plan = plan
             self.period_end = period_end
             self.cancel_at_period_end = cancel_at_period_end
             self.trial_available = trial_available
+            self.is_admin = is_admin
 
     # ── sign out ─────────────────────────────────────────────────────────────
     def sign_out(self):
@@ -479,6 +483,7 @@ class AuthManager:
             self.period_end = None
             self.cancel_at_period_end = False
             self.trial_available = False
+            self.is_admin = False
         try:
             storage.write_secret(REFRESH_TOKEN_SECRET, "")  # delete from keyring
         except Exception:

@@ -436,6 +436,7 @@ class AudioRecorder:
         self._chunk_errors    = []
         self._chunk_silence_before = {}
         self._record_error    = ""
+        self._cloud_capped    = False   # set when managed cloud hit its cap and we fell back to local
         # Rolling peak amplitude for adaptive bar normalization. Decays slowly
         # so bars stay calibrated to recent mic activity (handles mics with
         # very different gain levels - laptop mic vs. headset vs. far-field).
@@ -552,6 +553,7 @@ class AudioRecorder:
         self._session_lang  = None
         self._chunk_threads = []
         self._record_error  = ""
+        self._cloud_capped  = False
         self._level_peak    = 0.05
         
         open_args = {
@@ -1034,15 +1036,24 @@ class AudioRecorder:
             if resp.status_code == 403:
                 return "", "!managed:Pro required for managed cloud transcription."
             if resp.status_code == 429:
-                return "", "!managed:Daily cloud limit reached - try again tomorrow."
+                # Monthly cloud allowance used up - transparently fall back to the
+                # local model so the user keeps working. Flag it so the UI can
+                # notify once.
+                self._cloud_capped = True
+                return self._run_local(audio)
+            if resp.status_code == 403:
+                # Not entitled to managed cloud - fall back to local.
+                return self._run_local(audio)
             if resp.status_code == 401:
                 return "", "!managed:Session expired - sign in again."
             if resp.status_code != 200:
-                return "", f"!managed:HTTP {resp.status_code}: {resp.text[:80]}"
+                # Any cloud error: don't fail the dictation, use local instead.
+                return self._run_local(audio)
             data = resp.json()
             return data.get("text", ""), data.get("lang", "en")
-        except Exception as e:
-            return "", f"!managed:{e}"
+        except Exception:
+            # Network/other failure - fall back to local rather than erroring.
+            return self._run_local(audio)
 
     def _run_mistral(self, audio):
         try:
@@ -1949,6 +1960,16 @@ class AppController(QObject):
 
         self.is_rec = False
         self._account_recording_time()
+
+        # If managed cloud hit its monthly cap, we transparently used the local
+        # model - tell the user once so the switch isn't a mystery.
+        if getattr(self.recorder, "_cloud_capped", False):
+            self.recorder._cloud_capped = False
+            self.overlay.call_soon(
+                self.show_tray_hint,
+                "Cloud limit reached",
+                "You've used this month's fast-cloud minutes - switched to the local model (still unlimited).",
+            )
 
         if t.is_alive():
             telemetry.track(

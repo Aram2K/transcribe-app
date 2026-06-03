@@ -27,10 +27,11 @@ TIER_GUEST = "guest"
 TIER_FREE = "free"
 TIER_PRO = "pro"
 
-# Super admins can force any tier locally (for testing / control) via a config
-# override. This only affects client-side gating on their own machine - it never
-# grants real server entitlements (the cloud proxy still verifies subscriptions).
-SUPER_ADMIN_EMAILS = {"aramatamian15@gmail.com"}
+# Admin status is now server-authoritative (profiles.is_admin, set only via SQL)
+# and delivered through the my_entitlement RPC as auth.is_admin. There is NO admin
+# email in the client source, so editing the open-source app can't make anyone an
+# admin. The local "force tier" control is purely a preview toggle for admins and
+# never grants real server Pro (the cloud proxy still verifies entitlement).
 
 # Pro-only features.
 FEATURE_MEETINGS = "meetings"
@@ -47,8 +48,8 @@ def _load_usage():
 
 
 def is_super_admin(auth):
-    email = (getattr(auth, "user_email", None) or "") if auth is not None else ""
-    return email.strip().lower() in SUPER_ADMIN_EMAILS
+    # Server-authoritative: comes from profiles.is_admin via the entitlement RPC.
+    return bool(auth is not None and getattr(auth, "is_admin", False))
 
 
 def _override_tier(auth, cfg):
