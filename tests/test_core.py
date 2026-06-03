@@ -223,7 +223,10 @@ class TestConfig(unittest.TestCase):
         finally:
             m.CONFIG_PATH = orig
 
-    def test_local_action_model_enables_smart_output_mode(self):
+    def test_action_model_does_not_auto_enable_smart_output_mode(self):
+        # Smart Actions are Pro-only and must be opted into explicitly. Selecting
+        # an action model must NOT flip the default output mode away from
+        # transcribe_only.
         import main as m
         import local_llm
         orig = m.CONFIG_PATH
@@ -235,7 +238,7 @@ class TestConfig(unittest.TestCase):
                 "action_model": local_llm.QWEN_7B_ID,
             })
             c = load_config()
-            self.assertEqual(c["output_action"], "smart_auto")
+            self.assertEqual(c["output_action"], "transcribe_only")
         finally:
             m.CONFIG_PATH = orig
 

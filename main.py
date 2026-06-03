@@ -97,6 +97,7 @@ DEFAULT = {
     "analytics_endpoint": "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-analytics",
     "onboarding_done": False,
     "account_gate_seen": False,
+    "admin_tier_override": "auto",  # super-admin only: auto|guest|free|pro
     "dismissed_update_version": "",
     "pending_update_version": "",
     "pending_update_body": "",
@@ -131,16 +132,8 @@ def load_config():
             loaded["action_model"] = actions.RULE_BASED_ID
     loaded["action_model"] = actions.normalize_action_model(loaded.get("action_model"))
 
-    # Users often pick a local/cloud action model in Settings but leave output
-    # mode on the default "transcribe_only", so dictation never runs actions.
-    if loaded.get("output_action") == actions.ACTION_TRANSCRIBE_ONLY:
-        model_kind = actions.ACTION_MODELS.get(loaded["action_model"], {}).get("kind")
-        if model_kind in ("local_llm", "cloud"):
-            loaded["output_action"] = actions.ACTION_SMART_AUTO
-            logger.info(
-                "Enabled Smart actions automatically (action model: %s)",
-                loaded["action_model"],
-            )
+    # Output mode stays on "transcribe_only" by default. Smart Actions are a
+    # Pro feature and must be turned on explicitly — we never auto-enable them.
 
     action_key = (loaded.get("action_api_key") or "").strip()
     if action_key:
@@ -1259,6 +1252,8 @@ class AppController(QObject):
         menu.addAction(action_rec_meet)
 
         action_settings = QAction("Settings", self)
+        # Tier indicator dot — green = Free, purple = Pro, gray = Guest.
+        action_settings.setIcon(self._dot_icon(self._tier_color()))
         action_settings.triggered.connect(self.show_settings)
         menu.addAction(action_settings)
 
@@ -1282,7 +1277,43 @@ class AppController(QObject):
 
     # ── Auth / Pro helpers ────────────────────────────────────────────────────
     def is_pro(self):
-        return bool(getattr(self, "auth", None) and self.auth.is_pro)
+        try:
+            return entitlements.tier(self.auth, self.cfg) == entitlements.TIER_PRO
+        except Exception:
+            return bool(getattr(self, "auth", None) and self.auth.is_pro)
+
+    def current_tier(self):
+        try:
+            return entitlements.tier(self.auth, self.cfg)
+        except Exception:
+            return entitlements.TIER_GUEST
+
+    def _tier_color(self):
+        """Green = Free, Purple = Pro, Gray = Guest."""
+        return {
+            entitlements.TIER_PRO:   "#a855f7",
+            entitlements.TIER_FREE:  "#22c55e",
+            entitlements.TIER_GUEST: "#94a3b8",
+        }.get(self.current_tier(), "#94a3b8")
+
+    def _dot_icon(self, color_hex):
+        """A small filled circle QIcon used as the tier indicator."""
+        from PySide6.QtGui import QPixmap, QPainter, QColor, QBrush
+        pm = QPixmap(14, 14)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(QBrush(QColor(color_hex)))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(2, 2, 10, 10)
+        p.end()
+        return QIcon(pm)
+
+    def set_admin_tier_override(self, value):
+        """Super-admin only: force a tier locally (auto|guest|free|pro)."""
+        self.cfg["admin_tier_override"] = value
+        self.save_config()
+        self.sig_auth_changed.emit()
 
     def _on_auth_changed(self):
         # Runs on the GUI thread (QueuedConnection). Refresh tray + any open UI.
@@ -1371,7 +1402,7 @@ class AppController(QObject):
         if started is None:
             return
         elapsed = max(0.0, time.time() - started)
-        if entitlements.tier(self.auth) == entitlements.TIER_GUEST:
+        if entitlements.tier(self.auth, self.cfg) == entitlements.TIER_GUEST:
             entitlements.add_guest_seconds(elapsed)
             self.sig_auth_changed.emit()  # refresh tray remaining-time line
 
@@ -1707,7 +1738,7 @@ class AppController(QObject):
         if self.is_rec:
             return
         # Guests get a 10-minute free recording trial; block once it's spent.
-        if not entitlements.can_record(self.auth):
+        if not entitlements.can_record(self.auth, self.cfg):
             self._guest_limit_reached()
             return
         try:

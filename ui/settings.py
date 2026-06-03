@@ -15,6 +15,7 @@ import history as hist
 import telemetry
 import action_api
 import actions
+import entitlements
 
 class DownloadProgressSignal(QObject):
     progress = Signal(str, int, int, int) # model_name, percent, downloaded, total
@@ -1060,6 +1061,9 @@ class Settings(QDialog):
             checked=False,
         )
         self.rb_smart = self.card_smart.radio
+        self._smart_pro_badge = getattr(self.card_smart, "pro_badge", None)
+        if self._smart_pro_badge is not None:
+            self._smart_pro_badge.setVisible(not self._is_pro())
         self.rb_smart.setToolTip(
             "When enabled, your dictation is run through a language model "
             "that detects whether you want a translation, email, todo "
@@ -1245,8 +1249,25 @@ class Settings(QDialog):
             self.engine_section.setEnabled(self.rb_smart.isChecked())
         return tab
 
+    def _is_pro(self):
+        return bool(self.app and hasattr(self.app, "is_pro") and self.app.is_pro())
+
     def _on_output_mode_changed(self):
         is_smart = self.rb_smart.isChecked()
+
+        # Smart Actions are Pro-only. Bounce non-Pro users back to transcribe-only
+        # and prompt them to upgrade.
+        if is_smart and self.app and not self._is_pro():
+            self.rb_transcribe.blockSignals(True)
+            self.rb_smart.blockSignals(True)
+            self.rb_transcribe.setChecked(True)
+            self.rb_smart.setChecked(False)
+            self.rb_transcribe.blockSignals(False)
+            self.rb_smart.blockSignals(False)
+            is_smart = False
+            if hasattr(self.app, "_pro_upsell"):
+                self.app._pro_upsell("Smart Actions")
+
         # Engine controls stay visible at all times; they're just disabled
         # (grayed out) when Transcribe-only is selected. No hide/expand so the
         # layout never shifts.
@@ -1327,9 +1348,17 @@ class Settings(QDialog):
         text_col.addWidget(lbl_desc)
 
         row.addLayout(text_col, 1)
+
+        # Hidden PRO pill — shown on Pro-only modes for non-Pro users.
+        pro_badge = QLabel("PRO", row_host)
+        pro_badge.setObjectName("proBadge")
+        pro_badge.setVisible(False)
+        row.addWidget(pro_badge, 0, Qt.AlignTop)
+
         outer.addWidget(row_host, 0, Qt.AlignTop)
         outer.addStretch(1)
         card.radio = radio
+        card.pro_badge = pro_badge
         return card
 
     @staticmethod
@@ -2062,6 +2091,24 @@ class Settings(QDialog):
 
         btns.addStretch()
         c.addLayout(btns)
+
+        # Super-admin only: force a tier locally (for testing / control).
+        self._admin_row = QWidget(card)
+        ar = QHBoxLayout(self._admin_row)
+        ar.setContentsMargins(0, 6, 0, 0)
+        ar.setSpacing(8)
+        admin_lbl = QLabel("Admin · Force tier:", self._admin_row)
+        admin_lbl.setObjectName("subtitleLabel")
+        ar.addWidget(admin_lbl)
+        self._admin_tier_combo = QComboBox(self._admin_row)
+        for label, val in (("Auto", "auto"), ("Guest", "guest"), ("Free", "free"), ("Pro", "pro")):
+            self._admin_tier_combo.addItem(label, val)
+        self._admin_tier_combo.currentIndexChanged.connect(self._on_admin_tier_changed)
+        ar.addWidget(self._admin_tier_combo)
+        ar.addStretch()
+        self._admin_row.setVisible(False)
+        c.addWidget(self._admin_row)
+
         layout.addWidget(card)
 
         perks = QLabel(
@@ -2096,6 +2143,12 @@ class Settings(QDialog):
         if self.app and hasattr(self.app, "open_billing"):
             self.app.open_billing()
 
+    def _on_admin_tier_changed(self):
+        if getattr(self, "_suppress_admin_combo", False):
+            return
+        if self.app and hasattr(self.app, "set_admin_tier_override"):
+            self.app.set_admin_tier_override(self._admin_tier_combo.currentData())
+
     def refresh_pro_state(self):
         """Update the Account tab to reflect the current auth/entitlement state.
         Safe to call from main.py's auth-changed handler (and before the tab is
@@ -2104,22 +2157,34 @@ class Settings(QDialog):
             return
         auth = getattr(self.app, "auth", None) if self.app else None
         authed = bool(auth and auth.is_authenticated)
-        is_pro = bool(auth and auth.is_pro)
 
-        # Swap badge style (objectName drives the QSS; re-polish to apply).
-        self._acct_badge.setText("✦ PRO" if is_pro else "FREE")
-        self._acct_badge.setObjectName("proBadge" if is_pro else "freeBadge")
+        # Effective tier honors the super-admin override.
+        if self.app and hasattr(self.app, "current_tier"):
+            t = self.app.current_tier()
+        else:
+            t = entitlements.tier(auth)
+        is_pro = (t == entitlements.TIER_PRO)
+
+        # Tier badge: purple PRO / green FREE / gray GUEST.
+        if is_pro:
+            self._acct_badge.setText("✦ PRO"); self._acct_badge.setObjectName("proBadge")
+        elif t == entitlements.TIER_FREE:
+            self._acct_badge.setText("FREE"); self._acct_badge.setObjectName("freeBadge")
+        else:
+            self._acct_badge.setText("GUEST"); self._acct_badge.setObjectName("guestBadge")
         self._acct_badge.style().unpolish(self._acct_badge)
         self._acct_badge.style().polish(self._acct_badge)
 
+        # Smart-action lock pill follows Pro state.
+        if getattr(self, "_smart_pro_badge", None) is not None:
+            self._smart_pro_badge.setVisible(not is_pro)
+
         if authed:
-            self._acct_status_label.setText(
-                f"Signed in as {auth.user_email or 'your account'}"
-            )
+            self._acct_status_label.setText(f"Signed in as {auth.user_email or 'your account'}")
             if is_pro:
-                plan = (auth.plan or "Pro").capitalize()
+                plan = (getattr(auth, "plan", None) or "Pro").capitalize()
                 renew = ""
-                if auth.period_end:
+                if getattr(auth, "period_end", None):
                     verb = "Cancels" if auth.cancel_at_period_end else "Renews"
                     renew = f"  ·  {verb} {str(auth.period_end)[:10]}"
                 self._acct_plan_label.setText(f"Plan: {plan}{renew}")
@@ -2130,16 +2195,25 @@ class Settings(QDialog):
         else:
             self._acct_status_label.setText("Not signed in  ·  Guest")
             try:
-                import entitlements
                 mins = entitlements.guest_minutes_remaining()
                 self._acct_plan_label.setText(
                     f"Guest trial: ~{mins} min of free recording left. "
-                    "Sign in with Google for unlimited dictation."
+                    "Sign in for unlimited dictation."
                 )
             except Exception:
-                self._acct_plan_label.setText(
-                    "Sign in with Google to manage your subscription and unlock Pro."
-                )
+                self._acct_plan_label.setText("Sign in to manage your subscription and unlock Pro.")
+
+        # Super-admin tier override row (visible only to admins).
+        if hasattr(self, "_admin_row"):
+            is_admin = entitlements.is_super_admin(auth)
+            self._admin_row.setVisible(is_admin)
+            if is_admin and self.app:
+                ov = self.app.cfg.get("admin_tier_override", "auto")
+                idx = self._admin_tier_combo.findData(ov)
+                if idx >= 0:
+                    self._suppress_admin_combo = True
+                    self._admin_tier_combo.setCurrentIndex(idx)
+                    self._suppress_admin_combo = False
 
         self._acct_signin_btn.setVisible(not authed)
         self._acct_upgrade_btn.setVisible(authed and not is_pro)
