@@ -37,7 +37,7 @@ import telemetry
 import auth
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.5.47"
+APP_VERSION = "1.5.48"
 
 # ── Monetization links (Stripe) ───────────────────────────────────────────────
 PRO_MONTHLY_URL = "https://buy.stripe.com/3cI5kC30N1oeari7rh0Ba00"
