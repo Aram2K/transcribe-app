@@ -283,6 +283,16 @@ class Settings(QDialog):
         self._header_badge.setObjectName("guestBadge")
         header_row.addWidget(self._header_badge, 0, Qt.AlignVCenter)
         header_row.addStretch()
+        # Top-right CTA: upgrade (free/trial) or sign-up (guest).
+        self._header_cta = QPushButton("", self)
+        self._header_cta.setCursor(Qt.PointingHandCursor)
+        self._header_cta.setStyleSheet(
+            "background-color: #a855f7; border: 1px solid #9333ea; color: white;"
+            "font-weight: 700; border-radius: 8px; padding: 6px 14px;"
+        )
+        self._header_cta.clicked.connect(self._header_cta_clicked)
+        self._header_cta.setVisible(False)
+        header_row.addWidget(self._header_cta, 0, Qt.AlignVCenter)
         layout.addLayout(header_row)
 
         # Tabs Container
@@ -2161,6 +2171,30 @@ class Settings(QDialog):
         if self.app and hasattr(self.app, "set_admin_tier_override"):
             self.app.set_admin_tier_override(self._admin_tier_combo.currentData())
 
+    def _header_cta_clicked(self):
+        if not self.app:
+            return
+        auth = getattr(self.app, "auth", None)
+        if not (auth and auth.is_authenticated):
+            if hasattr(self.app, "show_auth_gate"):
+                self.app.show_auth_gate()
+        elif hasattr(self.app, "_pro_upsell"):
+            self.app._pro_upsell()
+
+    @staticmethod
+    def _trial_days_left(auth):
+        try:
+            import math
+            from datetime import datetime, timezone
+            end = getattr(auth, "period_end", None)
+            if not end:
+                return 0
+            dt = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+            secs = (dt - datetime.now(timezone.utc)).total_seconds()
+            return max(0, math.ceil(secs / 86400.0))
+        except Exception:
+            return 0
+
     def refresh_pro_state(self):
         """Update the Account tab to reflect the current auth/entitlement state.
         Safe to call from main.py's auth-changed handler (and before the tab is
@@ -2215,15 +2249,23 @@ class Settings(QDialog):
                 else "🔒 Smart Meeting Transcription (Pro)"
             )
 
+        plan = getattr(auth, "plan", None) if auth else None
+        on_trial = is_pro and plan == "trial"
+
         if authed:
             self._acct_status_label.setText(f"Signed in as {auth.user_email or 'your account'}")
-            if is_pro:
-                plan = (getattr(auth, "plan", None) or "Pro").capitalize()
+            if on_trial:
+                days = self._trial_days_left(auth)
+                self._acct_plan_label.setText(
+                    f"Pro trial — {days} day(s) left. Subscribe to keep Pro after it ends."
+                )
+            elif is_pro:
+                plan_name = (plan or "Pro").capitalize()
                 renew = ""
                 if getattr(auth, "period_end", None):
                     verb = "Cancels" if auth.cancel_at_period_end else "Renews"
                     renew = f"  ·  {verb} {str(auth.period_end)[:10]}"
-                self._acct_plan_label.setText(f"Plan: {plan}{renew}")
+                self._acct_plan_label.setText(f"Plan: {plan_name}{renew}")
             else:
                 self._acct_plan_label.setText(
                     "Plan: Free — upgrade to unlock Meetings, Smart Actions, and fast cloud transcription."
@@ -2234,10 +2276,28 @@ class Settings(QDialog):
                 mins = entitlements.guest_minutes_remaining()
                 self._acct_plan_label.setText(
                     f"Guest trial: ~{mins} min of free recording left. "
-                    "Sign in for unlimited dictation."
+                    "Create a free account to keep dictating + get 3 days of Pro."
                 )
             except Exception:
                 self._acct_plan_label.setText("Sign in to manage your subscription and unlock Pro.")
+
+        # Top-right CTA: sign up (guest) / upgrade (free) / trial countdown.
+        if hasattr(self, "_header_cta"):
+            if not authed:
+                try:
+                    mins = entitlements.guest_minutes_remaining()
+                except Exception:
+                    mins = 0
+                self._header_cta.setText(f"⚡ {mins} min left · Sign up")
+                self._header_cta.setVisible(True)
+            elif on_trial:
+                self._header_cta.setText(f"⚡ Trial: {self._trial_days_left(auth)}d · Upgrade")
+                self._header_cta.setVisible(True)
+            elif is_pro:
+                self._header_cta.setVisible(False)
+            else:
+                self._header_cta.setText("⚡ Upgrade to Pro")
+                self._header_cta.setVisible(True)
 
         # Super-admin tier override row (visible only to admins).
         if hasattr(self, "_admin_row"):

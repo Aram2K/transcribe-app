@@ -1317,6 +1317,14 @@ class AppController(QObject):
 
     def _on_auth_changed(self):
         # Runs on the GUI thread (QueuedConnection). Refresh tray + any open UI.
+        # Track the moment a user becomes Pro (trial or paid) for the funnel.
+        now_pro = self.is_pro()
+        if now_pro and not getattr(self, "_was_pro", False):
+            try:
+                telemetry.track("pro_activated", {"plan": getattr(self.auth, "plan", "") or ""}, self.cfg, APP_VERSION)
+            except Exception:
+                pass
+        self._was_pro = now_pro
         try:
             self._build_tray_menu()
         except Exception:
