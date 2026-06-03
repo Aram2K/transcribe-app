@@ -9,11 +9,15 @@ from PySide6.QtGui import QFont, QColor
 import local_llm
 
 class Onboarding(QDialog):
-    def __init__(self, main_app=None):
+    def __init__(self, main_app=None, account_only=False):
         super().__init__()
         self.app = main_app
-        
-        self.setWindowTitle("Welcome to Transcribe")
+        # account_only: a one-time gate shown to EXISTING users on the update that
+        # introduces accounts. Shows just the sign-in / guest choice (no setup
+        # steps, since they're already configured).
+        self.account_only = account_only
+
+        self.setWindowTitle("Sign in to Transcribe" if account_only else "Welcome to Transcribe")
         self.setFixedSize(520, 680)
         
         # Apply style sheet
@@ -511,11 +515,23 @@ class Onboarding(QDialog):
         self.guest_mode = False
         if self.app and hasattr(self.app, "start_google_login"):
             self.app.start_google_login()
-        self._go_to(1)
+        if self.account_only:
+            self._finish_account_only()
+        else:
+            self._go_to(1)
 
     def _choose_guest(self):
         self.guest_mode = True
-        self._go_to(1)
+        if self.account_only:
+            self._finish_account_only()
+        else:
+            self._go_to(1)
+
+    def _finish_account_only(self):
+        if self.app:
+            self.app.cfg["account_gate_seen"] = True
+            self.app.save_config()
+        self.accept()
 
     def _back(self):
         if self.current_page > 1:
@@ -570,7 +586,8 @@ class Onboarding(QDialog):
             self.app.cfg["mistral_stt_model"] = "voxtral-mini-latest"
             self.app.cfg["analytics_enabled"] = self.analytics_val
             self.app.cfg["onboarding_done"] = True
-            
+            self.app.cfg["account_gate_seen"] = True
+
             self.app.save_config()
             self.app.apply_tray_bindings()
             

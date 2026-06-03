@@ -96,6 +96,7 @@ DEFAULT = {
     "analytics_consent_applied": False,
     "analytics_endpoint": "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-analytics",
     "onboarding_done": False,
+    "account_gate_seen": False,
     "dismissed_update_version": "",
     "pending_update_version": "",
     "pending_update_body": "",
@@ -1190,9 +1191,13 @@ class AppController(QObject):
             APP_VERSION,
         )
 
-        # Onboarding wizard trigger on first launch
+        # Onboarding wizard trigger on first launch. Existing users (already
+        # onboarded before accounts existed) get a one-time account gate instead,
+        # so they aren't silently dropped to the 10-minute guest cap.
         if not self.cfg.get("onboarding_done", False):
             QTimer.singleShot(500, self.show_onboarding)
+        elif not self.cfg.get("account_gate_seen", False):
+            QTimer.singleShot(900, self.show_account_gate)
 
         # If a previous session already detected an update, prompt at startup
         # immediately — don't wait for the network check to confirm. (The
@@ -1499,6 +1504,21 @@ class AppController(QObject):
         self.onboarding_win.show()
         self.onboarding_win.raise_()
         self.onboarding_win.activateWindow()
+
+    def show_account_gate(self):
+        """One-time sign-in / guest gate for users who onboarded before accounts
+        existed, so the accounts update doesn't silently cap them."""
+        if self.cfg.get("account_gate_seen", False):
+            return
+        if self.auth.is_authenticated:
+            self.cfg["account_gate_seen"] = True
+            self.save_config()
+            return
+        from ui.onboarding import Onboarding
+        self._account_gate = Onboarding(main_app=self, account_only=True)
+        self._account_gate.show()
+        self._account_gate.raise_()
+        self._account_gate.activateWindow()
 
     def save_config(self):
         save_config(self.cfg)
