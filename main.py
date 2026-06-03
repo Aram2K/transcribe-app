@@ -1241,8 +1241,8 @@ class AppController(QObject):
             guest_lbl = QAction(f"Guest · ~{mins} min free recording left", self)
             guest_lbl.setEnabled(False)
             menu.addAction(guest_lbl)
-            signin = QAction("Sign in with Google (free)…", self)
-            signin.triggered.connect(lambda: self.start_google_login())
+            signin = QAction("Sign in / Sign up (free)…", self)
+            signin.triggered.connect(lambda: self.show_auth_gate())
             menu.addAction(signin)
 
         menu.addSeparator()
@@ -1351,27 +1351,36 @@ class AppController(QObject):
             )
 
     def _pro_upsell(self, feature=None):
+        try:
+            telemetry.track("paywall_viewed", {"feature": feature or ""}, self.cfg, APP_VERSION)
+        except Exception:
+            pass
+        try:
+            from ui.pro_dialog import ProDialog
+            dlg = ProDialog(main_app=self, feature=feature)
+            dlg.exec()
+            return
+        except Exception as e:
+            logger.warning("Pro dialog failed, using fallback: %s", e)
+
+        # Fallback: simple prompt if the rich dialog can't be shown.
         box = QMessageBox()
         box.setWindowTitle("Transcribe Pro")
         feat = f"{feature} is a Pro feature.\n\n" if feature else ""
-        box.setText(
-            feat +
-            "Upgrade to Transcribe Pro to unlock Meetings, Smart Actions, and "
-            "fast managed cloud transcription — no API key or setup."
-        )
-        signin_btn = None
+        box.setText(feat + "Upgrade to unlock Meetings, Smart Actions, and fast cloud transcription.")
         if not self.auth.is_authenticated:
-            box.setInformativeText("First sign in with Google, then choose a plan.")
-            signin_btn = box.addButton("Sign in with Google", QMessageBox.AcceptRole)
-        monthly_btn = box.addButton("Go Pro — €7.99/mo", QMessageBox.ActionRole)
-        annual_btn = box.addButton("Go Pro — €59/yr", QMessageBox.ActionRole)
+            signin_btn = box.addButton("Create account", QMessageBox.AcceptRole)
+        else:
+            signin_btn = None
+        monthly_btn = box.addButton("€7.99/mo", QMessageBox.ActionRole)
+        annual_btn = box.addButton("€59/yr", QMessageBox.ActionRole)
         box.addButton("Maybe later", QMessageBox.RejectRole)
         if hasattr(self, "style_content"):
             box.setStyleSheet(self.style_content)
         box.exec()
         clicked = box.clickedButton()
         if signin_btn is not None and clicked == signin_btn:
-            self.start_google_login()
+            self.show_auth_gate()
         elif clicked == monthly_btn:
             webbrowser.open(self._checkout_url(PRO_MONTHLY_URL))
         elif clicked == annual_btn:
@@ -1414,13 +1423,13 @@ class AppController(QObject):
             "Create a free account to keep dictating — it's unlimited, and you "
             "can upgrade to Pro anytime."
         )
-        signin = box.addButton("Sign in with Google (free)", QMessageBox.AcceptRole)
+        signin = box.addButton("Create free account", QMessageBox.AcceptRole)
         box.addButton("Not now", QMessageBox.RejectRole)
         if hasattr(self, "style_content"):
             box.setStyleSheet(self.style_content)
         box.exec()
         if box.clickedButton() == signin:
-            self.start_google_login()
+            self.show_auth_gate()
         try:
             telemetry.track("guest_trial_exhausted", {}, self.cfg, APP_VERSION)
         except Exception:
@@ -1535,6 +1544,19 @@ class AppController(QObject):
         self.onboarding_win.show()
         self.onboarding_win.raise_()
         self.onboarding_win.activateWindow()
+
+    def show_auth_gate(self):
+        """Open the email-first sign in / sign up dialog. Used by the Account tab,
+        tray, and upgrade prompts when the user wants to create or access an
+        account."""
+        if self.auth.is_authenticated:
+            self.show_settings()
+            return
+        from ui.onboarding import Onboarding
+        self._auth_gate = Onboarding(main_app=self, account_only=True)
+        self._auth_gate.show()
+        self._auth_gate.raise_()
+        self._auth_gate.activateWindow()
 
     def show_account_gate(self):
         """One-time sign-in / guest gate for users who onboarded before accounts

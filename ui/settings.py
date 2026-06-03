@@ -273,10 +273,17 @@ class Settings(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(12)
 
-        # Title Header
-        title_label = QLabel("Settings", self)
-        title_label.setObjectName("titleLabel")
-        layout.addWidget(title_label)
+        # Header: "Welcome, {name}" + a tier badge (purple Pro / green Free / gray Guest)
+        header_row = QHBoxLayout()
+        header_row.setSpacing(10)
+        self._welcome_label = QLabel("Welcome", self)
+        self._welcome_label.setObjectName("titleLabel")
+        header_row.addWidget(self._welcome_label)
+        self._header_badge = QLabel("GUEST", self)
+        self._header_badge.setObjectName("guestBadge")
+        header_row.addWidget(self._header_badge, 0, Qt.AlignVCenter)
+        header_row.addStretch()
+        layout.addLayout(header_row)
 
         # Tabs Container
         self.tabs = QTabWidget(self)
@@ -411,6 +418,11 @@ class Settings(QDialog):
             self.combo_device.setCurrentIndex(0)
 
     def _launch_smart_meeting(self):
+        # Meeting recording is Pro-only — prompt to upgrade instead of launching.
+        if not self._is_pro():
+            if self.app and hasattr(self.app, "_pro_upsell"):
+                self.app._pro_upsell("Meeting recording")
+            return
         self._save_general_configs()
         if self.app:
             self.app.cfg.update(self.cfg_working)
@@ -2071,7 +2083,7 @@ class Settings(QDialog):
         c.addWidget(self._acct_plan_label)
 
         btns = QHBoxLayout()
-        self._acct_signin_btn = QPushButton("Sign in with Google", card)
+        self._acct_signin_btn = QPushButton("Sign in / Create account", card)
         self._acct_signin_btn.setObjectName("primaryButton")
         self._acct_signin_btn.clicked.connect(self._acct_sign_in)
         btns.addWidget(self._acct_signin_btn)
@@ -2128,8 +2140,8 @@ class Settings(QDialog):
         return tab
 
     def _acct_sign_in(self):
-        if self.app and hasattr(self.app, "start_google_login"):
-            self.app.start_google_login()
+        if self.app and hasattr(self.app, "show_auth_gate"):
+            self.app.show_auth_gate()
 
     def _acct_sign_out(self):
         if self.app and hasattr(self.app, "sign_out"):
@@ -2175,9 +2187,33 @@ class Settings(QDialog):
         self._acct_badge.style().unpolish(self._acct_badge)
         self._acct_badge.style().polish(self._acct_badge)
 
+        # Header: "Welcome, {name}" + matching tier badge.
+        if hasattr(self, "_welcome_label"):
+            name = None
+            if authed and auth:
+                name = getattr(auth, "user_name", None) or (
+                    auth.user_email.split("@")[0] if auth.user_email else None
+                )
+            self._welcome_label.setText(f"Welcome, {name}" if name else "Welcome")
+            if is_pro:
+                self._header_badge.setText("✦ PRO"); self._header_badge.setObjectName("proBadge")
+            elif t == entitlements.TIER_FREE:
+                self._header_badge.setText("FREE"); self._header_badge.setObjectName("freeBadge")
+            else:
+                self._header_badge.setText("GUEST"); self._header_badge.setObjectName("guestBadge")
+            self._header_badge.style().unpolish(self._header_badge)
+            self._header_badge.style().polish(self._header_badge)
+
         # Smart-action lock pill follows Pro state.
         if getattr(self, "_smart_pro_badge", None) is not None:
             self._smart_pro_badge.setVisible(not is_pro)
+
+        # Meeting launch button reflects Pro state (locked label for non-Pro).
+        if hasattr(self, "btn_launch_meeting"):
+            self.btn_launch_meeting.setText(
+                "🚀 Start Smart Meeting Transcription" if is_pro
+                else "🔒 Smart Meeting Transcription (Pro)"
+            )
 
         if authed:
             self._acct_status_label.setText(f"Signed in as {auth.user_email or 'your account'}")

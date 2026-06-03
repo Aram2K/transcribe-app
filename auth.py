@@ -114,6 +114,7 @@ class AuthManager:
         self._refresh_token = None
 
         self.user_email = None
+        self.user_name = None
         self.user_id = None
         self.is_pro = False
         self.plan = None              # 'monthly' | 'annual' | None
@@ -258,17 +259,20 @@ class AuthManager:
             return ("error", "Incorrect email or password.")
         return ("error", msg)
 
-    def sign_up_email(self, email, password):
-        """Create an account with email + password.
+    def sign_up_email(self, email, password, name=None):
+        """Create an account with email + password (and optional display name).
         Returns (status, message):
           ("ok", "")        — signed in immediately (confirmations disabled)
           ("verify", email) — a confirmation email was sent
           ("error", <msg>)  — failed."""
+        body = {"email": email, "password": password}
+        if name:
+            body["data"] = {"full_name": name}
         try:
             resp = requests.post(
                 f"{SUPABASE_URL}/auth/v1/signup",
                 headers=self._headers(),
-                json={"email": email, "password": password},
+                json=body,
                 timeout=_HTTP_TIMEOUT,
             )
         except requests.RequestException:
@@ -324,8 +328,14 @@ class AuthManager:
                 except Exception:
                     logger.debug("Could not persist refresh token", exc_info=True)
             user = data.get("user") or {}
+            meta = user.get("user_metadata") or {}
             self.user_id = user.get("id")
-            self.user_email = user.get("email") or (user.get("user_metadata") or {}).get("email")
+            self.user_email = user.get("email") or meta.get("email")
+            self.user_name = (
+                meta.get("full_name")
+                or meta.get("name")
+                or (self.user_email.split("@")[0] if self.user_email else None)
+            )
 
     def _refresh_access_token(self):
         with self._lock:
@@ -427,6 +437,7 @@ class AuthManager:
             self._access_expires_at = 0.0
             self._refresh_token = None
             self.user_email = None
+            self.user_name = None
             self.user_id = None
             self.is_pro = False
             self.plan = None

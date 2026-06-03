@@ -121,6 +121,13 @@ class Onboarding(QDialog):
         seg.addWidget(self._tab_signup)
         cl.addLayout(seg)
 
+        # Name (sign up only)
+        self._name_input = QLineEdit(card)
+        self._name_input.setPlaceholderText("Your name")
+        self._name_input.setMinimumHeight(38)
+        self._name_input.setVisible(False)
+        cl.addWidget(self._name_input)
+
         # Email
         self._email_input = QLineEdit(card)
         self._email_input.setPlaceholderText("you@email.com")
@@ -164,23 +171,6 @@ class Onboarding(QDialog):
         self._resend_btn.clicked.connect(self._resend_verification)
         cl.addWidget(self._resend_btn, alignment=Qt.AlignCenter)
 
-        # Divider — "or"
-        div = QHBoxLayout()
-        div.setSpacing(8)
-        line_l = QFrame(card); line_l.setFrameShape(QFrame.HLine)
-        line_l.setStyleSheet("color: #cbd5e1; max-height: 1px;")
-        line_r = QFrame(card); line_r.setFrameShape(QFrame.HLine)
-        line_r.setStyleSheet("color: #cbd5e1; max-height: 1px;")
-        or_lbl = QLabel("or", card); or_lbl.setObjectName("subtitleLabel")
-        div.addWidget(line_l, 1); div.addWidget(or_lbl); div.addWidget(line_r, 1)
-        cl.addLayout(div)
-
-        # Google
-        self.btn_google = QPushButton("Continue with Google", card)
-        self.btn_google.setMinimumHeight(42)
-        self.btn_google.clicked.connect(self._choose_google)
-        cl.addWidget(self.btn_google)
-
         lay.addWidget(card)
 
         # Guest
@@ -208,6 +198,7 @@ class Onboarding(QDialog):
     def _set_auth_mode(self, mode):
         self._auth_mode = mode
         is_signup = (mode == "signup")
+        self._name_input.setVisible(is_signup)
         self._primary_btn.setText("Create account" if is_signup else "Sign in")
         self._tab_signin.setObjectName("primaryButton" if not is_signup else "")
         self._tab_signup.setObjectName("primaryButton" if is_signup else "")
@@ -232,8 +223,8 @@ class Onboarding(QDialog):
         self._msg_label.setVisible(True)
 
     def _set_form_busy(self, busy):
-        for w in (self._email_input, self._password_input, self._primary_btn,
-                  self._tab_signin, self._tab_signup, self.btn_google, self._show_pw_btn):
+        for w in (self._name_input, self._email_input, self._password_input,
+                  self._primary_btn, self._tab_signin, self._tab_signup, self._show_pw_btn):
             w.setEnabled(not busy)
         if busy:
             self._primary_btn.setText("Please wait…")
@@ -249,6 +240,7 @@ class Onboarding(QDialog):
         if len(pw) < 6:
             self._show_msg("Password must be at least 6 characters.", error=True)
             return
+        name = self._name_input.text().strip()
         self._msg_label.setVisible(False)
         self._resend_btn.setVisible(False)
         self._set_form_busy(True)
@@ -260,7 +252,7 @@ class Onboarding(QDialog):
                 self.auth_result.emit("error", "Sign-in is unavailable right now.")
                 return
             if mode == "signup":
-                status, msg = auth.sign_up_email(email, pw)
+                status, msg = auth.sign_up_email(email, pw, name or None)
             else:
                 status, msg = auth.sign_in_email(email, pw)
             self.auth_result.emit(status, msg)
