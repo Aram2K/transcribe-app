@@ -1772,6 +1772,15 @@ class AppController(QObject):
 
     def _on_hotkey(self):
         logger.info("[main] _on_hotkey fired (is_rec=%s)", self.is_rec)
+        # A previous dictation is still transcribing/processing — ignore the
+        # hotkey so we never re-enter the shared recorder mid-flight (crash).
+        if getattr(self, "_busy", False):
+            if not self.is_rec:
+                self.show_tray_hint(
+                    "One moment",
+                    "Finishing your previous dictation — try again in a second.",
+                )
+            return
         if not self.is_rec:
             # Dictation and the meeting recorder share one AudioRecorder + audio
             # device. Don't let the hotkey start a dictation on top of an active
@@ -1816,7 +1825,7 @@ class AppController(QObject):
 
     def _on_enter(self):
         logger.info("[main] _on_enter fired (is_rec=%s)", self.is_rec)
-        if self.is_rec:
+        if self.is_rec and not getattr(self, "_busy", False):
             threading.Thread(target=self._stop, daemon=True).start()
 
     def _on_escape(self):
@@ -1911,6 +1920,16 @@ class AppController(QObject):
         self._transient_kbd_handles = []
 
     def _stop(self):
+        # _busy spans the whole transcribe→action→paste pipeline so a second
+        # hotkey press can't re-enter and clobber the shared recorder mid-flight
+        # (a real crash source). Cleared in finally on every exit path.
+        self._busy = True
+        try:
+            self._stop_impl()
+        finally:
+            self._busy = False
+
+    def _stop_impl(self):
         self.recorder.stop_recording()
         self._unregister_transient_keys()
         from ui.overlay import TRANSCRIBING
@@ -1974,6 +1993,9 @@ class AppController(QObject):
             )
 
         if action_mode != actions.ACTION_TRANSCRIBE_ONLY:
+            # Switch the overlay to "Thinking…" while the smart action runs.
+            from ui.overlay import PROCESSING
+            self.overlay.call_soon(self.overlay.set_state, PROCESSING)
             try:
                 output_text = actions.process(
                     text,

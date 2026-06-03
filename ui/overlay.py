@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QWidget, QApplication
 # Overlay States
 RECORDING = "recording"
 TRANSCRIBING = "transcribing"
+PROCESSING = "processing"   # smart action / LLM running after transcription
 DONE = "done"
 
 class Overlay(QWidget):
@@ -162,7 +163,7 @@ class Overlay(QWidget):
         # Draw corresponding state representation
         if self.overlay_state == RECORDING:
             self._draw_rec(painter, accent_color)
-        elif self.overlay_state == TRANSCRIBING:
+        elif self.overlay_state in (TRANSCRIBING, PROCESSING):
             self._draw_loading(painter, accent_color)
         elif self.overlay_state == DONE:
             self._draw_done(painter)
@@ -245,16 +246,23 @@ class Overlay(QWidget):
         
         # Labels
         dots = "." * (int(t * 2.5) % 4)
-        label = f"Transcribing · {self._lang}{dots}" if self._lang else f"Finalising{dots}"
-        
+        if self.overlay_state == PROCESSING:
+            label = f"Thinking{dots}"
+        else:
+            label = f"Transcribing · {self._lang}{dots}" if self._lang else f"Finalising{dots}"
+
         painter.setPen(QColor(15, 23, 42))
         painter.setFont(QFont("Segoe UI", 11, QFont.Bold))
         painter.drawText(42, 25, label)
-        
-        backend = "Google Cloud" if self.app and self.app.cfg.get("backend") == "google" else "Local AI"
+
+        if self.overlay_state == PROCESSING:
+            sub = "applying smart action  ·  almost there"
+        else:
+            backend = "Google Cloud" if self.app and self.app.cfg.get("backend") == "google" else "Local AI"
+            sub = f"via {backend}  ·  pasting when ready"
         painter.setPen(QColor(100, 116, 139))
         painter.setFont(QFont("Segoe UI", 8))
-        painter.drawText(42, 39, f"via {backend}  ·  pasting when ready")
+        painter.drawText(42, 39, sub)
 
         # Partial Preview Card (Light mode)
         if self._partial:
