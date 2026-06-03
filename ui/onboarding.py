@@ -171,6 +171,25 @@ class Onboarding(QDialog):
         self._resend_btn.clicked.connect(self._resend_verification)
         cl.addWidget(self._resend_btn, alignment=Qt.AlignCenter)
 
+        # Forgot password (sign-in only)
+        self._forgot_btn = QPushButton("Forgot password?", card)
+        self._forgot_btn.setFlat(True)
+        self._forgot_btn.setStyleSheet("color: #3b82f6; border: none;")
+        self._forgot_btn.clicked.connect(self._forgot_password)
+        cl.addWidget(self._forgot_btn, alignment=Qt.AlignCenter)
+
+        # Divider + optional Google social login
+        div = QHBoxLayout(); div.setSpacing(8)
+        ll = QFrame(card); ll.setFrameShape(QFrame.HLine); ll.setStyleSheet("color:#cbd5e1; max-height:1px;")
+        lr = QFrame(card); lr.setFrameShape(QFrame.HLine); lr.setStyleSheet("color:#cbd5e1; max-height:1px;")
+        orl = QLabel("or", card); orl.setObjectName("subtitleLabel")
+        div.addWidget(ll, 1); div.addWidget(orl); div.addWidget(lr, 1)
+        cl.addLayout(div)
+        self.btn_google = QPushButton("Continue with Google", card)
+        self.btn_google.setMinimumHeight(42)
+        self.btn_google.clicked.connect(self._choose_google)
+        cl.addWidget(self.btn_google)
+
         lay.addWidget(card)
 
         # Guest
@@ -199,6 +218,8 @@ class Onboarding(QDialog):
         self._auth_mode = mode
         is_signup = (mode == "signup")
         self._name_input.setVisible(is_signup)
+        if hasattr(self, "_forgot_btn"):
+            self._forgot_btn.setVisible(not is_signup)
         self._primary_btn.setText("Create account" if is_signup else "Sign in")
         self._tab_signin.setObjectName("primaryButton" if not is_signup else "")
         self._tab_signup.setObjectName("primaryButton" if is_signup else "")
@@ -223,8 +244,11 @@ class Onboarding(QDialog):
         self._msg_label.setVisible(True)
 
     def _set_form_busy(self, busy):
-        for w in (self._name_input, self._email_input, self._password_input,
-                  self._primary_btn, self._tab_signin, self._tab_signup, self._show_pw_btn):
+        widgets = [self._name_input, self._email_input, self._password_input,
+                   self._primary_btn, self._tab_signin, self._tab_signup, self._show_pw_btn]
+        if hasattr(self, "btn_google"):
+            widgets.append(self.btn_google)
+        for w in widgets:
             w.setEnabled(not busy)
         if busy:
             self._primary_btn.setText("Please wait…")
@@ -281,6 +305,16 @@ class Onboarding(QDialog):
         if email and auth:
             threading.Thread(target=lambda: auth.resend_verification(email), daemon=True).start()
             self._show_msg("Verification email resent — check your inbox.", error=False)
+
+    def _forgot_password(self):
+        email = self._email_input.text().strip()
+        if "@" not in email or "." not in email.split("@")[-1]:
+            self._show_msg("Enter your email above first, then tap Forgot password.", error=True)
+            return
+        auth = getattr(self.app, "auth", None)
+        if auth and hasattr(auth, "send_password_reset"):
+            threading.Thread(target=lambda: auth.send_password_reset(email), daemon=True).start()
+            self._show_msg(f"If an account exists for {email}, a reset link is on its way.", error=False)
 
     def _proceed_after_auth(self):
         if self.account_only:

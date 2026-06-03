@@ -289,6 +289,19 @@ class AuthManager:
             return ("verify", email)
         return ("error", self._error_message(resp))
 
+    def send_password_reset(self, email):
+        """Send a password-recovery email (Supabase /recover)."""
+        try:
+            requests.post(
+                f"{SUPABASE_URL}/auth/v1/recover",
+                headers=self._headers(),
+                json={"email": email},
+                timeout=_HTTP_TIMEOUT,
+            )
+            return True
+        except requests.RequestException:
+            return False
+
     def resend_verification(self, email):
         try:
             requests.post(
