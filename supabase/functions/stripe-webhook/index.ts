@@ -3,7 +3,7 @@
 // Security model:
 //   * Verifies the Stripe signature with STRIPE_WEBHOOK_SECRET (raw body).
 //   * Writes to the `subscriptions` table with the SERVICE ROLE key (bypasses
-//     RLS) — the only path allowed to grant Pro. The client never can.
+//     RLS) - the only path allowed to grant Pro. The client never can.
 //   * Links a Stripe customer to a Supabase user by `client_reference_id`
 //     (the app passes the signed-in user's id into Checkout), falling back to
 //     matching the email on the `profiles` row.

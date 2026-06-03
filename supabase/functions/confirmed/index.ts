@@ -7,7 +7,7 @@ const HTML = `<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Transcribe — Email confirmed</title>
+<title>Transcribe - Email confirmed</title>
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }

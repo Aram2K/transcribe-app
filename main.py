@@ -1,4 +1,4 @@
-# Transcribe App — PySide6 Entry Point and Logic Controller
+# Transcribe App - PySide6 Entry Point and Logic Controller
 
 import sys
 import threading
@@ -137,7 +137,7 @@ def load_config():
     loaded["action_model"] = actions.normalize_action_model(loaded.get("action_model"))
 
     # Output mode stays on "transcribe_only" by default. Smart Actions are a
-    # Pro feature and must be turned on explicitly — we never auto-enable them.
+    # Pro feature and must be turned on explicitly - we never auto-enable them.
 
     action_key = (loaded.get("action_api_key") or "").strip()
     if action_key:
@@ -438,7 +438,7 @@ class AudioRecorder:
         self._record_error    = ""
         # Rolling peak amplitude for adaptive bar normalization. Decays slowly
         # so bars stay calibrated to recent mic activity (handles mics with
-        # very different gain levels — laptop mic vs. headset vs. far-field).
+        # very different gain levels - laptop mic vs. headset vs. far-field).
         self._level_peak      = 0.05
 
     def load_model(self, name=None):
@@ -564,7 +564,7 @@ class AudioRecorder:
         # Resolve what to capture. `capture_mode` is passed explicitly by the
         # caller: the meetings window passes "smart_meeting"/"default_mic"; plain
         # hotkey dictation passes nothing and just uses the configured mic. This
-        # keeps loopback/system-audio capture scoped to meetings — it can never
+        # keeps loopback/system-audio capture scoped to meetings - it can never
         # leak into ordinary dictation via a shared config key.
         self.mic_stream = None
         is_loopback = False
@@ -719,7 +719,7 @@ class AudioRecorder:
                         self._level_peak = peak_now
                     else:
                         self._level_peak = max(0.01, self._level_peak * 0.995)
-                    # Use 0.7 * peak as the "full bar" reference — leaves
+                    # Use 0.7 * peak as the "full bar" reference - leaves
                     # headroom so transient loud sounds visibly spike past
                     # normal speech levels.
                     scale = max(0.01, self._level_peak * 0.7)
@@ -1034,9 +1034,9 @@ class AudioRecorder:
             if resp.status_code == 403:
                 return "", "!managed:Pro required for managed cloud transcription."
             if resp.status_code == 429:
-                return "", "!managed:Daily cloud limit reached — try again tomorrow."
+                return "", "!managed:Daily cloud limit reached - try again tomorrow."
             if resp.status_code == 401:
-                return "", "!managed:Session expired — sign in again."
+                return "", "!managed:Session expired - sign in again."
             if resp.status_code != 200:
                 return "", f"!managed:HTTP {resp.status_code}: {resp.text[:80]}"
             data = resp.json()
@@ -1150,7 +1150,7 @@ def make_qicon(color="#3b82f6"):
 
 # ── Main PySide6 Application Controller ───────────────────────────────────────
 class AppController(QObject):
-    # Cross-thread Signals — emitted from background hotkey-listener threads
+    # Cross-thread Signals - emitted from background hotkey-listener threads
     # (keyboard lib / pynput) and delivered on the Qt main thread via
     # QueuedConnection. Avoids QTimer.singleShot from non-Qt threads, which
     # silently no-ops because those threads have no Qt event loop.
@@ -1253,7 +1253,7 @@ class AppController(QObject):
             QTimer.singleShot(900, self.show_account_gate)
 
         # If a previous session already detected an update, prompt at startup
-        # immediately — don't wait for the network check to confirm. (The
+        # immediately - don't wait for the network check to confirm. (The
         # background check still runs and will clear the flag if no update.)
         cached_pending = self.cfg.get("pending_update_version", "")
         if cached_pending and self.cfg.get("onboarding_done", False):
@@ -1312,7 +1312,7 @@ class AppController(QObject):
         menu.addAction(action_rec_meet)
 
         action_settings = QAction("Settings", self)
-        # Tier indicator dot — green = Free, purple = Pro, gray = Guest.
+        # Tier indicator dot - green = Free, purple = Pro, gray = Guest.
         action_settings.setIcon(self._dot_icon(self._tier_color()))
         action_settings.triggered.connect(self.show_settings)
         menu.addAction(action_settings)
@@ -1330,7 +1330,7 @@ class AppController(QObject):
         self._tray_menu = menu  # keep a reference so Qt doesn't GC it
         self.tray_icon.setContextMenu(menu)
 
-        tip = "Transcribe — Pro" if is_pro else "Transcribe"
+        tip = "Transcribe - Pro" if is_pro else "Transcribe"
         if self.auth.is_authenticated and self.auth.user_email:
             tip += f"\n{self.auth.user_email}"
         self.tray_icon.setToolTip(tip)
@@ -1488,7 +1488,7 @@ class AppController(QObject):
         box.setWindowTitle("Free trial used up")
         box.setText(
             "You've used your 10 free guest minutes.\n\n"
-            "Create a free account to keep dictating — it's unlimited, and you "
+            "Create a free account to keep dictating - it's unlimited, and you "
             "can upgrade to Pro anytime."
         )
         signin = box.addButton("Create free account", QMessageBox.AcceptRole)
@@ -1526,7 +1526,7 @@ class AppController(QObject):
                 if tag and _parse_version(tag) > _parse_version(APP_VERSION):
                     self.cfg["pending_update_version"] = tag
                     self.save_config()
-                    # Emit signal — handled on main thread via QueuedConnection.
+                    # Emit signal - handled on main thread via QueuedConnection.
                     self.sig_update_available.emit(tag)
                 else:
                     if self.cfg.get("pending_update_version"):
@@ -1543,13 +1543,13 @@ class AppController(QObject):
             return
         if not tag:
             return
-        # Skip if user is mid-recording — don't interrupt them.
+        # Skip if user is mid-recording - don't interrupt them.
         if self.is_rec:
             return
         self._update_prompt_open = True
         try:
             reply = QMessageBox.question(
-                None, "Transcribe — Update Available",
+                None, "Transcribe - Update Available",
                 f"A new version ({tag}) is available.\n"
                 f"You are running v{APP_VERSION}.\n\n"
                 "Install update now?",
@@ -1702,7 +1702,7 @@ class AppController(QObject):
                 logger.info("Registered keyboard hotkey: %s", hotkey)
             else:
                 # macOS / Linux: pynput GlobalHotKeys (handles modifier tracking
-                # internally — more robust than a custom Listener).
+                # internally - more robust than a custom Listener).
                 from pynput import keyboard as pynput_keyboard
                 listener = pynput_keyboard.GlobalHotKeys({
                     self._to_pynput_hotkey(hotkey): lambda: self.sig_hotkey.emit(),
@@ -1772,19 +1772,19 @@ class AppController(QObject):
 
     def _on_hotkey(self):
         logger.info("[main] _on_hotkey fired (is_rec=%s)", self.is_rec)
-        # A previous dictation is still transcribing/processing — ignore the
+        # A previous dictation is still transcribing/processing - ignore the
         # hotkey so we never re-enter the shared recorder mid-flight (crash).
         if getattr(self, "_busy", False):
             if not self.is_rec:
                 self.show_tray_hint(
                     "One moment",
-                    "Finishing your previous dictation — try again in a second.",
+                    "Finishing your previous dictation - try again in a second.",
                 )
             return
         if not self.is_rec:
             # Dictation and the meeting recorder share one AudioRecorder + audio
             # device. Don't let the hotkey start a dictation on top of an active
-            # meeting — it would clobber the meeting's audio stream. Tell the
+            # meeting - it would clobber the meeting's audio stream. Tell the
             # user instead.
             if self._is_meeting_busy():
                 self.show_tray_hint(
@@ -1798,7 +1798,7 @@ class AppController(QObject):
             threading.Thread(target=self._stop, daemon=True).start()
 
     def _is_meeting_busy(self):
-        """True while the meeting window is actively recording or processing —
+        """True while the meeting window is actively recording or processing -
         i.e. while it owns the shared AudioRecorder."""
         win = getattr(self, "meetings_win", None)
         if win is None:
@@ -1882,7 +1882,7 @@ class AppController(QObject):
 
     def _register_transient_keys(self):
         # Enter (stop) and Esc (cancel) are only meaningful while recording.
-        # Use a pynput Listener — we confirmed in the logs that pynput reliably
+        # Use a pynput Listener - we confirmed in the logs that pynput reliably
         # receives plain Enter/Esc events on Windows, while the `keyboard`
         # library's on_press_key callback wasn't firing for those keys when
         # another hotkey was already registered with add_hotkey.
@@ -1958,7 +1958,7 @@ class AppController(QObject):
             )
             self.overlay.call_soon(
                 self.overlay.show_error,
-                f"Transcription timed out after {TRANSCRIBE_TIMEOUT_SEC}s — try a shorter clip or a smaller model.",
+                f"Transcription timed out after {TRANSCRIBE_TIMEOUT_SEC}s - try a shorter clip or a smaller model.",
             )
             return
             
@@ -1983,7 +1983,7 @@ class AppController(QObject):
         output_text = text
 
         # Smart Actions are Pro-only. Free users still get their raw transcription
-        # pasted — we just skip the AI action and nudge them once.
+        # pasted - we just skip the AI action and nudge them once.
         if action_mode != actions.ACTION_TRANSCRIBE_ONLY and not self.is_pro():
             action_mode = actions.ACTION_TRANSCRIBE_ONLY
             self.overlay.call_soon(

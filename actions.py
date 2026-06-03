@@ -161,7 +161,7 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
         kind = ACTION_MODELS[model].get("kind")
 
         # Cloud engine: let API errors surface clearly (missing key, bad key,
-        # network). We do NOT silently fall back to rule-based — the user
+        # network). We do NOT silently fall back to rule-based - the user
         # explicitly picked a cloud LLM, so a failure must be visible.
         if kind == "cloud":
             if not config:
@@ -201,7 +201,7 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
             except local_llm.LocalLLMError as e:
                 raise ActionError(str(e)) from e
 
-        # Rule-based engine was explicitly chosen — best-effort regex routing.
+        # Rule-based engine was explicitly chosen - best-effort regex routing.
         routed = _run_smart_rule_based(text, source_lang, target_lang, config)
         if routed is not None:
             return routed

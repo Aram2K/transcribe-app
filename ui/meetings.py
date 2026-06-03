@@ -317,7 +317,7 @@ class MeetingsWindow(QDialog):
 
         # A plain Alt-R dictation shares this same AudioRecorder + audio device.
         # If one is running, stop it first (and tell the user) so the two don't
-        # fight over the device — which crashes — or leak dictation audio into
+        # fight over the device - which crashes - or leak dictation audio into
         # the meeting recording.
         dictation_was_running = False
         try:
@@ -348,7 +348,7 @@ class MeetingsWindow(QDialog):
             return
 
         # Save the recorder's existing (dictation/overlay) callbacks so they can
-        # be restored when the meeting ends — otherwise dictation's live level
+        # be restored when the meeting ends - otherwise dictation's live level
         # meter and partials stay broken after a meeting. While the meeting owns
         # the recorder, silence the overlay callbacks so the dictation overlay
         # never pops up mid-meeting.
@@ -370,7 +370,7 @@ class MeetingsWindow(QDialog):
         self.input_live_notes.clear()
         self._record_started_at = time.time()
 
-        # Start recording — guard against device-open failures (busy mic, no
+        # Start recording - guard against device-open failures (busy mic, no
         # loopback device, driver errors) so a failure never crashes the app or
         # leaves the window stuck in a fake "recording" state.
         try:
@@ -675,7 +675,7 @@ class MeetingsWindow(QDialog):
         if format_type == "email":
             clean_body = self._strip_markdown(summary)
             return (
-                f"Subject: {title} — Notes\n\n"
+                f"Subject: {title} - Notes\n\n"
                 "Hi,\n\n"
                 f"{clean_body}\n\n"
                 "Best,"
@@ -684,7 +684,7 @@ class MeetingsWindow(QDialog):
         if format_type == "slack":
             slack = re.sub(r"^#+\s+(.*)$", r"*\1*", summary, flags=re.MULTILINE)
             slack = slack.replace("**", "*")
-            return f"*{title} — Notes*\n\n{slack}"
+            return f"*{title} - Notes*\n\n{slack}"
             
         return summary
 

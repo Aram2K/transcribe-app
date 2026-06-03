@@ -155,7 +155,7 @@ class Settings(QDialog):
             self.app.cfg.update(self.cfg_working)
             self.app.save_config()
             self.app.apply_tray_bindings()
-        # Save no longer closes the window — just confirm with a small toast.
+        # Save no longer closes the window - just confirm with a small toast.
         self._show_saved_toast()
 
     def _show_saved_toast(self, text="✓  Settings saved"):
@@ -316,7 +316,7 @@ class Settings(QDialog):
         self.tabs.addTab(self._create_account_tab(), "Account")
         layout.addWidget(self.tabs)
 
-        # Bottom row — Save stays open + shows a small toast; Close dismisses.
+        # Bottom row - Save stays open + shows a small toast; Close dismisses.
         bottom_layout = QHBoxLayout()
         self._saved_toast = QLabel("", self)
         self._saved_toast.setStyleSheet("color: #16a34a; font-weight: 700;")
@@ -394,7 +394,14 @@ class Settings(QDialog):
         dev_frame = QFrame(tab)
         dev_frame.setObjectName("cardFrame")
         dev_lay = QVBoxLayout(dev_frame)
-        dev_lay.addWidget(QLabel("Default Meeting Audio Device", dev_frame))
+        dev_head = QHBoxLayout()
+        dev_head.addWidget(QLabel("Default Meeting Audio Device", dev_frame))
+        dev_head.addStretch()
+        self._meeting_pro_badge = QLabel("PRO", dev_frame)
+        self._meeting_pro_badge.setObjectName("proBadge")
+        self._meeting_pro_badge.setVisible(not self._is_pro())
+        dev_head.addWidget(self._meeting_pro_badge)
+        dev_lay.addLayout(dev_head)
         
         self.combo_device = QComboBox(dev_frame)
         self._populate_audio_devices()
@@ -416,12 +423,12 @@ class Settings(QDialog):
         cloud_frame.setObjectName("cardFrame")
         cf_lay = QVBoxLayout(cloud_frame)
         cf_lay.setContentsMargins(18, 14, 18, 14)
-        self.chk_managed = QCheckBox("⚡ Managed Cloud transcription (Pro) — fast & accurate, no API key", cloud_frame)
+        self.chk_managed = QCheckBox("⚡ Managed Cloud transcription (Pro) - fast & accurate, no API key", cloud_frame)
         self.chk_managed.setChecked(self.cfg_working.get("backend") == "managed")
         self.chk_managed.stateChanged.connect(self._on_managed_toggled)
         cf_lay.addWidget(self.chk_managed)
         cloud_desc = QLabel(
-            "Transcribe on our servers using your Pro plan — no local model or API key needed.",
+            "Transcribe on our servers using your Pro plan - no local model or API key needed.",
             cloud_frame,
         )
         cloud_desc.setObjectName("subtitleLabel")
@@ -477,7 +484,7 @@ class Settings(QDialog):
             self.cfg_working["backend"] = "local"
 
     def _launch_smart_meeting(self):
-        # Meeting recording is Pro-only — prompt to upgrade instead of launching.
+        # Meeting recording is Pro-only - prompt to upgrade instead of launching.
         if not self._is_pro():
             if self.app and hasattr(self.app, "_pro_upsell"):
                 self.app._pro_upsell("Meeting recording")
@@ -917,7 +924,7 @@ class Settings(QDialog):
                         self.google_test_finished.emit(False, f"API key valid, but: {err_msg[:60]}")
                     elif resp.status_code == 400:
                         # Auth succeeded; the request was rejected only because of
-                        # the dummy test audio — the key itself works.
+                        # the dummy test audio - the key itself works.
                         self.google_test_finished.emit(True, "Working!")
                     else:
                         self.google_test_finished.emit(False, f"HTTP {resp.status_code}: {err_msg[:50]}")
@@ -1126,7 +1133,7 @@ class Settings(QDialog):
         self.card_smart = self._build_mode_card(
             self.mode_section,
             "Smart actions",
-            "Detect intent from voice — e.g. say \"translate to russian: …\", "
+            "Detect intent from voice - e.g. say \"translate to russian: …\", "
             "\"write email to John\", or \"make a todo list\". The AI produces "
             "only the result.",
             checked=False,
@@ -1138,7 +1145,7 @@ class Settings(QDialog):
         self.rb_smart.setToolTip(
             "When enabled, your dictation is run through a language model "
             "that detects whether you want a translation, email, todo "
-            "list, summary, or rewrite — and produces only that output. "
+            "list, summary, or rewrite - and produces only that output. "
             "If you don't ask for anything specific, your words are pasted "
             "as-is."
         )
@@ -1277,7 +1284,7 @@ class Settings(QDialog):
         llm_p_lay.addWidget(self.combo_local_model)
         lay_llm.addWidget(llm_pick_frame)
 
-        # GGUF model cards — scroll with the whole tab (no nested mini-scroll)
+        # GGUF model cards - scroll with the whole tab (no nested mini-scroll)
         llm_cards_label = QLabel("Local model downloads", self.card_local_llm)
         llm_cards_label.setObjectName("subtitleLabel")
         llm_cards_label.setStyleSheet("font-weight: 600; color: #475569; margin-top: 4px;")
@@ -1358,7 +1365,7 @@ class Settings(QDialog):
 
         The engine section is always visible now (just enabled/disabled), so
         the cards no longer need to expand to fill space when Transcribe-only
-        is selected — that previously caused the giant-empty-card layout.
+        is selected - that previously caused the giant-empty-card layout.
         """
         if not hasattr(self, "card_transcribe"):
             return
@@ -1420,7 +1427,7 @@ class Settings(QDialog):
 
         row.addLayout(text_col, 1)
 
-        # Hidden PRO pill — shown on Pro-only modes for non-Pro users.
+        # Hidden PRO pill - shown on Pro-only modes for non-Pro users.
         pro_badge = QLabel("PRO", row_host)
         pro_badge.setObjectName("proBadge")
         pro_badge.setVisible(False)
@@ -2035,7 +2042,7 @@ class Settings(QDialog):
         aibuben_lay.addWidget(lbl_aibuben_logo)
 
         lbl_aibuben_desc = QLabel(
-            "This project is proud to be part of the <b>AIBUBEN</b> AI community in Yerevan—"
+            "This project is proud to be part of the <b>AIBUBEN</b> AI community in Yerevan-"
             "empowering AI builders, creators, and students to learn, connect, and build state-of-the-art products.",
             aibuben_frame
         )
@@ -2192,8 +2199,8 @@ class Settings(QDialog):
         perks = QLabel(
             "<b>Transcribe Pro</b> unlocks:<br>"
             "&nbsp;&nbsp;🎤&nbsp; Meeting recording with AI notes<br>"
-            "&nbsp;&nbsp;🧠&nbsp; Smart Actions — rewrite, translate, summarize<br>"
-            "&nbsp;&nbsp;⚡&nbsp; Managed cloud transcription — fast, no API key<br>"
+            "&nbsp;&nbsp;🧠&nbsp; Smart Actions - rewrite, translate, summarize<br>"
+            "&nbsp;&nbsp;⚡&nbsp; Managed cloud transcription - fast, no API key<br>"
             "&nbsp;&nbsp;⭐&nbsp; Priority models &amp; support",
             tab,
         )
@@ -2304,6 +2311,8 @@ class Settings(QDialog):
                 "🚀 Start Smart Meeting Transcription" if is_pro
                 else "🔒 Smart Meeting Transcription (Pro)"
             )
+        if hasattr(self, "_meeting_pro_badge"):
+            self._meeting_pro_badge.setVisible(not is_pro)
 
         plan = getattr(auth, "plan", None) if auth else None
         on_trial = is_pro and plan == "trial"
@@ -2313,7 +2322,7 @@ class Settings(QDialog):
             if on_trial:
                 days = self._trial_days_left(auth)
                 self._acct_plan_label.setText(
-                    f"Pro trial — {days} day(s) left. Subscribe to keep Pro after it ends."
+                    f"Pro trial - {days} day(s) left. Subscribe to keep Pro after it ends."
                 )
             elif is_pro:
                 plan_name = (plan or "Pro").capitalize()
@@ -2324,7 +2333,7 @@ class Settings(QDialog):
                 self._acct_plan_label.setText(f"Plan: {plan_name}{renew}")
             else:
                 self._acct_plan_label.setText(
-                    "Plan: Free — upgrade to unlock Meetings, Smart Actions, and fast cloud transcription."
+                    "Plan: Free - upgrade to unlock Meetings, Smart Actions, and fast cloud transcription."
                 )
         else:
             self._acct_status_label.setText("Not signed in  ·  Guest")
@@ -2687,7 +2696,7 @@ class Settings(QDialog):
         else:
             return
 
-        # Modifier-less binding is only safe for Function keys (F1–F12); a bare
+        # Modifier-less binding is only safe for Function keys (F1-F12); a bare
         # typing/navigation key would fire during normal use. Require a modifier
         # otherwise (mouse buttons are handled separately in eventFilter).
         is_function_key = len(key_str) >= 2 and key_str[0] == "f" and key_str[1:].isdigit()
@@ -2695,7 +2704,7 @@ class Settings(QDialog):
             QMessageBox.warning(
                 self, "Modifier Required",
                 "Use at least one modifier (Ctrl, Alt, Shift, or Win), a Function "
-                "key (F1–F12), or a mouse button.\n\nA single typing key can't be a "
+                "key (F1-F12), or a mouse button.\n\nA single typing key can't be a "
                 "hotkey because it would trigger while you type."
             )
             return

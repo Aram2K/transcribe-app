@@ -528,7 +528,7 @@ class TestMeetingsWindowHelpers(unittest.TestCase):
             summary="## Summary\nGreat call.\n\n## Action items\n- [ ] follow up",
         )
         out = mw._format_share("email")
-        self.assertIn("Subject: Sync with Sara — Notes", out)
+        self.assertIn("Subject: Sync with Sara - Notes", out)
         self.assertIn("Hi,", out)
         self.assertIn("Best,", out)
         # Markdown sigils should be stripped in the email body
@@ -541,7 +541,7 @@ class TestMeetingsWindowHelpers(unittest.TestCase):
             summary="## Summary\n**Aram** will ship by Friday.",
         )
         out = mw._format_share("slack")
-        self.assertIn("*Standup — Notes*", out)
+        self.assertIn("*Standup - Notes*", out)
         # ## Summary becomes *Summary*; **Aram** becomes *Aram*
         self.assertIn("*Summary*", out)
         self.assertIn("*Aram*", out)

@@ -15,7 +15,7 @@ $$;
 revoke all on function public.handle_new_user() from public, anon, authenticated;
 
 -- Explicit one-time trial start (3 days). The `pro_trial_started_at is null`
--- guard means it can only ever be started ONCE per account — re-calling never
+-- guard means it can only ever be started ONCE per account - re-calling never
 -- resets or extends it (ungameable). Returns the trial end timestamp.
 create or replace function public.start_pro_trial()
 returns timestamptz

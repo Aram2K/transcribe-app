@@ -71,7 +71,7 @@ def build_messages(text, mode, source_lang="auto", target_lang="en"):
     elif mode == "summarize":
         instruction = (
             "Summarize this text in 3-5 sentences capturing the main points. "
-            "Output only the summary — no preamble, no headings."
+            "Output only the summary - no preamble, no headings."
         )
     elif mode == "meeting_notes":
         # Prompt engineering applied from Microsoft Research's meeting-recap
@@ -82,13 +82,13 @@ def build_messages(text, mode, source_lang="auto", target_lang="en"):
         instruction = (
             "You are summarising a meeting transcript. Think carefully before writing:\n"
             "1. First mentally identify the most important utterances in the transcript "
-            "(decisions, commitments, questions, blockers). DO NOT output this — it is "
+            "(decisions, commitments, questions, blockers). DO NOT output this - it is "
             "internal reasoning to ground the notes.\n"
             "2. Then produce well-formed Markdown with EXACTLY these four sections in "
             "this order, even if a section is empty:\n\n"
             "## Summary\n"
             "2-4 sentences in third person ('The team discussed…', 'Aram committed to…'). "
-            "Never use first-person ('I will…') — convert to third person using whoever "
+            "Never use first-person ('I will…') - convert to third person using whoever "
             "spoke when known, or 'the speaker' otherwise.\n\n"
             "## Key decisions\n"
             "Bullet list of concrete decisions reached. Skip if none.\n\n"

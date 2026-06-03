@@ -8,7 +8,7 @@ Security design (this whole module is built around "never trust the client"):
   * Only the **publishable** Supabase key is embedded (it is designed to be
     public; Row Level Security on the database is what actually protects data).
   * The **refresh token** is stored in the OS keyring (Windows Credential
-    Manager / macOS Keychain) via storage.write_secret — never in a plaintext
+    Manager / macOS Keychain) via storage.write_secret - never in a plaintext
     file. The short-lived access token is kept in memory only.
   * "Are you Pro?" is answered by the server-side `is_pro()` RPC, which reads
     the user's own subscription rows. The client can never self-grant Pro.
@@ -166,7 +166,7 @@ class AuthManager:
     def sign_in_with_google(self):
         """Run the full PKCE OAuth flow. Returns True on success.
 
-        Blocking — call from a worker thread. The browser opens; we wait for the
+        Blocking - call from a worker thread. The browser opens; we wait for the
         loopback redirect, exchange the code, persist the refresh token, and
         load entitlement."""
         verifier, challenge = _make_pkce_pair()
@@ -245,7 +245,7 @@ class AuthManager:
                 timeout=_HTTP_TIMEOUT,
             )
         except requests.RequestException:
-            return ("error", "Network error — check your connection and try again.")
+            return ("error", "Network error - check your connection and try again.")
         if resp.status_code == 200:
             self._apply_session(resp.json())
             self.refresh_entitlement()
@@ -255,7 +255,7 @@ class AuthManager:
         # Friendlier copy for the two most common cases.
         low = msg.lower()
         if "not confirmed" in low or "not been confirmed" in low:
-            return ("error", "Please verify your email first — check your inbox.")
+            return ("error", "Please verify your email first - check your inbox.")
         if "invalid" in low or "credential" in low:
             return ("error", "Incorrect email or password.")
         return ("error", msg)
@@ -263,9 +263,9 @@ class AuthManager:
     def sign_up_email(self, email, password, name=None):
         """Create an account with email + password (and optional display name).
         Returns (status, message):
-          ("ok", "")        — signed in immediately (confirmations disabled)
-          ("verify", email) — a confirmation email was sent
-          ("error", <msg>)  — failed."""
+          ("ok", "")        - signed in immediately (confirmations disabled)
+          ("verify", email) - a confirmation email was sent
+          ("error", <msg>)  - failed."""
         body = {"email": email, "password": password}
         if name:
             body["data"] = {"full_name": name}
@@ -277,7 +277,7 @@ class AuthManager:
                 timeout=_HTTP_TIMEOUT,
             )
         except requests.RequestException:
-            return ("error", "Network error — check your connection and try again.")
+            return ("error", "Network error - check your connection and try again.")
         if resp.status_code in (200, 201):
             data = resp.json() or {}
             session = data.get("session") or data
@@ -367,7 +367,7 @@ class AuthManager:
             logger.warning("Token refresh failed (network): %s", e)
             return False
         if resp.status_code != 200:
-            logger.warning("Token refresh HTTP %s — clearing session", resp.status_code)
+            logger.warning("Token refresh HTTP %s - clearing session", resp.status_code)
             # Refresh token is invalid/revoked: sign out locally.
             self._clear_local()
             self._notify()

@@ -1,4 +1,4 @@
-# Interactive "Go Pro" upgrade dialog — benefits + plan picker + checkout.
+# Interactive "Go Pro" upgrade dialog - benefits + plan picker + checkout.
 
 import threading
 import webbrowser
@@ -56,8 +56,8 @@ class ProDialog(QDialog):
         cl.setSpacing(12)
         for icon, head, desc in (
             ("🎤", "Meeting recording + AI notes", "Record any call and get clean, summarized minutes."),
-            ("🧠", "Smart Actions", "Translate, rewrite, summarize, draft emails — just by voice."),
-            ("⚡", "Managed cloud transcription", "Fast and accurate — no API key, no setup, no timeouts."),
+            ("🧠", "Smart Actions", "Translate, rewrite, summarize, draft emails - just by voice."),
+            ("⚡", "Managed cloud transcription", "Fast and accurate - no API key, no setup, no timeouts."),
             ("⭐", "Priority models & support", "The best models first, and a direct line to us."),
         ):
             row = QHBoxLayout()
@@ -82,7 +82,7 @@ class ProDialog(QDialog):
         # ── Free trial (only for signed-in users who haven't used it) ──
         authed = bool(self.app and getattr(self.app, "auth", None) and self.app.auth.is_authenticated)
         if authed and getattr(self.app.auth, "trial_available", False):
-            self.btn_trial = QPushButton("🎁  Start 3-day free trial — no card needed", self)
+            self.btn_trial = QPushButton("🎁  Start 3-day free trial - no card needed", self)
             self.btn_trial.setMinimumHeight(44)
             self.btn_trial.setCursor(Qt.PointingHandCursor)
             self.btn_trial.setStyleSheet(
@@ -99,8 +99,8 @@ class ProDialog(QDialog):
         # ── Plan picker ──
         plans = QHBoxLayout()
         plans.setSpacing(10)
-        self.card_monthly = self._plan_card("Monthly", "€7.99", "/mo", None, "monthly")
-        self.card_annual = self._plan_card("Annual", "€59", "/yr", "Save 38%", "annual")
+        self.card_monthly = self._plan_card("Monthly", "€7.99", "/mo", None, None, "monthly")
+        self.card_annual = self._plan_card("Annual", "€59", "/yr", "€96", "Save 38%", "annual")
         plans.addWidget(self.card_monthly)
         plans.addWidget(self.card_annual)
         root.addLayout(plans)
@@ -131,31 +131,46 @@ class ProDialog(QDialog):
         self._select_plan("annual")
         self._refresh_note()
 
-    def _plan_card(self, name, price, per, badge, plan_id):
+    def _plan_card(self, name, price, per, original, badge, plan_id):
         card = QFrame(self)
         card.setObjectName("cardFrame")
         card.setCursor(Qt.PointingHandCursor)
-        card.setMinimumHeight(92)
+        card.setMinimumHeight(124)
         v = QVBoxLayout(card)
         v.setContentsMargins(14, 12, 14, 12)
-        v.setSpacing(3)
+        v.setSpacing(4)
+
         top = QLabel(name, card)
-        top.setStyleSheet("font-weight: 700; color: #334155;")
+        top.setStyleSheet("font-weight: 700; color: #334155; font-size: 13px;")
         v.addWidget(top)
+
+        # Price row, with an optional struck-through "was" price before it.
         prow = QHBoxLayout()
-        prow.setSpacing(2)
+        prow.setSpacing(5)
+        if original:
+            o = QLabel(f"<s>{original}</s>", card)
+            o.setStyleSheet("color: #94a3b8; font-size: 14px;")
+            prow.addWidget(o, 0, Qt.AlignBottom)
         p = QLabel(price, card)
-        p.setStyleSheet("font-size: 22px; font-weight: 800; color: #0f172a;")
+        p.setStyleSheet("font-size: 24px; font-weight: 800; color: #0f172a;")
+        prow.addWidget(p)
         u = QLabel(per, card)
         u.setObjectName("subtitleLabel")
-        prow.addWidget(p)
         prow.addWidget(u, 0, Qt.AlignBottom)
         prow.addStretch()
         v.addLayout(prow)
+
+        v.addStretch()
+
+        # Bottom slot, aligned across both cards: a "Save" pill or a plain note.
         if badge:
             b = QLabel(badge, card)
             b.setObjectName("proBadge")
-            v.addWidget(b, 0, Qt.AlignLeft)
+        else:
+            b = QLabel("billed monthly", card)
+            b.setObjectName("subtitleLabel")
+        v.addWidget(b, 0, Qt.AlignLeft)
+
         card.mousePressEvent = lambda _e, pid=plan_id: self._select_plan(pid)
         return card
 

@@ -2,16 +2,16 @@
 Tier + entitlement logic for Transcribe.
 
 Three tiers:
-  * guest — not signed in. A 10-minute total recording trial (all models), so a
+  * guest - not signed in. A 10-minute total recording trial (all models), so a
             new user can experience the product before creating an account
             (lower friction → higher activation; see onboarding research).
-  * free  — signed in, no active subscription. Unlimited local dictation; Pro
+  * free  - signed in, no active subscription. Unlimited local dictation; Pro
             features (meetings, smart actions, managed cloud) are locked behind
             contextual upgrade prompts.
-  * pro   — signed in with an active subscription. Everything unlocked.
+  * pro   - signed in with an active subscription. Everything unlocked.
 
 Guest usage is metered locally (no account) in usage.json. Pro entitlement is
-always confirmed server-side by auth.AuthManager — this module only maps that
+always confirmed server-side by auth.AuthManager - this module only maps that
 state to tiers + feature gates. It never decides Pro on its own.
 """
 
@@ -28,7 +28,7 @@ TIER_FREE = "free"
 TIER_PRO = "pro"
 
 # Super admins can force any tier locally (for testing / control) via a config
-# override. This only affects client-side gating on their own machine — it never
+# override. This only affects client-side gating on their own machine - it never
 # grants real server entitlements (the cloud proxy still verifies subscriptions).
 SUPER_ADMIN_EMAILS = {"aramatamian15@gmail.com"}
 

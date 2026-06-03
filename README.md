@@ -10,7 +10,7 @@
 [![Offline](https://img.shields.io/badge/works-offline-success?style=flat-square)]()
 [![Armenian](https://img.shields.io/badge/language-Armenian%20%7C%20English%20%7C%20Russian-orange?style=flat-square)]()
 
-<h3>Press a key. Speak. Your words appear — wherever your cursor is.</h3>
+<h3>Press a key. Speak. Your words appear - wherever your cursor is.</h3>
 
 <p>A lightweight, always-on speech-to-text tool that lives in your system tray.<br/>
 Works completely offline using Whisper AI, or connects to Google Cloud for best Armenian accuracy.</p>
@@ -27,7 +27,7 @@ Works completely offline using Whisper AI, or connects to Google Cloud for best 
 
 ## What is Transcribe?
 
-Transcribe is a hotkey-triggered dictation tool that runs silently in the background on your computer. Press your configured key, speak naturally, and when you stop — the transcription is automatically pasted wherever your cursor is: a chat window, a document, an email, a code editor, anything.
+Transcribe is a hotkey-triggered dictation tool that runs silently in the background on your computer. Press your configured key, speak naturally, and when you stop - the transcription is automatically pasted wherever your cursor is: a chat window, a document, an email, a code editor, anything.
 
 It was built especially for **Armenian speakers** who need accurate, native-script transcription (not Latin transliteration), while also supporting English, Russian, French, German, Spanish, and Arabic.
 
@@ -56,25 +56,25 @@ It was built especially for **Armenian speakers** who need accurate, native-scri
 ### Windows
 
 1. Download **[TranscribeApp-Windows-Setup.exe](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Windows-Setup.exe)**
-2. Run it — the installer wizard handles everything (Start Menu shortcut, optional autostart, optional desktop icon)
-3. Click **Finish** — Transcribe launches automatically and a microphone icon appears in your system tray
+2. Run it - the installer wizard handles everything (Start Menu shortcut, optional autostart, optional desktop icon)
+3. Click **Finish** - Transcribe launches automatically and a microphone icon appears in your system tray
 4. The first-run welcome window walks you through setting your hotkey, language, and backend
 5. To uninstall later: **Settings → Apps → Transcribe → Uninstall**
 
 > **Note:** Windows may show a "Windows protected your PC" warning the first time because the app isn't code-signed. Click **More info → Run anyway**. The app is open-source and safe.
 
-**Updates** are automatic — when a new version is published, Transcribe shows a notification and adds an "Install update" item to the tray menu. One click downloads and installs the update without re-downloading the full app manually.
+**Updates** are automatic - when a new version is published, Transcribe shows a notification and adds an "Install update" item to the tray menu. One click downloads and installs the update without re-downloading the full app manually.
 
 ### macOS
 
 1. Download **[TranscribeApp-Mac.dmg](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Mac.dmg)**
 2. Open the `.dmg` and drag the app to your Applications folder
-3. **First launch — Gatekeeper warning.** macOS will block the app with *"Apple could not verify TranscribeApp is free of malware"* because it isn't notarized (notarization needs a paid Apple Developer ID — the app is open-source and safe). Use **one** of these:
+3. **First launch - Gatekeeper warning.** macOS will block the app with *"Apple could not verify TranscribeApp is free of malware"* because it isn't notarized (notarization needs a paid Apple Developer ID - the app is open-source and safe). Use **one** of these:
    - **Easiest:** Open **System Settings → Privacy & Security**, scroll to the bottom and click **Open Anyway** next to the TranscribeApp message.
    - **Or:** In Finder, right-click (or Control-click) **TranscribeApp.app → Open**, then click **Open** in the dialog.
    - **Or via Terminal:** `xattr -dr com.apple.quarantine /Applications/TranscribeApp.app` then launch normally.
-4. **Where did the app go?** Transcribe has no Dock window — it runs as a **microphone icon in the menu bar** at the top-right of your screen, next to the wifi/battery icons. Click it any time to reach Settings, History, Record Meeting, and Quit.
-5. **Grant Accessibility permission** — required for the global hotkey:
+4. **Where did the app go?** Transcribe has no Dock window - it runs as a **microphone icon in the menu bar** at the top-right of your screen, next to the wifi/battery icons. Click it any time to reach Settings, History, Record Meeting, and Quit.
+5. **Grant Accessibility permission** - required for the global hotkey:
    - The first time you press your hotkey, macOS prompts you to allow Transcribe under **System Settings → Privacy & Security → Accessibility**. Toggle TranscribeApp **on**. Until you do, the hotkey silently won't fire.
 6. **Hotkey:** the default is **Option + R** (`alt+r`). To change it: menu bar icon → Settings → Hotkey → click the field and press any combination of `⌘ ⌥ ⌃ ⇧` plus a key. It's read by physical key code, so any keyboard layout (French, German, Armenian, …) works.
 
@@ -99,28 +99,28 @@ Capture a Google Meet, Zoom, or any conference call and automatically get back a
 
 ```
 1.  Tray icon → Record Meeting…
-2.  (Optional) Add the meeting title + attendee names — these anchor
+2.  (Optional) Add the meeting title + attendee names - these anchor
     action-item ownership in the final notes
 3.  Pick your audio source, click Start meeting
 4.  A red REC banner with a pulsing dot, live timer, and audio-level
     meter makes it obvious the recording is on. The window pins itself
-    on top and the tray icon turns red — you won't miss it.
+    on top and the tray icon turns red - you won't miss it.
 5.  Type your own bullet points in the right-hand "Your notes" pane
     while you listen. They'll be merged into the AI summary.
 6.  Click Stop & generate notes → wait 10-60s while the AI engine runs
 7.  Read / Copy as Markdown / Copy as email / Copy as Slack / Save to
-    file — everything is also stored on disk
+    file - everything is also stored on disk
 ```
 
 The AI notes follow a research-backed structure (Microsoft Research, 2023): `## Summary` in third person, `## Key decisions`, `## Action items` as `- [ ] task (Owner: name)` checkboxes, `## Open questions`. When you provide an attendee list, owner attribution kicks in: phrases like *"I'll draft the spec"* and *"Aram should review it"* get attributed to the right person.
 
-Long silence gaps (>1.4s) are tagged as `[speaker change]` in the transcript so the LLM can attribute who said what — a lightweight diarization signal that needs no extra ML dependency.
+Long silence gaps (>1.4s) are tagged as `[speaker change]` in the transcript so the LLM can attribute who said what - a lightweight diarization signal that needs no extra ML dependency.
 
 Each meeting is stored in `%APPDATA%\Transcribe\meetings\<timestamp>\` with:
-- `chunks.jsonl` — every transcribed chunk as it arrived (crash-recoverable)
-- `transcript.txt` — full transcript
-- `notes.md` — Summary + Key decisions + Action items + Open questions
-- `meta.json` — duration, chunk count, language
+- `chunks.jsonl` - every transcribed chunk as it arrived (crash-recoverable)
+- `transcript.txt` - full transcript
+- `notes.md` - Summary + Key decisions + Action items + Open questions
+- `meta.json` - duration, chunk count, language
 
 ### Capturing the *other* participants' audio
 
@@ -148,7 +148,7 @@ For 1-hour+ meetings, a cloud engine is recommended because local Qwen has a sma
 
 | Backend | Best for | Speed | Cost | Internet |
 |---------|----------|-------|------|----------|
-| **Local (Whisper AI)** | Privacy, offline use | 0.5–15s | Free forever | ❌ No |
+| **Local (Whisper AI)** | Privacy, offline use | 0.5-15s | Free forever | ❌ No |
 | **Google Cloud** | Armenian accuracy | ~1s | 60 min/month free | ✅ Yes |
 
 ### Setting up Google Cloud (for best Armenian)
@@ -197,16 +197,16 @@ Unifies all transcription backends as first-class card choices in a single view:
 
 ## Auto-start on Login
 
-**Windows** — run once:
+**Windows** - run once:
 ```powershell
 powershell -ExecutionPolicy Bypass -File setup_autostart.ps1
 ```
 
-**macOS** — add the app to `System Settings → General → Login Items`.
+**macOS** - add the app to `System Settings → General → Login Items`.
 
 ---
 
-## For Developers — Run from Source
+## For Developers - Run from Source
 
 ### Requirements
 - Python 3.9+
@@ -264,7 +264,7 @@ GitHub Actions builds `TranscribeApp-Windows.zip` and `TranscribeApp-Mac.dmg` an
 - [x] System tray, settings panel, history log
 - [x] Custom vocabulary / prompt
 - [x] macOS support
-- [x] GitHub Actions CI — auto-builds .exe and .dmg on tag
+- [x] GitHub Actions CI - auto-builds .exe and .dmg on tag
 - [ ] One-click `.dmg` installer (macOS)
 - [ ] Configurable silence detection (auto-stop)
 - [ ] Export history to CSV / TXT

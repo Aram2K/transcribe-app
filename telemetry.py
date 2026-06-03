@@ -56,7 +56,7 @@ ALLOWED_EVENTS = {
     "update_check_result",
     "update_install_started",
     "update_install_result",
-    # Meeting feature (previously dropped — these names weren't allow-listed, so
+    # Meeting feature (previously dropped - these names weren't allow-listed, so
     # we had zero data on meeting usage).
     "meeting_recording_started",
     "meeting_recording_failed",

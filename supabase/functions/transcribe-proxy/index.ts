@@ -1,4 +1,4 @@
-// Managed cloud transcription proxy — the Pro moat.
+// Managed cloud transcription proxy - the Pro moat.
 //
 // Flow: verify the caller's Supabase JWT → confirm is_pro() server-side (paid
 // or trial) → enforce a daily quota → call Google Speech-to-Text with the

@@ -9,13 +9,13 @@ QWidget {
     font-size: 13px;
 }
 
-/* Main Window and Dialogs — soft gradient backdrop gives the glass panels depth */
+/* Main Window and Dialogs - soft gradient backdrop gives the glass panels depth */
 QMainWindow, QDialog {
     background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
         stop:0 #eaf0f8, stop:0.5 #f4f7fb, stop:1 #e7eef7);
 }
 
-/* Card / Group Panel Frames — frosted "liquid glass": translucent gradient fill
+/* Card / Group Panel Frames - frosted "liquid glass": translucent gradient fill
    with a subtle highlight border so panels read as layered glass. */
 QFrame#cardFrame {
     background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
@@ -42,7 +42,7 @@ QFrame#overlayCard {
     border: 1px solid rgba(255, 255, 255, 210);
     border-radius: 20px;
 }
-/* Pro account card — warm frosted glass with a faint gold edge */
+/* Pro account card - warm frosted glass with a faint gold edge */
 QFrame#glassCard {
     background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
         stop:0 rgba(255, 251, 235, 230), stop:1 rgba(254, 243, 199, 170));
@@ -205,7 +205,7 @@ QComboBox QAbstractItemView::item:hover {
     color: #0f172a;
 }
 
-/* Scroll areas — visible scrollbars for long settings panels */
+/* Scroll areas - visible scrollbars for long settings panels */
 QScrollArea {
     background: transparent;
     border: none;
@@ -352,7 +352,7 @@ QCheckBox::indicator:disabled {
 }
 
 /* ── Tier pills ───────────────────────────────────────────────────────────── */
-/* PRO — purple glass pill. */
+/* PRO - purple glass pill. */
 QLabel#proBadge {
     background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
         stop:0 rgba(168, 85, 247, 235), stop:1 rgba(126, 34, 206, 235));
@@ -363,7 +363,7 @@ QLabel#proBadge {
     font-weight: bold;
     padding: 2px 10px;
 }
-/* FREE — green pill. */
+/* FREE - green pill. */
 QLabel#freeBadge {
     background-color: rgba(34, 197, 94, 45);
     color: #15803d;
@@ -373,7 +373,7 @@ QLabel#freeBadge {
     font-weight: bold;
     padding: 2px 10px;
 }
-/* GUEST — neutral gray pill. */
+/* GUEST - neutral gray pill. */
 QLabel#guestBadge {
     background-color: rgba(148, 163, 184, 45);
     color: #475569;

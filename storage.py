@@ -80,7 +80,7 @@ def append_jsonl(path, record):
 
 def read_jsonl(path):
     """Read a JSONL file produced by `append_jsonl` into a list. Skips
-    malformed lines rather than failing — chunk recovery should be robust
+    malformed lines rather than failing - chunk recovery should be robust
     even if the last write was partial."""
     out = []
     p = Path(path)

@@ -17,7 +17,7 @@ class Overlay(QWidget):
 
     # Cross-thread invoker: emit to dispatch a callable onto the Qt main thread.
     # QueuedConnection guarantees the slot runs on this QObject's owning thread
-    # regardless of which thread emits — so worker threads (audio recorder,
+    # regardless of which thread emits - so worker threads (audio recorder,
     # transcription thread) can safely update UI state.
     _invoke = Signal(object)
 
@@ -102,7 +102,7 @@ class Overlay(QWidget):
         self._hide_at = time.time() + 4.0
 
     def call_soon(self, func, *args, **kwargs):
-        # Marshal onto Qt main thread via Signal — works reliably from any
+        # Marshal onto Qt main thread via Signal - works reliably from any
         # thread. (QTimer.singleShot from a non-Qt thread is documented
         # thread-unsafe and was silently dropping calls.)
         self._invoke.emit(lambda: func(*args, **kwargs))
@@ -302,7 +302,7 @@ class Overlay(QWidget):
             # Pick a contextual hint based on the kind of error message.
             low = self._done_msg.lower()
             if "model.bin" in low or "model" in low and "open" in low:
-                hint = "Whisper cache issue — restart app or redownload model"
+                hint = "Whisper cache issue - restart app or redownload model"
             elif "api" in low or "key" in low or "auth" in low or "401" in low or "403" in low:
                 hint = "Check Settings → API key"
             elif "microphone" in low or "input" in low or "audio" in low:

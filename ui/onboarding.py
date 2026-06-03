@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QCheckBox, QStackedWidget, QWidget, QLineEdit, QMessageBox, QFrame
 )
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtGui import QFont, QColor, QIcon
 import local_llm
 
 class Onboarding(QDialog):
@@ -108,7 +108,7 @@ class Onboarding(QDialog):
         cl.setContentsMargins(22, 20, 22, 20)
         cl.setSpacing(11)
 
-        # Segmented toggle — Sign in | Sign up
+        # Segmented toggle - Sign in | Sign up
         seg = QHBoxLayout()
         seg.setSpacing(6)
         self._tab_signin = QPushButton("Sign in", card)
@@ -143,9 +143,14 @@ class Onboarding(QDialog):
         self._password_input.setMinimumHeight(38)
         self._password_input.returnPressed.connect(self._submit_email_auth)
         pw_row.addWidget(self._password_input)
-        self._show_pw_btn = QPushButton("👁", card)
+        self._show_pw_btn = QPushButton(card)
         self._show_pw_btn.setFixedSize(40, 38)
-        self._show_pw_btn.setToolTip("Show / hide password")
+        self._show_pw_btn.setIcon(QIcon(self._asset("eye.svg")))
+        self._show_pw_btn.setToolTip("Show password")
+        self._show_pw_btn.setCursor(Qt.PointingHandCursor)
+        self._show_pw_btn.setStyleSheet(
+            "border: 1px solid #cbd5e1; border-radius: 8px; background: #ffffff;"
+        )
         self._show_pw_btn.clicked.connect(self._toggle_password_visibility)
         pw_row.addWidget(self._show_pw_btn)
         cl.addLayout(pw_row)
@@ -200,7 +205,7 @@ class Onboarding(QDialog):
         lay.addWidget(self.btn_guest, alignment=Qt.AlignCenter)
 
         guest_note = QLabel(
-            "Guest mode: 10 minutes of free recording, all models — no account needed.",
+            "Guest mode: 10 minutes of free recording, all models - no account needed.",
             self.page_account,
         )
         guest_note.setObjectName("subtitleLabel")
@@ -228,13 +233,26 @@ class Onboarding(QDialog):
         self._msg_label.setVisible(False)
         self._resend_btn.setVisible(False)
 
+    @staticmethod
+    def _asset(name):
+        try:
+            from main import resource_path
+            return resource_path("assets", name)
+        except Exception:
+            import os
+            return os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", name
+            )
+
     def _toggle_password_visibility(self):
         if self._password_input.echoMode() == QLineEdit.Password:
             self._password_input.setEchoMode(QLineEdit.Normal)
-            self._show_pw_btn.setText("🙈")
+            self._show_pw_btn.setIcon(QIcon(self._asset("eye-off.svg")))
+            self._show_pw_btn.setToolTip("Hide password")
         else:
             self._password_input.setEchoMode(QLineEdit.Password)
-            self._show_pw_btn.setText("👁")
+            self._show_pw_btn.setIcon(QIcon(self._asset("eye.svg")))
+            self._show_pw_btn.setToolTip("Show password")
 
     def _show_msg(self, text, error=False):
         self._msg_label.setText(text)
@@ -304,7 +322,7 @@ class Onboarding(QDialog):
         auth = getattr(self.app, "auth", None)
         if email and auth:
             threading.Thread(target=lambda: auth.resend_verification(email), daemon=True).start()
-            self._show_msg("Verification email resent — check your inbox.", error=False)
+            self._show_msg("Verification email resent - check your inbox.", error=False)
 
     def _forgot_password(self):
         email = self._email_input.text().strip()
@@ -634,14 +652,14 @@ class Onboarding(QDialog):
         else:
             return # ignore weird keys
 
-        # Modifier-less binding is only safe for Function keys (F1–F12); a bare
+        # Modifier-less binding is only safe for Function keys (F1-F12); a bare
         # typing/navigation key would fire during normal use.
         is_function_key = len(key_str) >= 2 and key_str[0] == "f" and key_str[1:].isdigit()
         if not mods and not is_function_key:
             QMessageBox.warning(
                 self, "Modifier Required",
                 "Use at least one modifier (Ctrl, Alt, Shift, or Win), a Function "
-                "key (F1–F12), or a mouse button.\n\nA single typing key can't be a "
+                "key (F1-F12), or a mouse button.\n\nA single typing key can't be a "
                 "hotkey because it would trigger while you type."
             )
             return
@@ -677,7 +695,7 @@ class Onboarding(QDialog):
 
     def _update_nav(self):
         # Page 0 is the account gate (its own buttons drive the flow); pages
-        # 1–3 are the 3-step setup wizard with the Back/Next bar.
+        # 1-3 are the 3-step setup wizard with the Back/Next bar.
         p = self.current_page
         if p == 0:
             self.step_label.setText("WELCOME")
