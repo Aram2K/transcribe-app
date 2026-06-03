@@ -401,6 +401,24 @@ class Settings(QDialog):
         
         layout.addWidget(dev_frame)
 
+        # Managed Cloud (Pro) dictation backend
+        cloud_frame = QFrame(tab)
+        cloud_frame.setObjectName("cardFrame")
+        cf_lay = QVBoxLayout(cloud_frame)
+        cf_lay.setContentsMargins(18, 14, 18, 14)
+        self.chk_managed = QCheckBox("⚡ Managed Cloud transcription (Pro) — fast & accurate, no API key", cloud_frame)
+        self.chk_managed.setChecked(self.cfg_working.get("backend") == "managed")
+        self.chk_managed.stateChanged.connect(self._on_managed_toggled)
+        cf_lay.addWidget(self.chk_managed)
+        cloud_desc = QLabel(
+            "Transcribe on our servers using your Pro plan — no local model or API key needed.",
+            cloud_frame,
+        )
+        cloud_desc.setObjectName("subtitleLabel")
+        cloud_desc.setWordWrap(True)
+        cf_lay.addWidget(cloud_desc)
+        layout.addWidget(cloud_frame)
+
         # Privacy mode checkbox
         self.chk_privacy = QCheckBox("Privacy Mode (Disable local history, force offline local models)", tab)
         if self.app:
@@ -426,6 +444,20 @@ class Settings(QDialog):
             self.combo_device.setCurrentIndex(idx)
         else:
             self.combo_device.setCurrentIndex(0)
+
+    def _on_managed_toggled(self, _state):
+        # Managed cloud is Pro-only. Non-Pro toggling on → revert + upsell.
+        if self.chk_managed.isChecked():
+            if not self._is_pro():
+                self.chk_managed.blockSignals(True)
+                self.chk_managed.setChecked(False)
+                self.chk_managed.blockSignals(False)
+                if self.app and hasattr(self.app, "_pro_upsell"):
+                    self.app._pro_upsell("Managed cloud transcription")
+                return
+            self.cfg_working["backend"] = "managed"
+        elif self.cfg_working.get("backend") == "managed":
+            self.cfg_working["backend"] = "local"
 
     def _launch_smart_meeting(self):
         # Meeting recording is Pro-only — prompt to upgrade instead of launching.

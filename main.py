@@ -40,6 +40,9 @@ import entitlements
 # ── Version ───────────────────────────────────────────────────────────────────
 APP_VERSION = "1.5.48"
 
+# ── Managed cloud transcription (Pro moat) ────────────────────────────────────
+MANAGED_PROXY_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-proxy"
+
 # ── Monetization links (Stripe) ───────────────────────────────────────────────
 PRO_MONTHLY_URL = "https://buy.stripe.com/3cI5kC30N1oeari7rh0Ba00"
 PRO_ANNUAL_URL  = "https://buy.stripe.com/fZuaEW0SF4Aq1UMh1R0Ba01"
@@ -418,6 +421,9 @@ class AudioRecorder:
         self.on_chunk_complete = lambda idx, text, lang: None
         self.on_lang_detected = lambda code, name: None
         self.on_partial       = lambda text: None
+        # Returns the signed-in user's Supabase access token (set by AppController);
+        # used by the managed cloud backend to authenticate to the proxy.
+        self.get_auth_token   = None
         
         self._chunk_frames    = []
         self._chunk_results   = {}
@@ -768,7 +774,9 @@ class AudioRecorder:
 
     def _transcribe_chunk(self, audio, idx):
         try:
-            if cfg["backend"] == "google" and cfg["google_api_key"]:
+            if cfg["backend"] == "managed":
+                text, lang = self._run_managed(audio)
+            elif cfg["backend"] == "google" and cfg["google_api_key"]:
                 text, lang = self._run_google(audio)
             elif cfg["backend"] == "mistral" and cfg.get("mistral_api_key"):
                 text, lang = self._run_mistral(audio)
@@ -869,24 +877,26 @@ class AudioRecorder:
         remaining = np.frombuffer(b"".join(self._chunk_frames), dtype=np.float32).copy()
         last_text, detected = "", ""
 
-        is_cloud = (cfg["backend"] == "google" and cfg["google_api_key"]) or (cfg["backend"] == "mistral" and cfg.get("mistral_api_key"))
+        is_cloud = (cfg["backend"] in ("managed", "google", "mistral"))
         min_samples = cfg["sample_rate"] // 4 if is_cloud else cfg["sample_rate"] // 2
 
-        # Smart Audio Padding: Pad short final audio snippets with silence (zeros) 
+        # Smart Audio Padding: Pad short final audio snippets with silence (zeros)
         # to satisfy the backend's minimum length requirement rather than discarding them.
         if 0 < len(remaining) < min_samples:
             padding_len = min_samples - len(remaining)
             remaining = np.concatenate([remaining, np.zeros(padding_len, dtype=np.float32)])
 
         if len(remaining) >= min_samples:
-            if cfg["backend"] == "google" and cfg["google_api_key"]:
+            if cfg["backend"] == "managed":
+                last_text, detected = self._run_managed(remaining)
+            elif cfg["backend"] == "google" and cfg["google_api_key"]:
                 last_text, detected = self._run_google(remaining)
             elif cfg["backend"] == "mistral" and cfg.get("mistral_api_key"):
                 last_text, detected = self._run_mistral(remaining)
             else:
                 last_text, detected = self._run_local(remaining)
 
-        if detected and (detected.startswith("!google:") or detected.startswith("!mistral:")):
+        if detected and (detected.startswith("!google:") or detected.startswith("!mistral:") or detected.startswith("!managed:")):
             return "", detected
 
         with self._chunk_lock:
@@ -990,6 +1000,48 @@ class AudioRecorder:
             return text, lang
         except Exception as e:
             return "", f"!google:{e}"
+
+    def _run_managed(self, audio):
+        """Pro managed cloud transcription. Sends audio + the user's access token
+        to our server proxy, which holds the real STT key. The key never touches
+        the client, so this can't be used without a valid Pro/trial account."""
+        try:
+            import requests
+            token = None
+            try:
+                if callable(self.get_auth_token):
+                    token = self.get_auth_token()
+            except Exception:
+                token = None
+            if not token:
+                return "", "!managed:Sign in to use managed cloud transcription."
+
+            wav_bytes = self._float_to_wav(audio)
+            raw_pcm = wav_bytes[44:]  # strip 44-byte WAV header → raw LINEAR16
+            b64_data = base64.b64encode(raw_pcm).decode("utf-8")
+
+            resp = requests.post(
+                MANAGED_PROXY_URL,
+                json={
+                    "audio": b64_data,
+                    "sample_rate": cfg["sample_rate"],
+                    "language": cfg["language"],
+                },
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=20,
+            )
+            if resp.status_code == 403:
+                return "", "!managed:Pro required for managed cloud transcription."
+            if resp.status_code == 429:
+                return "", "!managed:Daily cloud limit reached — try again tomorrow."
+            if resp.status_code == 401:
+                return "", "!managed:Session expired — sign in again."
+            if resp.status_code != 200:
+                return "", f"!managed:HTTP {resp.status_code}: {resp.text[:80]}"
+            data = resp.json()
+            return data.get("text", ""), data.get("lang", "en")
+        except Exception as e:
+            return "", f"!managed:{e}"
 
     def _run_mistral(self, audio):
         try:
@@ -1137,6 +1189,8 @@ class AppController(QObject):
         # threads; state changes are marshaled to the GUI thread via the
         # sig_auth_changed signal so tray/UI updates stay thread-safe.
         self.auth = auth.AuthManager(on_state_changed=self.sig_auth_changed.emit)
+        # Let the recorder fetch a fresh access token for managed cloud transcription.
+        self.recorder.get_auth_token = lambda: self.auth.get_access_token()
 
         # Initialize UI Dialog Windows (modularly split!)
         from ui.overlay import Overlay
