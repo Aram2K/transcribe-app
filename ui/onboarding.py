@@ -22,6 +22,7 @@ class Onboarding(QDialog):
             
         self.current_page = 0
         self.capturing = False
+        self.guest_mode = True  # default to guest until they choose to sign in
         
         # Onboarding State Config
         self.hotkey_val = self.app.cfg.get("hotkey", "alt+r") if self.app else "alt+r"
@@ -66,11 +67,83 @@ class Onboarding(QDialog):
         action_layout.addWidget(self.btn_back)
         action_layout.addStretch()
         action_layout.addWidget(self.btn_next)
-        
+
         self.main_layout.addLayout(action_layout)
+        self._update_nav()
+
+    def _create_account_page(self):
+        """First-run gate: sign in / sign up with Google, or continue as guest.
+        Keeping a low-friction guest path improves activation (see research),
+        while still capturing accounts for those ready to commit."""
+        self.page_account = QWidget()
+        lay = QVBoxLayout(self.page_account)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(14)
+
+        title = QLabel("Welcome to Transcribe", self.page_account)
+        title.setObjectName("titleLabel")
+        title.setAlignment(Qt.AlignCenter)
+        lay.addWidget(title)
+
+        sub = QLabel(
+            "Private, instant voice-to-text anywhere you type.\nChoose how you'd like to start.",
+            self.page_account,
+        )
+        sub.setObjectName("subtitleLabel")
+        sub.setAlignment(Qt.AlignCenter)
+        sub.setWordWrap(True)
+        lay.addWidget(sub)
+
+        card = QFrame(self.page_account)
+        card.setObjectName("glassCard")
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(20, 20, 20, 20)
+        cl.setSpacing(10)
+
+        head = QLabel("Create your free account", card)
+        head.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        cl.addWidget(head)
+
+        perks = QLabel(
+            "•  Unlimited local dictation\n"
+            "•  Your plan syncs across devices\n"
+            "•  Unlock Pro features anytime",
+            card,
+        )
+        perks.setObjectName("subtitleLabel")
+        cl.addWidget(perks)
+
+        self.btn_google = QPushButton("✦  Continue with Google", card)
+        self.btn_google.setObjectName("primaryButton")
+        self.btn_google.setMinimumHeight(42)
+        self.btn_google.clicked.connect(self._choose_google)
+        cl.addWidget(self.btn_google)
+        lay.addWidget(card)
+
+        self.btn_guest = QPushButton("Continue as guest  →", self.page_account)
+        self.btn_guest.setFlat(True)
+        self.btn_guest.setStyleSheet("color: #475569; border: none; font-weight: 600;")
+        self.btn_guest.clicked.connect(self._choose_guest)
+        lay.addWidget(self.btn_guest, alignment=Qt.AlignCenter)
+
+        guest_note = QLabel(
+            "Guest mode: 10 minutes of free recording, all models — no account needed.",
+            self.page_account,
+        )
+        guest_note.setObjectName("subtitleLabel")
+        guest_note.setAlignment(Qt.AlignCenter)
+        guest_note.setWordWrap(True)
+        guest_note.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        lay.addWidget(guest_note)
+
+        lay.addStretch()
+        self.stack.addWidget(self.page_account)
 
     def _create_pages(self):
-        # Page 0: Welcome & Hotkey setup
+        # Page 0: Account gate (sign in / continue as guest)
+        self._create_account_page()
+
+        # Page 1: Welcome & Hotkey setup
         self.page_welcome = QWidget()
         layout_wel = QVBoxLayout(self.page_welcome)
         layout_wel.setContentsMargins(0, 0, 0, 0)
@@ -414,25 +487,43 @@ class Onboarding(QDialog):
             card.style().unpolish(card)
             card.style().polish(card)
 
+    def _go_to(self, page):
+        self.current_page = page
+        self.stack.setCurrentIndex(page)
+        self._update_nav()
+
+    def _update_nav(self):
+        # Page 0 is the account gate (its own buttons drive the flow); pages
+        # 1–3 are the 3-step setup wizard with the Back/Next bar.
+        p = self.current_page
+        if p == 0:
+            self.step_label.setText("WELCOME")
+            self.btn_back.setVisible(False)
+            self.btn_next.setVisible(False)
+        else:
+            self.step_label.setText(f"STEP {p} OF 3")
+            self.btn_back.setVisible(True)
+            self.btn_next.setVisible(True)
+            self.btn_back.setEnabled(p > 1)
+            self.btn_next.setText("Get Started" if p == 3 else "Next")
+
+    def _choose_google(self):
+        self.guest_mode = False
+        if self.app and hasattr(self.app, "start_google_login"):
+            self.app.start_google_login()
+        self._go_to(1)
+
+    def _choose_guest(self):
+        self.guest_mode = True
+        self._go_to(1)
+
     def _back(self):
-        if self.current_page > 0:
-            self.current_page -= 1
-            self.stack.setCurrentIndex(self.current_page)
-            self.step_label.setText(f"STEP {self.current_page + 1} OF 3")
-            self.btn_next.setText("Next")
-            
-            if self.current_page == 0:
-                self.btn_back.setEnabled(False)
+        if self.current_page > 1:
+            self._go_to(self.current_page - 1)
 
     def _next(self):
-        if self.current_page < 2:
-            self.current_page += 1
-            self.stack.setCurrentIndex(self.current_page)
-            self.step_label.setText(f"STEP {self.current_page + 1} OF 3")
-            self.btn_back.setEnabled(True)
-            
-            if self.current_page == 2:
-                self.btn_next.setText("Get Started")
+        if self.current_page < 3:
+            self._go_to(self.current_page + 1)
         else:
             self._save_onboarding()
 

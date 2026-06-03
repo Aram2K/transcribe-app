@@ -35,6 +35,7 @@ import action_api
 import local_llm
 import telemetry
 import auth
+import entitlements
 
 # ── Version ───────────────────────────────────────────────────────────────────
 APP_VERSION = "1.5.48"
@@ -1132,6 +1133,7 @@ class AppController(QObject):
         from pynput.keyboard import Controller
         self.kbd = Controller()
         self.is_rec = False
+        self._rec_started_at = None  # wall-clock start of the current dictation
         self._mouse_listener = None
         self._kbd_listener = None
         self._registered_kbd_hotkey = None
@@ -1237,7 +1239,11 @@ class AppController(QObject):
             signout.triggered.connect(lambda: self.sign_out())
             menu.addAction(signout)
         else:
-            signin = QAction("Sign in with Google…", self)
+            mins = entitlements.guest_minutes_remaining()
+            guest_lbl = QAction(f"Guest · ~{mins} min free recording left", self)
+            guest_lbl.setEnabled(False)
+            menu.addAction(guest_lbl)
+            signin = QAction("Sign in with Google (free)…", self)
             signin.triggered.connect(lambda: self.start_google_login())
             menu.addAction(signin)
 
@@ -1351,6 +1357,38 @@ class AppController(QObject):
             return f"{base}{sep}{urlencode(params)}"
         except Exception:
             return base
+
+    def _account_recording_time(self):
+        """Add the just-finished recording's duration to the guest meter. Only
+        guests are metered; free/pro have unlimited local dictation."""
+        started = self._rec_started_at
+        self._rec_started_at = None
+        if started is None:
+            return
+        elapsed = max(0.0, time.time() - started)
+        if entitlements.tier(self.auth) == entitlements.TIER_GUEST:
+            entitlements.add_guest_seconds(elapsed)
+            self.sig_auth_changed.emit()  # refresh tray remaining-time line
+
+    def _guest_limit_reached(self):
+        box = QMessageBox()
+        box.setWindowTitle("Free trial used up")
+        box.setText(
+            "You've used your 10 free guest minutes.\n\n"
+            "Create a free account to keep dictating — it's unlimited, and you "
+            "can upgrade to Pro anytime."
+        )
+        signin = box.addButton("Sign in with Google (free)", QMessageBox.AcceptRole)
+        box.addButton("Not now", QMessageBox.RejectRole)
+        if hasattr(self, "style_content"):
+            box.setStyleSheet(self.style_content)
+        box.exec()
+        if box.clickedButton() == signin:
+            self.start_google_login()
+        try:
+            telemetry.track("guest_trial_exhausted", {}, self.cfg, APP_VERSION)
+        except Exception:
+            pass
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:
@@ -1648,8 +1686,13 @@ class AppController(QObject):
     def _start(self):
         if self.is_rec:
             return
+        # Guests get a 10-minute free recording trial; block once it's spent.
+        if not entitlements.can_record(self.auth):
+            self._guest_limit_reached()
+            return
         try:
             self.is_rec = True
+            self._rec_started_at = time.time()
             self.overlay.set_partial("")
             from ui.overlay import RECORDING
             self.overlay.show_overlay(RECORDING)
@@ -1683,6 +1726,7 @@ class AppController(QObject):
     def _cancel(self):
         self.recorder.stop_recording()
         self.is_rec = False
+        self._account_recording_time()
         self._unregister_transient_keys()
         self.overlay.call_soon(self.overlay.hide_overlay)
 
@@ -1744,6 +1788,7 @@ class AppController(QObject):
         t.join(timeout=TRANSCRIBE_TIMEOUT_SEC)
 
         self.is_rec = False
+        self._account_recording_time()
 
         if t.is_alive():
             telemetry.track(

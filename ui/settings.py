@@ -2128,10 +2128,18 @@ class Settings(QDialog):
                     "Plan: Free — upgrade to unlock Meetings, Smart Actions, and fast cloud transcription."
                 )
         else:
-            self._acct_status_label.setText("Not signed in")
-            self._acct_plan_label.setText(
-                "Sign in with Google to manage your subscription and unlock Pro."
-            )
+            self._acct_status_label.setText("Not signed in  ·  Guest")
+            try:
+                import entitlements
+                mins = entitlements.guest_minutes_remaining()
+                self._acct_plan_label.setText(
+                    f"Guest trial: ~{mins} min of free recording left. "
+                    "Sign in with Google for unlimited dictation."
+                )
+            except Exception:
+                self._acct_plan_label.setText(
+                    "Sign in with Google to manage your subscription and unlock Pro."
+                )
 
         self._acct_signin_btn.setVisible(not authed)
         self._acct_upgrade_btn.setVisible(authed and not is_pro)

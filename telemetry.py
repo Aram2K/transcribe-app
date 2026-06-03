@@ -65,6 +65,7 @@ ALLOWED_EVENTS = {
     "paywall_viewed",
     "upgrade_clicked",
     "checkout_opened",
+    "guest_trial_exhausted",
     "login_succeeded",
     "login_failed",
     "signed_out",
