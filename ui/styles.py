@@ -9,20 +9,23 @@ QWidget {
     font-size: 13px;
 }
 
-/* Main Window and Dialogs */
+/* Main Window and Dialogs — soft gradient backdrop gives the glass panels depth */
 QMainWindow, QDialog {
-    background-color: #f1f5f9;
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #eaf0f8, stop:0.5 #f4f7fb, stop:1 #e7eef7);
 }
 
-/* Card / Group Panel Frames */
+/* Card / Group Panel Frames — frosted "liquid glass": translucent gradient fill
+   with a subtle highlight border so panels read as layered glass. */
 QFrame#cardFrame {
-    background-color: #ffffff;
-    border: 1px solid #e2e8f0;
-    border-radius: 12px;
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(255, 255, 255, 230), stop:1 rgba(241, 245, 249, 195));
+    border: 1px solid rgba(203, 213, 225, 140);
+    border-radius: 16px;
 }
 QFrame#cardFrame:disabled {
-    background-color: #f8fafc;
-    border-color: #cbd5e1;
+    background-color: rgba(248, 250, 252, 160);
+    border-color: rgba(203, 213, 225, 110);
 }
 QFrame#activeCardFrame {
     background-color: #ffffff;
@@ -34,8 +37,16 @@ QFrame#activeCardFrame:disabled {
     border-color: #cbd5e1;
 }
 QFrame#overlayCard {
-    background-color: rgba(255, 255, 255, 240);
-    border: 1px solid rgba(59, 130, 246, 120);
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(255, 255, 255, 225), stop:1 rgba(248, 250, 252, 195));
+    border: 1px solid rgba(255, 255, 255, 210);
+    border-radius: 20px;
+}
+/* Pro account card — warm frosted glass with a faint gold edge */
+QFrame#glassCard {
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(255, 251, 235, 230), stop:1 rgba(254, 243, 199, 170));
+    border: 1px solid rgba(245, 158, 11, 90);
     border-radius: 16px;
 }
 
@@ -343,5 +354,28 @@ QCheckBox::indicator:checked:hover {
 QCheckBox::indicator:disabled {
     background-color: #f1f5f9;
     border-color: #e2e8f0;
+}
+
+/* ── Pro / glass accents ─────────────────────────────────────────────────── */
+/* Glassy gold PRO pill for the account panel / headers. */
+QLabel#proBadge {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 rgba(245, 158, 11, 235), stop:1 rgba(217, 119, 6, 235));
+    color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 150);
+    border-radius: 9px;
+    font-size: 11px;
+    font-weight: bold;
+    padding: 2px 10px;
+}
+/* Neutral pill for the Free state. */
+QLabel#freeBadge {
+    background-color: rgba(148, 163, 184, 45);
+    color: #475569;
+    border: 1px solid rgba(148, 163, 184, 90);
+    border-radius: 9px;
+    font-size: 11px;
+    font-weight: bold;
+    padding: 2px 10px;
 }
 """

@@ -1902,10 +1902,24 @@ class Settings(QDialog):
         from PySide6.QtGui import QPixmap
 
         lbl_aibuben_logo = QLabel(aibuben_frame)
-        logo_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "aibuben_logo.png")
+        # Resolve the asset in a PyInstaller-safe way: bundled builds put assets
+        # under sys._MEIPASS, while running from source uses the repo path. Using
+        # the same resource_path() helper as main.py means the logo renders in the
+        # packaged app instead of falling back to text.
+        try:
+            from main import resource_path
+            logo_path = resource_path("assets", "aibuben_logo.png")
+        except Exception:
+            logo_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "assets", "aibuben_logo.png",
+            )
         pixmap = QPixmap(logo_path)
         if not pixmap.isNull():
-            lbl_aibuben_logo.setPixmap(pixmap.scaledToHeight(55, Qt.SmoothTransformation))
+            # Bound to a tidy box, preserving the wordmark's aspect ratio.
+            lbl_aibuben_logo.setPixmap(
+                pixmap.scaled(280, 80, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
         else:
             lbl_aibuben_logo.setText("Powered by AIBUBEN")
             lbl_aibuben_logo.setStyleSheet("font-size: 14px; font-weight: bold; color: #3b82f6;")

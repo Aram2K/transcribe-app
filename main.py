@@ -34,9 +34,17 @@ import actions
 import action_api
 import local_llm
 import telemetry
+import auth
 
 # ── Version ───────────────────────────────────────────────────────────────────
 APP_VERSION = "1.5.47"
+
+# ── Monetization links (Stripe) ───────────────────────────────────────────────
+PRO_MONTHLY_URL = "https://buy.stripe.com/3cI5kC30N1oeari7rh0Ba00"
+PRO_ANNUAL_URL  = "https://buy.stripe.com/fZuaEW0SF4Aq1UMh1R0Ba01"
+# Set this to your Stripe Customer Portal link (Billing → Customer portal) so Pro
+# users can self-manage their subscription. Left blank until configured.
+STRIPE_PORTAL_URL = ""
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
@@ -1102,6 +1110,7 @@ class AppController(QObject):
     sig_enter = Signal()
     sig_escape = Signal()
     sig_update_available = Signal(str)  # tag of newer version
+    sig_auth_changed = Signal()         # auth/entitlement state changed (from worker threads)
 
     def __init__(self, qapp):
         super().__init__()
@@ -1127,7 +1136,12 @@ class AppController(QObject):
         self._kbd_listener = None
         self._registered_kbd_hotkey = None
         self._transient_kbd_handles = []
-        
+
+        # Auth + Pro entitlement (Supabase). All network calls run on worker
+        # threads; state changes are marshaled to the GUI thread via the
+        # sig_auth_changed signal so tray/UI updates stay thread-safe.
+        self.auth = auth.AuthManager(on_state_changed=self.sig_auth_changed.emit)
+
         # Initialize UI Dialog Windows (modularly split!)
         from ui.overlay import Overlay
         from ui.settings import Settings
@@ -1148,6 +1162,7 @@ class AppController(QObject):
         self.sig_enter.connect(self._on_enter, Qt.QueuedConnection)
         self.sig_escape.connect(self._on_escape, Qt.QueuedConnection)
         self.sig_update_available.connect(self._prompt_update, Qt.QueuedConnection)
+        self.sig_auth_changed.connect(self._on_auth_changed, Qt.QueuedConnection)
         self._update_prompt_open = False
 
         # Register the configured hotkey (keyboard combo or mouse button).
@@ -1155,7 +1170,10 @@ class AppController(QObject):
 
         # Setup System Tray
         self._setup_tray()
-        
+
+        # Restore any saved login + Pro entitlement in the background.
+        threading.Thread(target=self.auth.load_session, daemon=True).start()
+
         # Check updates in background
         threading.Thread(target=self._background_check_updates, daemon=True).start()
         
@@ -1184,38 +1202,155 @@ class AppController(QObject):
     def _setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
         self.update_tray_icon()
-        
-        # Tray Right-Click Menu
+        self._build_tray_menu()
+        self.tray_icon.show()
+
+        # Single click tray icon wakes settings window
+        self.tray_icon.activated.connect(self._on_tray_activated)
+
+    def _build_tray_menu(self):
+        """(Re)build the tray context menu. Called again on auth changes so the
+        Pro badge + account section stay current."""
+        is_pro = self.is_pro()
         menu = QMenu()
-        
-        action_title = QAction(f"Transcribe  v{APP_VERSION}", self)
+
+        title_text = f"Transcribe  v{APP_VERSION}" + ("    ✦ PRO" if is_pro else "")
+        action_title = QAction(title_text, self)
         action_title.setEnabled(False)
         menu.addAction(action_title)
+
+        # ── Account section ──
+        if self.auth.is_authenticated:
+            who = self.auth.user_email or "Account"
+            acct = QAction(f"{who}  ·  {'Pro' if is_pro else 'Free'}", self)
+            acct.setEnabled(False)
+            menu.addAction(acct)
+            if is_pro:
+                manage = QAction("Manage subscription…", self)
+                manage.triggered.connect(lambda: self.open_billing())
+                menu.addAction(manage)
+            else:
+                upgrade = QAction("✦ Upgrade to Pro…", self)
+                upgrade.triggered.connect(lambda: self._pro_upsell())
+                menu.addAction(upgrade)
+            signout = QAction("Sign out", self)
+            signout.triggered.connect(lambda: self.sign_out())
+            menu.addAction(signout)
+        else:
+            signin = QAction("Sign in with Google…", self)
+            signin.triggered.connect(lambda: self.start_google_login())
+            menu.addAction(signin)
+
         menu.addSeparator()
 
-        action_rec_meet = QAction("Record Meeting...", self)
+        action_rec_meet = QAction("Record Meeting..." + ("" if is_pro else "  🔒"), self)
         action_rec_meet.triggered.connect(self.show_meeting)
         menu.addAction(action_rec_meet)
-        
+
         action_settings = QAction("Settings", self)
         action_settings.triggered.connect(self.show_settings)
         menu.addAction(action_settings)
-        
+
         action_history = QAction("History Log", self)
         action_history.triggered.connect(self.show_history)
         menu.addAction(action_history)
-        
+
         menu.addSeparator()
-        
+
         action_quit = QAction("Quit", self)
         action_quit.triggered.connect(self.quit_app)
         menu.addAction(action_quit)
-        
+
+        self._tray_menu = menu  # keep a reference so Qt doesn't GC it
         self.tray_icon.setContextMenu(menu)
-        self.tray_icon.show()
-        
-        # Single click tray icon wakes settings window
-        self.tray_icon.activated.connect(self._on_tray_activated)
+
+        tip = "Transcribe — Pro" if is_pro else "Transcribe"
+        if self.auth.is_authenticated and self.auth.user_email:
+            tip += f"\n{self.auth.user_email}"
+        self.tray_icon.setToolTip(tip)
+
+    # ── Auth / Pro helpers ────────────────────────────────────────────────────
+    def is_pro(self):
+        return bool(getattr(self, "auth", None) and self.auth.is_pro)
+
+    def _on_auth_changed(self):
+        # Runs on the GUI thread (QueuedConnection). Refresh tray + any open UI.
+        try:
+            self._build_tray_menu()
+        except Exception:
+            logger.debug("tray rebuild failed", exc_info=True)
+        sw = getattr(self, "settings_win", None)
+        if sw is not None and hasattr(sw, "refresh_pro_state"):
+            try:
+                sw.refresh_pro_state()
+            except Exception:
+                pass
+
+    def start_google_login(self):
+        def _run():
+            try:
+                self.auth.sign_in_with_google()
+            except Exception:
+                logger.debug("google login failed", exc_info=True)
+        threading.Thread(target=_run, daemon=True).start()
+        self.show_tray_hint("Sign in", "Opening your browser to sign in with Google…")
+
+    def sign_out(self):
+        threading.Thread(target=self.auth.sign_out, daemon=True).start()
+
+    def open_billing(self):
+        if STRIPE_PORTAL_URL:
+            webbrowser.open(STRIPE_PORTAL_URL)
+        else:
+            self.show_tray_hint(
+                "Manage subscription",
+                "Use the 'Manage subscription' link in your Stripe receipt email "
+                "(Customer Portal not configured yet)."
+            )
+
+    def _pro_upsell(self, feature=None):
+        box = QMessageBox()
+        box.setWindowTitle("Transcribe Pro")
+        feat = f"{feature} is a Pro feature.\n\n" if feature else ""
+        box.setText(
+            feat +
+            "Upgrade to Transcribe Pro to unlock Meetings, Smart Actions, and "
+            "fast managed cloud transcription — no API key or setup."
+        )
+        signin_btn = None
+        if not self.auth.is_authenticated:
+            box.setInformativeText("First sign in with Google, then choose a plan.")
+            signin_btn = box.addButton("Sign in with Google", QMessageBox.AcceptRole)
+        monthly_btn = box.addButton("Go Pro — €7.99/mo", QMessageBox.ActionRole)
+        annual_btn = box.addButton("Go Pro — €59/yr", QMessageBox.ActionRole)
+        box.addButton("Maybe later", QMessageBox.RejectRole)
+        if hasattr(self, "style_content"):
+            box.setStyleSheet(self.style_content)
+        box.exec()
+        clicked = box.clickedButton()
+        if signin_btn is not None and clicked == signin_btn:
+            self.start_google_login()
+        elif clicked == monthly_btn:
+            webbrowser.open(self._checkout_url(PRO_MONTHLY_URL))
+        elif clicked == annual_btn:
+            webbrowser.open(self._checkout_url(PRO_ANNUAL_URL))
+
+    def _checkout_url(self, base):
+        """Append the signed-in user's id (+ email) to a Stripe payment link so
+        the webhook can link the resulting subscription to the right account."""
+        try:
+            uid = getattr(self.auth, "user_id", None)
+            if not uid:
+                return base
+            from urllib.parse import urlencode
+            params = {"client_reference_id": uid}
+            email = getattr(self.auth, "user_email", None)
+            if email:
+                params["prefilled_email"] = email
+            sep = "&" if "?" in base else "?"
+            return f"{base}{sep}{urlencode(params)}"
+        except Exception:
+            return base
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:
@@ -1314,6 +1449,10 @@ class AppController(QObject):
         self.history_win.activateWindow()
 
     def show_meeting(self):
+        # Meeting recording + AI notes are Pro-only.
+        if not self.is_pro():
+            self._pro_upsell("Meeting recording")
+            return
         self.meetings_win.show()
         self.meetings_win.raise_()
         self.meetings_win.activateWindow()
@@ -1637,7 +1776,17 @@ class AppController(QObject):
 
         action_mode = actions.normalize_action_mode(self.cfg.get("output_action"))
         output_text = text
-        
+
+        # Smart Actions are Pro-only. Free users still get their raw transcription
+        # pasted — we just skip the AI action and nudge them once.
+        if action_mode != actions.ACTION_TRANSCRIBE_ONLY and not self.is_pro():
+            action_mode = actions.ACTION_TRANSCRIBE_ONLY
+            self.overlay.call_soon(
+                self.show_tray_hint,
+                "Smart Actions are Pro",
+                "Pasted your raw transcription. Upgrade to Transcribe Pro to run AI actions.",
+            )
+
         if action_mode != actions.ACTION_TRANSCRIBE_ONLY:
             try:
                 output_text = actions.process(
