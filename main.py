@@ -15,6 +15,7 @@ import logging
 import hashlib
 import datetime
 import shutil
+import base64
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -1169,7 +1170,12 @@ class AppController(QObject):
         # builds and autostart can launch from an arbitrary CWD).
         from ui.styles import STYLESHEET
         _check_svg = resource_path("assets", "check.svg").replace("\\", "/")
-        self.style_content = STYLESHEET.replace('url("assets/check.svg")', f'url("{_check_svg}")')
+        _chevron_svg = resource_path("assets", "chevron.svg").replace("\\", "/")
+        self.style_content = (
+            STYLESHEET
+            .replace('url("assets/check.svg")', f'url("{_check_svg}")')
+            .replace('url("assets/chevron.svg")', f'url("{_chevron_svg}")')
+        )
 
         # Setup pure business Audio Recorder
         self.recorder = AudioRecorder()

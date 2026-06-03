@@ -120,6 +120,7 @@ class AuthManager:
         self.plan = None              # 'monthly' | 'annual' | None
         self.period_end = None        # ISO string or None
         self.cancel_at_period_end = False
+        self.trial_available = False   # true if the one-time trial was never started
 
     # ── public state helpers ─────────────────────────────────────────────────
     @property
@@ -401,18 +402,39 @@ class AuthManager:
                 row.get("plan"),
                 row.get("current_period_end"),
                 bool(row.get("cancel_at_period_end")),
+                bool(row.get("trial_available", False)),
             )
         else:
-            self._set_entitlement(False, None, None, False)
+            self._set_entitlement(False, None, None, False, False)
         self._notify()
         return True
 
-    def _set_entitlement(self, is_pro, plan, period_end, cancel_at_period_end):
+    def start_trial(self):
+        """Explicitly start the one-time 3-day Pro trial. Returns True if Pro is
+        active afterward. Server-enforced: calling again never resets it."""
+        token = self.get_access_token()
+        if not token:
+            return False
+        try:
+            requests.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/start_pro_trial",
+                headers=self._headers(with_auth=True),
+                json={},
+                timeout=_HTTP_TIMEOUT,
+            )
+        except requests.RequestException as e:
+            logger.warning("start_trial failed: %s", e)
+            return False
+        self.refresh_entitlement()
+        return self.is_pro
+
+    def _set_entitlement(self, is_pro, plan, period_end, cancel_at_period_end, trial_available=False):
         with self._lock:
             self.is_pro = is_pro
             self.plan = plan
             self.period_end = period_end
             self.cancel_at_period_end = cancel_at_period_end
+            self.trial_available = trial_available
 
     # ── sign out ─────────────────────────────────────────────────────────────
     def sign_out(self):
@@ -443,6 +465,7 @@ class AuthManager:
             self.plan = None
             self.period_end = None
             self.cancel_at_period_end = False
+            self.trial_available = False
         try:
             storage.write_secret(REFRESH_TOKEN_SECRET, "")  # delete from keyring
         except Exception:

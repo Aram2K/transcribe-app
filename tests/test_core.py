@@ -651,11 +651,15 @@ class TestSettingsValidation(unittest.TestCase):
         dialog.accept = MagicMock()
         dialog.app = MagicMock()
         dialog.app.cfg = {}
-        
+
         Settings._on_save_clicked(dialog)
-        
+
+        # Save persists config and confirms with a toast — but does NOT close the
+        # window (Save no longer dismisses Settings).
         dialog._sync_action_settings_from_widgets.assert_called_once()
-        dialog.accept.assert_called_once()
+        dialog.app.save_config.assert_called_once()
+        dialog._show_saved_toast.assert_called_once()
+        dialog.accept.assert_not_called()
         dialog.tabs.setCurrentIndex.assert_not_called()
 
     def test_save_clicked_invalid_mistral_key(self):

@@ -155,7 +155,13 @@ class Settings(QDialog):
             self.app.cfg.update(self.cfg_working)
             self.app.save_config()
             self.app.apply_tray_bindings()
-        self.accept()
+        # Save no longer closes the window — just confirm with a small toast.
+        self._show_saved_toast()
+
+    def _show_saved_toast(self, text="✓  Settings saved"):
+        self._saved_toast.setText(text)
+        self._saved_toast.setVisible(True)
+        QTimer.singleShot(2000, lambda: self._saved_toast.setVisible(False))
 
     def _sync_action_settings_from_widgets(self):
         """Persist output mode + engine from widgets (not only on toggle signals)."""
@@ -310,19 +316,23 @@ class Settings(QDialog):
         self.tabs.addTab(self._create_account_tab(), "Account")
         layout.addWidget(self.tabs)
 
-        # Bottom Close Row
+        # Bottom row — Save stays open + shows a small toast; Close dismisses.
         bottom_layout = QHBoxLayout()
+        self._saved_toast = QLabel("", self)
+        self._saved_toast.setStyleSheet("color: #16a34a; font-weight: 700;")
+        self._saved_toast.setVisible(False)
+        bottom_layout.addWidget(self._saved_toast)
         bottom_layout.addStretch()
-        
-        btn_cancel = QPushButton("Cancel", self)
-        btn_cancel.clicked.connect(self.reject)
-        bottom_layout.addWidget(btn_cancel)
-        
+
+        btn_close = QPushButton("Close", self)
+        btn_close.clicked.connect(self.reject)
+        bottom_layout.addWidget(btn_close)
+
         btn_save = QPushButton("Save", self)
         btn_save.setObjectName("primaryButton")
         btn_save.clicked.connect(self._on_save_clicked)
         bottom_layout.addWidget(btn_save)
-        
+
         layout.addLayout(bottom_layout)
 
     # ── TAB 1: General Settings ──────────────────────────────────────────────
@@ -456,6 +466,13 @@ class Settings(QDialog):
                     self.app._pro_upsell("Managed cloud transcription")
                 return
             self.cfg_working["backend"] = "managed"
+            # Cloud and Privacy Mode are mutually exclusive (cloud sends audio off
+            # the device; Privacy forces everything local).
+            if hasattr(self, "chk_privacy") and self.chk_privacy.isChecked():
+                self.chk_privacy.blockSignals(True)
+                self.chk_privacy.setChecked(False)
+                self.chk_privacy.blockSignals(False)
+                self.cfg_working["privacy_mode"] = False
         elif self.cfg_working.get("backend") == "managed":
             self.cfg_working["backend"] = "local"
 
@@ -1713,6 +1730,13 @@ class Settings(QDialog):
         self.cfg_working["language"] = self.combo_lang.currentData()
         self.cfg_working["initial_prompt"] = self.vocab_input.toPlainText().strip()
         self.cfg_working["privacy_mode"] = self.chk_privacy.isChecked()
+        # Privacy Mode and Cloud transcription are mutually exclusive.
+        if self.chk_privacy.isChecked() and hasattr(self, "chk_managed") and self.chk_managed.isChecked():
+            self.chk_managed.blockSignals(True)
+            self.chk_managed.setChecked(False)
+            self.chk_managed.blockSignals(False)
+            if self.cfg_working.get("backend") == "managed":
+                self.cfg_working["backend"] = "local"
         if hasattr(self, "combo_device"):
             self.cfg_working["meeting_audio_mode"] = self.combo_device.currentData()
         if hasattr(self, "google_key_input"):

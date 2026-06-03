@@ -166,25 +166,20 @@ QComboBox:disabled {
 }
 QComboBox::drop-down {
     subcontrol-origin: padding;
-    subcontrol-position: top right;
-    width: 32px;
-    border-left: 1px solid #cbd5e1;
-    border-top-right-radius: 8px;
-    border-bottom-right-radius: 8px;
-}
-QComboBox::drop-down:disabled {
-    border-left-color: #e2e8f0;
+    subcontrol-position: center right;
+    width: 30px;
+    border: none;
+    background: transparent;
 }
 QComboBox::down-arrow {
-    width: 0;
-    height: 0;
-    border-left: 5px solid transparent;
-    border-right: 5px solid transparent;
-    border-top: 6px solid #64748b;
-    margin-right: 10px;
+    image: url("assets/chevron.svg");
+    width: 12px;
+    height: 8px;
+    margin-right: 12px;
 }
-QComboBox::down-arrow:disabled {
-    border-top-color: #cbd5e1;
+QComboBox::down-arrow:on {
+    /* keep the same chevron while the popup is open */
+    image: url("assets/chevron.svg");
 }
 QComboBox QAbstractItemView {
     background-color: #ffffff;
