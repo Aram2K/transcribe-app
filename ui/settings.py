@@ -289,6 +289,7 @@ class Settings(QDialog):
             about_title = f"About (Update v{self.cfg_working.get('pending_update_version').replace('v', '')}!)"
             
         self.tabs.addTab(self._create_about_tab(), about_title)
+        self.tabs.addTab(self._create_account_tab(), "Account")
         layout.addWidget(self.tabs)
 
         # Bottom Close Row
@@ -2005,6 +2006,137 @@ class Settings(QDialog):
         scroll.setWidget(scroll_content)
         layout.addWidget(scroll)
         return tab
+
+    # ── TAB 6: Account & Billing ─────────────────────────────────────────────
+    def _create_account_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # Frosted-glass account card
+        card = QFrame(tab)
+        card.setObjectName("glassCard")
+        card.setMinimumHeight(150)
+        c = QVBoxLayout(card)
+        c.setContentsMargins(20, 20, 20, 20)
+        c.setSpacing(12)
+
+        head = QHBoxLayout()
+        title = QLabel("Your Account", card)
+        title.setObjectName("titleLabel")
+        head.addWidget(title)
+        head.addStretch()
+        self._acct_badge = QLabel("FREE", card)
+        self._acct_badge.setObjectName("freeBadge")
+        head.addWidget(self._acct_badge)
+        c.addLayout(head)
+
+        self._acct_status_label = QLabel("Not signed in", card)
+        self._acct_status_label.setObjectName("subtitleLabel")
+        c.addWidget(self._acct_status_label)
+
+        self._acct_plan_label = QLabel("", card)
+        self._acct_plan_label.setObjectName("subtitleLabel")
+        self._acct_plan_label.setWordWrap(True)
+        c.addWidget(self._acct_plan_label)
+
+        btns = QHBoxLayout()
+        self._acct_signin_btn = QPushButton("Sign in with Google", card)
+        self._acct_signin_btn.setObjectName("primaryButton")
+        self._acct_signin_btn.clicked.connect(self._acct_sign_in)
+        btns.addWidget(self._acct_signin_btn)
+
+        self._acct_upgrade_btn = QPushButton("✦ Upgrade to Pro", card)
+        self._acct_upgrade_btn.setObjectName("primaryButton")
+        self._acct_upgrade_btn.clicked.connect(self._acct_upgrade)
+        btns.addWidget(self._acct_upgrade_btn)
+
+        self._acct_manage_btn = QPushButton("Manage subscription", card)
+        self._acct_manage_btn.clicked.connect(self._acct_manage)
+        btns.addWidget(self._acct_manage_btn)
+
+        self._acct_signout_btn = QPushButton("Sign out", card)
+        self._acct_signout_btn.clicked.connect(self._acct_sign_out)
+        btns.addWidget(self._acct_signout_btn)
+
+        btns.addStretch()
+        c.addLayout(btns)
+        layout.addWidget(card)
+
+        perks = QLabel(
+            "<b>Transcribe Pro</b> unlocks:<br>"
+            "&nbsp;&nbsp;🎤&nbsp; Meeting recording with AI notes<br>"
+            "&nbsp;&nbsp;🧠&nbsp; Smart Actions — rewrite, translate, summarize<br>"
+            "&nbsp;&nbsp;⚡&nbsp; Managed cloud transcription — fast, no API key<br>"
+            "&nbsp;&nbsp;⭐&nbsp; Priority models &amp; support",
+            tab,
+        )
+        perks.setWordWrap(True)
+        perks.setObjectName("subtitleLabel")
+        layout.addWidget(perks)
+        layout.addStretch()
+
+        self.refresh_pro_state()
+        return tab
+
+    def _acct_sign_in(self):
+        if self.app and hasattr(self.app, "start_google_login"):
+            self.app.start_google_login()
+
+    def _acct_sign_out(self):
+        if self.app and hasattr(self.app, "sign_out"):
+            self.app.sign_out()
+
+    def _acct_upgrade(self):
+        if self.app and hasattr(self.app, "_pro_upsell"):
+            self.app._pro_upsell()
+
+    def _acct_manage(self):
+        if self.app and hasattr(self.app, "open_billing"):
+            self.app.open_billing()
+
+    def refresh_pro_state(self):
+        """Update the Account tab to reflect the current auth/entitlement state.
+        Safe to call from main.py's auth-changed handler (and before the tab is
+        built)."""
+        if not hasattr(self, "_acct_badge"):
+            return
+        auth = getattr(self.app, "auth", None) if self.app else None
+        authed = bool(auth and auth.is_authenticated)
+        is_pro = bool(auth and auth.is_pro)
+
+        # Swap badge style (objectName drives the QSS; re-polish to apply).
+        self._acct_badge.setText("✦ PRO" if is_pro else "FREE")
+        self._acct_badge.setObjectName("proBadge" if is_pro else "freeBadge")
+        self._acct_badge.style().unpolish(self._acct_badge)
+        self._acct_badge.style().polish(self._acct_badge)
+
+        if authed:
+            self._acct_status_label.setText(
+                f"Signed in as {auth.user_email or 'your account'}"
+            )
+            if is_pro:
+                plan = (auth.plan or "Pro").capitalize()
+                renew = ""
+                if auth.period_end:
+                    verb = "Cancels" if auth.cancel_at_period_end else "Renews"
+                    renew = f"  ·  {verb} {str(auth.period_end)[:10]}"
+                self._acct_plan_label.setText(f"Plan: {plan}{renew}")
+            else:
+                self._acct_plan_label.setText(
+                    "Plan: Free — upgrade to unlock Meetings, Smart Actions, and fast cloud transcription."
+                )
+        else:
+            self._acct_status_label.setText("Not signed in")
+            self._acct_plan_label.setText(
+                "Sign in with Google to manage your subscription and unlock Pro."
+            )
+
+        self._acct_signin_btn.setVisible(not authed)
+        self._acct_upgrade_btn.setVisible(authed and not is_pro)
+        self._acct_manage_btn.setVisible(authed and is_pro)
+        self._acct_signout_btn.setVisible(authed)
 
     def _check_for_updates(self):
         if self.app and self.cfg_working.get("pending_update_version"):
