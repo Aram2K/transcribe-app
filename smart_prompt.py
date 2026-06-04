@@ -7,7 +7,7 @@
 #
 # Users can override the examples by creating
 # %APPDATA%/Transcribe/smart_examples.json (or the platform equivalent).
-# The override file replaces the defaults entirely — copy-paste the
+# The override file replaces the defaults entirely - copy-paste the
 # DEFAULT_EXAMPLES list and edit as needed.
 
 import json
@@ -22,7 +22,7 @@ logger = logging.getLogger("transcribe.smart")
 
 SMART_SYSTEM_PROMPT = (
     "You are a private voice-dictation assistant. The user just dictated "
-    "something. Decide what they want and output ONLY the final result — "
+    "something. Decide what they want and output ONLY the final result - "
     "no preamble, no quotation marks, no commentary, no markdown fences.\n"
     "\n"
     "Rules:\n"
@@ -32,7 +32,7 @@ SMART_SYSTEM_PROMPT = (
     "email (Subject line, greeting, body, sign-off). Use \"Best,\" by default.\n"
     "- If they ask to MAKE A LIST / TODO / CHECKLIST → output a Markdown "
     "checklist with `- [ ]` items. One item per line.\n"
-    "- If they ask to SUMMARIZE / SUMMARY / RECAP / TLDR → output a 2–4 "
+    "- If they ask to SUMMARIZE / SUMMARY / RECAP / TLDR → output a 2-4 "
     "sentence summary capturing the main points.\n"
     "- If they ask to REWRITE / CLEAN UP / POLISH / FIX → improve "
     "grammar and clarity while keeping the meaning. Strip filler words "
@@ -45,13 +45,13 @@ SMART_SYSTEM_PROMPT = (
     "\n"
     "Never include the action verb or instruction phrase in the output. "
     "If they said \"translate to russian: I will meet you at 5pm\", the "
-    "output is the Russian translation only — not the word \"translate\"."
+    "output is the Russian translation only - not the word \"translate\"."
 )
 
 
 # Each example is (user-transcript, expected-output). Picked to cover the
 # common intent buckets so the model can pattern-match against them. Keep
-# them short — long examples eat into the context window and slow down
+# them short - long examples eat into the context window and slow down
 # small local models.
 DEFAULT_EXAMPLES = [
     (
@@ -64,7 +64,7 @@ DEFAULT_EXAMPLES = [
     ),
     (
         "write an email to john that the q3 report is ready and i will send draft tonight",
-        "Subject: Q3 Report Ready\n\nHi John,\n\nThe Q3 report is ready — I'll send the draft over tonight.\n\nBest,",
+        "Subject: Q3 Report Ready\n\nHi John,\n\nThe Q3 report is ready - I'll send the draft over tonight.\n\nBest,",
     ),
     (
         "make a todo list call mom buy groceries finish slides for friday",
@@ -87,7 +87,7 @@ DEFAULT_EXAMPLES = [
 
 # Fast pre-check: if none of these tokens appear, the user almost
 # certainly wants raw transcription, so we skip the LLM entirely.
-# Word boundaries matter — "fixed" shouldn't match "fix", etc.
+# Word boundaries matter - "fixed" shouldn't match "fix", etc.
 _ACTION_INTENT_RE = re.compile(
     r"\b("
     r"translate|translation|"
@@ -227,7 +227,7 @@ def extract_payload(text, mode):
 
 
 def has_action_intent(text):
-    """Fast regex check — does this transcript look like an action request?
+    """Fast regex check - does this transcript look like an action request?
 
     Returning False means the Smart-mode pipeline should bypass the LLM and
     just pass the (cleaned) text through. Returning True means we run the

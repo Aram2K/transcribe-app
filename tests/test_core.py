@@ -87,7 +87,7 @@ _pyside6 = _stub("PySide6")
 _pyside6.QtCore = _core
 _pyside6.QtGui = _gui
 _pyside6.QtWidgets = _widgets
-# ctypes is NOT stubbed — it is stdlib and works cross-platform.
+# ctypes is NOT stubbed - it is stdlib and works cross-platform.
 # ctypes.windll only appears inside apply_glass() which is never called by tests.
 # Replacing ctypes in sys.modules breaks ctypes._layout imports on Python 3.11.
 
@@ -244,7 +244,7 @@ class TestConfig(unittest.TestCase):
 
     def test_privacy_mode_forces_local_no_history_keeps_analytics(self):
         # Privacy Mode forces backend=local and disables history, but it
-        # intentionally leaves analytics_enabled untouched — the user
+        # intentionally leaves analytics_enabled untouched - the user
         # controls that independently via the Settings checkbox.
         import main as m
         import actions
@@ -398,7 +398,7 @@ class TestUpdaterHelpers(unittest.TestCase):
 
 class TestModelOk(unittest.TestCase):
     def test_tiny_always_ok(self):
-        # tiny needs 2 GB — should pass on any machine with RAM stubs returning 16 GB
+        # tiny needs 2 GB - should pass on any machine with RAM stubs returning 16 GB
         self.assertTrue(model_ok("tiny"))
 
     def test_unknown_model_raises(self):
@@ -458,7 +458,7 @@ class TestFmtHotkey(unittest.TestCase):
 
 
 class TestMeetingsWindowHelpers(unittest.TestCase):
-    """Tests for the pure-data helpers on MeetingsWindow — transcript
+    """Tests for the pure-data helpers on MeetingsWindow - transcript
     stitching, prompt context building, and share-format conversion.
 
     These don't exercise the Tk widgets; we bypass __init__ and set the
@@ -478,9 +478,9 @@ class TestMeetingsWindowHelpers(unittest.TestCase):
         mw = self._make_mw()
         chunks = [
             {"text": "Hello everyone.", "silence_before": 0.0},
-            {"text": "Thanks for joining.", "silence_before": 0.3},   # short — no marker
-            {"text": "I'll draft the spec.", "silence_before": 1.8},  # long — marker
-            {"text": "Sounds good.", "silence_before": 2.0},          # long — marker
+            {"text": "Thanks for joining.", "silence_before": 0.3},   # short - no marker
+            {"text": "I'll draft the spec.", "silence_before": 1.8},  # long - marker
+            {"text": "Sounds good.", "silence_before": 2.0},          # long - marker
         ]
         out = mw._build_transcript_with_markers(chunks)
         self.assertIn("Hello everyone.", out)
@@ -654,7 +654,7 @@ class TestSettingsValidation(unittest.TestCase):
 
         Settings._on_save_clicked(dialog)
 
-        # Save persists config and confirms with a toast — but does NOT close the
+        # Save persists config and confirms with a toast - but does NOT close the
         # window (Save no longer dismisses Settings).
         dialog._sync_action_settings_from_widgets.assert_called_once()
         dialog.app.save_config.assert_called_once()
