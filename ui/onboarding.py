@@ -1,7 +1,7 @@
 # Modern Onboarding Walkthrough Wizard in PySide6
 
 import threading
-from PySide6.QtCore import Qt, QEvent, Signal
+from PySide6.QtCore import Qt, QEvent, Signal, QSize
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QCheckBox, QStackedWidget, QWidget, QLineEdit, QMessageBox, QFrame
@@ -190,13 +190,14 @@ class Onboarding(QDialog):
         orl = QLabel("or", card); orl.setObjectName("subtitleLabel")
         div.addWidget(ll, 1); div.addWidget(orl); div.addWidget(lr, 1)
         cl.addLayout(div)
-        self.btn_google = QPushButton("  Sign in with Google", card)
-        self.btn_google.setIcon(QIcon(self._asset("google_logo.png")))
+        self.btn_google = QPushButton("   Sign in with Google", card)
+        self.btn_google.setIcon(QIcon(self._asset("google_g.svg")))
+        self.btn_google.setIconSize(QSize(20, 20))
         self.btn_google.setMinimumHeight(44)
         self.btn_google.setCursor(Qt.PointingHandCursor)
         self.btn_google.setStyleSheet(
             "QPushButton { background: #ffffff; color: #3c4043; border: 1px solid #dadce0;"
-            " border-radius: 8px; font-weight: 600; }"
+            " border-radius: 8px; font-size: 14px; font-weight: 600; padding: 0 12px; }"
             "QPushButton:hover { background: #f7faff; border-color: #d2e3fc; }"
         )
         self.btn_google.clicked.connect(self._choose_google)
