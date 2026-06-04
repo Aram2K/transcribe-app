@@ -3,7 +3,7 @@ const HTML = `<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Transcribe – Email confirmed</title>
+<title>Transcribe - Email confirmed</title>
 <style>
   * { box-sizing: border-box; }
   body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; font-family: 'Segoe UI', system-ui, sans-serif; background: linear-gradient(135deg, #f3e8ff 0%, #eef2ff 50%, #faf5ff 100%); }
