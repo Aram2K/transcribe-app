@@ -1631,11 +1631,16 @@ class AppController(QObject):
         if self.auth.is_authenticated:
             self.show_settings()
             return
-        from ui.onboarding import Onboarding
-        self._auth_gate = Onboarding(main_app=self, account_only=True)
-        self._auth_gate.show()
-        self._auth_gate.raise_()
-        self._auth_gate.activateWindow()
+        # Reuse a single dialog instance so repeated clicks just bring it forward
+        # instead of stacking new windows.
+        gate = getattr(self, "_auth_gate", None)
+        if gate is None:
+            from ui.onboarding import Onboarding
+            gate = Onboarding(main_app=self, account_only=True)
+            self._auth_gate = gate
+        gate.show()
+        gate.raise_()
+        gate.activateWindow()
 
     def show_account_gate(self):
         """One-time sign-in / guest gate for users who onboarded before accounts

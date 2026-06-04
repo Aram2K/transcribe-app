@@ -234,6 +234,8 @@ class Onboarding(QDialog):
         if hasattr(self, "_forgot_btn"):
             self._forgot_btn.setVisible(not is_signup)
         self._primary_btn.setText("Create account" if is_signup else "Sign in")
+        if hasattr(self, "btn_google"):
+            self.btn_google.setText("   Sign up with Google" if is_signup else "   Continue with Google")
         self._tab_signin.setObjectName("primaryButton" if not is_signup else "")
         self._tab_signup.setObjectName("primaryButton" if is_signup else "")
         for b in (self._tab_signin, self._tab_signup):
