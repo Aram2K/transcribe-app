@@ -190,8 +190,15 @@ class Onboarding(QDialog):
         orl = QLabel("or", card); orl.setObjectName("subtitleLabel")
         div.addWidget(ll, 1); div.addWidget(orl); div.addWidget(lr, 1)
         cl.addLayout(div)
-        self.btn_google = QPushButton("Continue with Google", card)
-        self.btn_google.setMinimumHeight(42)
+        self.btn_google = QPushButton("  Sign in with Google", card)
+        self.btn_google.setIcon(QIcon(self._asset("google_logo.png")))
+        self.btn_google.setMinimumHeight(44)
+        self.btn_google.setCursor(Qt.PointingHandCursor)
+        self.btn_google.setStyleSheet(
+            "QPushButton { background: #ffffff; color: #3c4043; border: 1px solid #dadce0;"
+            " border-radius: 8px; font-weight: 600; }"
+            "QPushButton:hover { background: #f7faff; border-color: #d2e3fc; }"
+        )
         self.btn_google.clicked.connect(self._choose_google)
         cl.addWidget(self.btn_google)
 
