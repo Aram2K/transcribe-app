@@ -352,11 +352,12 @@ class Settings(QDialog):
         sp_head = QLabel("Your Device", specs_frame)
         sp_head.setStyleSheet("font-weight: 600;")
         sp_lay.addWidget(sp_head)
-        specs_lbl = QLabel(self._device_specs_text(), specs_frame)
-        specs_lbl.setObjectName("subtitleLabel")
-        specs_lbl.setTextFormat(Qt.RichText)
-        sp_lay.addWidget(specs_lbl)
+        self._specs_label = QLabel(self._quick_specs(), specs_frame)
+        self._specs_label.setObjectName("subtitleLabel")
+        self._specs_label.setWordWrap(True)
+        sp_lay.addWidget(self._specs_label)
         layout.addWidget(specs_frame)
+        self._detect_gpu_async()
 
         # Hotkey Configuration
         hotkey_frame = QFrame(tab)
@@ -402,22 +403,6 @@ class Settings(QDialog):
         self.vocab_input.textChanged.connect(self._save_general_configs)
         vocab_lay.addWidget(self.vocab_input)
         layout.addWidget(vocab_frame)
-
-
-
-        # System specs - helps users pick a model that fits their machine.
-        specs_frame = QFrame(tab)
-        specs_frame.setObjectName("cardFrame")
-        sp_lay = QVBoxLayout(specs_frame)
-        sp_lay.setContentsMargins(14, 12, 14, 12)
-        sp_lay.setSpacing(4)
-        sp_lay.addWidget(QLabel("Your System", specs_frame))
-        self._specs_label = QLabel(self._quick_specs(), specs_frame)
-        self._specs_label.setObjectName("subtitleLabel")
-        self._specs_label.setWordWrap(True)
-        sp_lay.addWidget(self._specs_label)
-        layout.addWidget(specs_frame)
-        self._detect_gpu_async()
 
         # Meeting Audio Device
         dev_frame = QFrame(tab)
