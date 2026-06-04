@@ -20,3 +20,6 @@ build/
 
 # CI-generated icon
 assets/icon.ico
+
+# Supabase CLI local state
+supabase/.temp/
