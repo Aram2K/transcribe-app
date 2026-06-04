@@ -28,42 +28,39 @@ class ProDialog(QDialog):
         root.setContentsMargins(24, 22, 24, 22)
         root.setSpacing(12)
 
-        crown = QLabel("✦", self)
-        crown.setAlignment(Qt.AlignCenter)
-        crown.setStyleSheet("font-size: 38px; color: #a855f7;")
-        root.addWidget(crown)
+        eyebrow = QLabel("TRANSCRIBE PRO", self)
+        eyebrow.setAlignment(Qt.AlignCenter)
+        eyebrow.setStyleSheet("font-size: 11px; font-weight: 800; letter-spacing: 2px; color: #a855f7;")
+        root.addWidget(eyebrow)
 
-        title = QLabel("Go Pro", self)
+        title = QLabel("Everything you get with Pro", self)
         title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("font-size: 24px; font-weight: 800; color: #7e22ce;")
+        title.setStyleSheet("font-size: 22px; font-weight: 800; color: #0f172a;")
         root.addWidget(title)
 
-        sub = QLabel(
-            (f"{feature} is a Pro feature.\n" if feature else "")
-            + "Unlock the full power of Transcribe.",
-            self,
-        )
-        sub.setAlignment(Qt.AlignCenter)
-        sub.setObjectName("subtitleLabel")
-        sub.setWordWrap(True)
-        root.addWidget(sub)
+        if feature:
+            sub = QLabel(f"{feature} is a Pro feature.", self)
+            sub.setAlignment(Qt.AlignCenter)
+            sub.setObjectName("subtitleLabel")
+            sub.setWordWrap(True)
+            root.addWidget(sub)
 
-        # ── Benefits ──
+        # ── Benefits (clean checkmarks, no emojis) ──
         card = QFrame(self)
         card.setObjectName("glassCard")
         cl = QVBoxLayout(card)
         cl.setContentsMargins(20, 16, 20, 16)
-        cl.setSpacing(12)
-        for icon, head, desc in (
-            ("🎤", "Meeting recording + AI notes", "Record any call and get clean, summarized minutes."),
-            ("🧠", "Smart Actions", "Translate, rewrite, summarize, draft emails - just by voice."),
-            ("⚡", "Managed cloud transcription", "Fast and accurate - no API key, no setup, no timeouts."),
-            ("⭐", "Priority models & support", "The best models first, and a direct line to us."),
+        cl.setSpacing(10)
+        for head, desc in (
+            ("Meeting recording with AI notes", "Record any call and get clean, summarized minutes."),
+            ("Smart Actions", "Translate, rewrite, summarize and draft emails by voice."),
+            ("Fast cloud transcription", "Accurate, with no API key, no setup and no timeouts."),
+            ("Priority models and support", "The best models first, and a direct line to us."),
         ):
             row = QHBoxLayout()
             row.setSpacing(12)
-            ic = QLabel(icon, card)
-            ic.setStyleSheet("font-size: 20px;")
+            ic = QLabel("✓", card)
+            ic.setStyleSheet("font-size: 16px; font-weight: 800; color: #a855f7;")
             row.addWidget(ic, 0, Qt.AlignTop)
             col = QVBoxLayout()
             col.setSpacing(1)
@@ -135,10 +132,10 @@ class ProDialog(QDialog):
         card = QFrame(self)
         card.setObjectName("cardFrame")
         card.setCursor(Qt.PointingHandCursor)
-        card.setMinimumHeight(124)
+        card.setMinimumHeight(94)
         v = QVBoxLayout(card)
         v.setContentsMargins(14, 12, 14, 12)
-        v.setSpacing(4)
+        v.setSpacing(6)
 
         top = QLabel(name, card)
         top.setStyleSheet("font-weight: 700; color: #334155; font-size: 13px;")
@@ -149,18 +146,16 @@ class ProDialog(QDialog):
         prow.setSpacing(5)
         if original:
             o = QLabel(f"<s>{original}</s>", card)
-            o.setStyleSheet("color: #94a3b8; font-size: 14px;")
+            o.setStyleSheet("color: #94a3b8; font-size: 15px;")
             prow.addWidget(o, 0, Qt.AlignBottom)
         p = QLabel(price, card)
-        p.setStyleSheet("font-size: 24px; font-weight: 800; color: #0f172a;")
+        p.setStyleSheet("font-size: 30px; font-weight: 800; color: #0f172a;")
         prow.addWidget(p)
         u = QLabel(per, card)
         u.setObjectName("subtitleLabel")
         prow.addWidget(u, 0, Qt.AlignBottom)
         prow.addStretch()
         v.addLayout(prow)
-
-        v.addStretch()
 
         # Bottom slot, aligned across both cards: a "Save" pill or a plain note.
         if badge:

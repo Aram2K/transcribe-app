@@ -432,30 +432,23 @@ class Settings(QDialog):
         
         layout.addWidget(dev_frame)
 
-        # Managed Cloud (Pro) dictation backend
+        # Fast cloud transcription (Pro) backend - off by default.
         cloud_frame = QFrame(tab)
         cloud_frame.setObjectName("cardFrame")
         cf_lay = QVBoxLayout(cloud_frame)
-        cf_lay.setContentsMargins(18, 14, 18, 14)
-        self.chk_managed = QCheckBox("⚡ Use fast cloud transcription (recommended for Pro)", cloud_frame)
-        # Default ON for Pro on the stock local backend, so cloud "just works"
-        # without them hunting for a setting. They can uncheck for offline/local.
-        _default_managed = self.cfg_working.get("backend") == "managed" or (
-            self._is_pro()
-            and self.cfg_working.get("backend", "local") == "local"
-            and not self.cfg_working.get("privacy_mode")
-        )
-        self.chk_managed.setChecked(_default_managed)
-        if _default_managed:
-            self.cfg_working["backend"] = "managed"
+        cf_lay.setContentsMargins(18, 12, 18, 12)
+        cf_lay.setSpacing(4)
+        ch_row = QHBoxLayout()
+        self.chk_managed = QCheckBox("Fast cloud transcription", cloud_frame)
+        self.chk_managed.setChecked(self.cfg_working.get("backend") == "managed")
         self.chk_managed.stateChanged.connect(self._on_managed_toggled)
-        cf_lay.addWidget(self.chk_managed)
-        cloud_desc = QLabel(
-            "What it does: we transcribe on our servers (fast, accurate, no API key, "
-            "nothing to download). Included with Pro. Uncheck to use a local model "
-            "on your machine instead (fully offline / private).",
-            cloud_frame,
-        )
+        ch_row.addWidget(self.chk_managed)
+        self._cloud_pro_badge = QLabel("PRO", cloud_frame)
+        self._cloud_pro_badge.setObjectName("proBadge")
+        ch_row.addWidget(self._cloud_pro_badge)
+        ch_row.addStretch()
+        cf_lay.addLayout(ch_row)
+        cloud_desc = QLabel("Transcribe on our servers - no setup, no API key.", cloud_frame)
         cloud_desc.setObjectName("subtitleLabel")
         cloud_desc.setWordWrap(True)
         cf_lay.addWidget(cloud_desc)
@@ -2382,13 +2375,19 @@ class Settings(QDialog):
         if getattr(self, "_smart_pro_badge", None) is not None:
             self._smart_pro_badge.setVisible(not is_pro)
 
-        # Meeting controls: deactivated (greyed) for non-Pro, with a locked label.
+        # Meeting controls: locked but readable for non-Pro (clicking prompts upgrade).
         if hasattr(self, "btn_launch_meeting"):
-            self.btn_launch_meeting.setText(
-                "🚀 Start Smart Meeting Transcription" if is_pro
-                else "🔒 Smart Meeting Transcription (Pro)"
-            )
-            self.btn_launch_meeting.setEnabled(is_pro)
+            if is_pro:
+                self.btn_launch_meeting.setText("Start Smart Meeting Transcription")
+                self.btn_launch_meeting.setStyleSheet("")  # default primary style
+            else:
+                self.btn_launch_meeting.setText("Smart Meeting Transcription   (Pro)")
+                self.btn_launch_meeting.setStyleSheet(
+                    "QPushButton { background-color: #eef2f7; color: #475569;"
+                    " border: 1px solid #cbd5e1; border-radius: 8px; font-weight: 600; }"
+                    "QPushButton:hover { background-color: #e2e8f0; }"
+                )
+            self.btn_launch_meeting.setEnabled(True)
         if hasattr(self, "combo_device"):
             self.combo_device.setEnabled(is_pro)
         if hasattr(self, "_meeting_pro_badge"):
@@ -2426,22 +2425,35 @@ class Settings(QDialog):
             except Exception:
                 self._acct_plan_label.setText("Sign in to manage your subscription and unlock Pro.")
 
-        # Top-right CTA: sign up (guest) / upgrade (free) / trial countdown.
+        # Top-right CTA: neutral "Sign up" for guests, purple "Upgrade" for free/trial.
         if hasattr(self, "_header_cta"):
+            neutral = (
+                "QPushButton { background: #ffffff; border: 1px solid #cbd5e1; color: #334155;"
+                " font-weight: 600; border-radius: 8px; padding: 6px 14px; }"
+                "QPushButton:hover { border-color: #3b82f6; color: #1e293b; }"
+            )
+            purple = (
+                "QPushButton { background-color: #a855f7; border: 1px solid #9333ea; color: white;"
+                " font-weight: 700; border-radius: 8px; padding: 6px 14px; }"
+                "QPushButton:hover { background-color: #9333ea; }"
+            )
             if not authed:
                 try:
                     mins = entitlements.guest_minutes_remaining()
                 except Exception:
                     mins = 0
-                self._header_cta.setText(f"⚡ {mins} min left · Sign up")
+                self._header_cta.setText(f"Sign up   ·   {mins} min left")
+                self._header_cta.setStyleSheet(neutral)
                 self._header_cta.setVisible(True)
             elif on_trial:
-                self._header_cta.setText(f"⚡ Trial: {self._trial_days_left(auth)}d · Upgrade")
+                self._header_cta.setText(f"Upgrade   ·   Trial {self._trial_days_left(auth)}d left")
+                self._header_cta.setStyleSheet(purple)
                 self._header_cta.setVisible(True)
             elif is_pro:
                 self._header_cta.setVisible(False)
             else:
-                self._header_cta.setText("⚡ Upgrade to Pro")
+                self._header_cta.setText("Upgrade to Pro")
+                self._header_cta.setStyleSheet(purple)
                 self._header_cta.setVisible(True)
 
         # Super-admin tier override row (visible only to admins).
