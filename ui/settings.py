@@ -2430,6 +2430,27 @@ class Settings(QDialog):
         if hasattr(self, "_meeting_pro_badge"):
             self._meeting_pro_badge.setVisible(not is_pro)
 
+        # Privacy Mode (can be toggled from the tray) deactivates cloud options
+        # with a clear reason so users know why they're disabled.
+        privacy = bool(self.app and self.app.cfg.get("privacy_mode"))
+        if hasattr(self, "chk_privacy") and self.chk_privacy.isChecked() != privacy:
+            self.chk_privacy.blockSignals(True)
+            self.chk_privacy.setChecked(privacy)
+            self.chk_privacy.blockSignals(False)
+            self.cfg_working["privacy_mode"] = privacy
+        if hasattr(self, "chk_managed"):
+            self.chk_managed.setEnabled(not privacy)
+            self.chk_managed.setToolTip(
+                "Disabled by Privacy Mode (everything stays on your device)" if privacy else ""
+            )
+            if privacy and self.chk_managed.isChecked():
+                self.chk_managed.blockSignals(True)
+                self.chk_managed.setChecked(False)
+                self.chk_managed.blockSignals(False)
+                self.cfg_working["backend"] = "local"
+        if hasattr(self, "_cloud_pro_badge"):
+            self._cloud_pro_badge.setVisible(not privacy)
+
         plan = getattr(auth, "plan", None) if auth else None
         on_trial = is_pro and plan == "trial"
 

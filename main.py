@@ -1332,6 +1332,13 @@ class AppController(QObject):
         action_history.triggered.connect(self.show_history)
         menu.addAction(action_history)
 
+        # Privacy Mode toggle - accessible from anywhere, not just Settings.
+        action_privacy = QAction("Privacy Mode (on-device only)", self)
+        action_privacy.setCheckable(True)
+        action_privacy.setChecked(bool(self.cfg.get("privacy_mode", False)))
+        action_privacy.triggered.connect(lambda: self.toggle_privacy_mode())
+        menu.addAction(action_privacy)
+
         menu.addSeparator()
 
         action_quit = QAction("Quit", self)
@@ -1428,6 +1435,26 @@ class AppController(QObject):
                 "Use the 'Manage subscription' link in your Stripe receipt email "
                 "(Customer Portal not configured yet)."
             )
+
+    def toggle_privacy_mode(self):
+        """Flip Privacy Mode from anywhere (tray). Privacy forces everything local:
+        no cloud/managed backend, no history."""
+        new = not self.cfg.get("privacy_mode", False)
+        self.cfg["privacy_mode"] = new
+        if new:
+            self.cfg["backend"] = "local"   # privacy = on-device only
+        self.save_config()
+        self.show_tray_hint(
+            "Privacy Mode ON" if new else "Privacy Mode OFF",
+            "Everything stays on your device - cloud features are disabled."
+            if new else "Cloud features are available again.",
+        )
+        # Refresh any open Settings window + rebuild the tray checkmark.
+        self.sig_auth_changed.emit()
+        try:
+            self._build_tray_menu()
+        except Exception:
+            pass
 
     def _pro_upsell(self, feature=None):
         try:
