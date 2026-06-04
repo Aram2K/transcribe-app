@@ -24,6 +24,7 @@ class DownloadProgressSignal(QObject):
 class Settings(QDialog):
     mistral_test_finished = Signal(bool, str)
     google_test_finished = Signal(bool, str)
+    specs_ready = Signal(str)  # GPU name detected on a worker thread
 
     def __init__(self, parent=None, main_app=None):
         super().__init__(parent)
@@ -59,6 +60,7 @@ class Settings(QDialog):
         # Connect test signals
         self.mistral_test_finished.connect(self._on_mistral_test_finished)
         self.google_test_finished.connect(self._on_google_test_finished)
+        self.specs_ready.connect(self._on_specs_ready)
         
         # Whisper model card controls references
         self.whisper_cards = {}
@@ -205,7 +207,7 @@ class Settings(QDialog):
             self.rb_smart.blockSignals(False)
             self.rb_transcribe.blockSignals(False)
             if hasattr(self, "engine_section"):
-                self.engine_section.setEnabled(self.rb_smart.isChecked())
+                self.engine_section.setEnabled(True)  # always selectable, even in transcribe-only
         
         # 2. Spoken Language
         idx = self.combo_lang.findData(self.cfg_working.get("language", "auto"))
@@ -343,6 +345,19 @@ class Settings(QDialog):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(14)
 
+        # Your device - so people know their specs and which models fit.
+        specs_frame = QFrame(tab)
+        specs_frame.setObjectName("cardFrame")
+        sp_lay = QVBoxLayout(specs_frame)
+        sp_head = QLabel("Your Device", specs_frame)
+        sp_head.setStyleSheet("font-weight: 600;")
+        sp_lay.addWidget(sp_head)
+        specs_lbl = QLabel(self._device_specs_text(), specs_frame)
+        specs_lbl.setObjectName("subtitleLabel")
+        specs_lbl.setTextFormat(Qt.RichText)
+        sp_lay.addWidget(specs_lbl)
+        layout.addWidget(specs_frame)
+
         # Hotkey Configuration
         hotkey_frame = QFrame(tab)
         hotkey_frame.setObjectName("cardFrame")
@@ -390,6 +405,20 @@ class Settings(QDialog):
 
 
 
+        # System specs - helps users pick a model that fits their machine.
+        specs_frame = QFrame(tab)
+        specs_frame.setObjectName("cardFrame")
+        sp_lay = QVBoxLayout(specs_frame)
+        sp_lay.setContentsMargins(14, 12, 14, 12)
+        sp_lay.setSpacing(4)
+        sp_lay.addWidget(QLabel("Your System", specs_frame))
+        self._specs_label = QLabel(self._quick_specs(), specs_frame)
+        self._specs_label.setObjectName("subtitleLabel")
+        self._specs_label.setWordWrap(True)
+        sp_lay.addWidget(self._specs_label)
+        layout.addWidget(specs_frame)
+        self._detect_gpu_async()
+
         # Meeting Audio Device
         dev_frame = QFrame(tab)
         dev_frame.setObjectName("cardFrame")
@@ -423,12 +452,23 @@ class Settings(QDialog):
         cloud_frame.setObjectName("cardFrame")
         cf_lay = QVBoxLayout(cloud_frame)
         cf_lay.setContentsMargins(18, 14, 18, 14)
-        self.chk_managed = QCheckBox("⚡ Managed Cloud transcription (Pro) - fast & accurate, no API key", cloud_frame)
-        self.chk_managed.setChecked(self.cfg_working.get("backend") == "managed")
+        self.chk_managed = QCheckBox("⚡ Use fast cloud transcription (recommended for Pro)", cloud_frame)
+        # Default ON for Pro on the stock local backend, so cloud "just works"
+        # without them hunting for a setting. They can uncheck for offline/local.
+        _default_managed = self.cfg_working.get("backend") == "managed" or (
+            self._is_pro()
+            and self.cfg_working.get("backend", "local") == "local"
+            and not self.cfg_working.get("privacy_mode")
+        )
+        self.chk_managed.setChecked(_default_managed)
+        if _default_managed:
+            self.cfg_working["backend"] = "managed"
         self.chk_managed.stateChanged.connect(self._on_managed_toggled)
         cf_lay.addWidget(self.chk_managed)
         cloud_desc = QLabel(
-            "Transcribe on our servers using your Pro plan - no local model or API key needed.",
+            "What it does: we transcribe on our servers (fast, accurate, no API key, "
+            "nothing to download). Included with Pro. Uncheck to use a local model "
+            "on your machine instead (fully offline / private).",
             cloud_frame,
         )
         cloud_desc.setObjectName("subtitleLabel")
@@ -496,6 +536,58 @@ class Settings(QDialog):
             self.app.apply_tray_bindings()
             self.accept()
             self.app.show_meeting()
+
+    # ── System specs ─────────────────────────────────────────────────────────
+    def _quick_specs(self, gpu="detecting…"):
+        try:
+            import psutil
+            logical = psutil.cpu_count(logical=True) or 0
+            physical = psutil.cpu_count(logical=False) or logical
+            ram = psutil.virtual_memory().total / (1024 ** 3)
+            return f"🧩 CPU: {physical} cores / {logical} threads      🧠 RAM: {ram:.0f} GB      🎮 GPU: {gpu}"
+        except Exception:
+            return "System information unavailable."
+
+    def _on_specs_ready(self, gpu):
+        if hasattr(self, "_specs_label"):
+            self._specs_label.setText(self._quick_specs(gpu))
+
+    def _detect_gpu_async(self):
+        threading.Thread(target=lambda: self.specs_ready.emit(self._detect_gpu()), daemon=True).start()
+
+    @staticmethod
+    def _detect_gpu():
+        import sys, subprocess
+        try:
+            import ctranslate2
+            cuda = ctranslate2.get_cuda_device_count()
+        except Exception:
+            cuda = 0
+        name = None
+        try:
+            if sys.platform == "win32":
+                out = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "(Get-CimInstance Win32_VideoController).Name -join ', '"],
+                    capture_output=True, text=True, timeout=6,
+                )
+                name = (out.stdout or "").strip() or None
+            elif sys.platform == "darwin":
+                out = subprocess.run(["system_profiler", "SPDisplaysDataType"],
+                                     capture_output=True, text=True, timeout=6)
+                for line in (out.stdout or "").splitlines():
+                    if "Chipset Model" in line:
+                        name = line.split(":", 1)[1].strip()
+                        break
+        except Exception:
+            name = None
+        if name and cuda > 0:
+            return f"{name} (CUDA x{cuda})"
+        if name:
+            return name
+        if cuda > 0:
+            return f"CUDA GPU ×{cuda}"
+        return "CPU only (no GPU acceleration)"
 
     # ── TAB 2: Models Configurator ──────────────────────────────────────────
     def _create_models_tab(self):
@@ -1324,7 +1416,7 @@ class Settings(QDialog):
         self._refresh_mode_cards_layout()
         # Initial enabled state: engine controls active only in Smart mode.
         if hasattr(self, "engine_section"):
-            self.engine_section.setEnabled(self.rb_smart.isChecked())
+            self.engine_section.setEnabled(True)  # always selectable, even in transcribe-only
         return tab
 
     def _is_pro(self):
@@ -1350,7 +1442,7 @@ class Settings(QDialog):
         # (grayed out) when Transcribe-only is selected. No hide/expand so the
         # layout never shifts.
         if hasattr(self, "engine_section"):
-            self.engine_section.setEnabled(is_smart)
+            self.engine_section.setEnabled(True)
         new_mode = actions.ACTION_SMART_AUTO if is_smart else actions.ACTION_TRANSCRIBE_ONLY
         self.cfg_working["output_action"] = new_mode
         for card, sel in (
@@ -2305,12 +2397,15 @@ class Settings(QDialog):
         if getattr(self, "_smart_pro_badge", None) is not None:
             self._smart_pro_badge.setVisible(not is_pro)
 
-        # Meeting launch button reflects Pro state (locked label for non-Pro).
+        # Meeting controls: deactivated (greyed) for non-Pro, with a locked label.
         if hasattr(self, "btn_launch_meeting"):
             self.btn_launch_meeting.setText(
                 "🚀 Start Smart Meeting Transcription" if is_pro
                 else "🔒 Smart Meeting Transcription (Pro)"
             )
+            self.btn_launch_meeting.setEnabled(is_pro)
+        if hasattr(self, "combo_device"):
+            self.combo_device.setEnabled(is_pro)
         if hasattr(self, "_meeting_pro_badge"):
             self._meeting_pro_badge.setVisible(not is_pro)
 
