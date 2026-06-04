@@ -1400,12 +1400,20 @@ class Settings(QDialog):
     def _is_pro(self):
         return bool(self.app and hasattr(self.app, "is_pro") and self.app.is_pro())
 
+    def _can_use_smart(self):
+        try:
+            auth = getattr(self.app, "auth", None) if self.app else None
+            cfg = self.app.cfg if self.app else None
+            return entitlements.can_use_smart_action(auth, cfg)
+        except Exception:
+            return True
+
     def _on_output_mode_changed(self):
         is_smart = self.rb_smart.isChecked()
 
-        # Smart Actions are Pro-only. Bounce non-Pro users back to transcribe-only
-        # and prompt them to upgrade.
-        if is_smart and self.app and not self._is_pro():
+        # Smart Actions: Pro = unlimited; non-Pro can select it while they still
+        # have free tries left. Only bounce + upsell once the 5 tries are gone.
+        if is_smart and self.app and not self._is_pro() and not self._can_use_smart():
             self.rb_transcribe.blockSignals(True)
             self.rb_smart.blockSignals(True)
             self.rb_transcribe.setChecked(True)
@@ -2372,8 +2380,37 @@ class Settings(QDialog):
             self._header_badge.style().polish(self._header_badge)
 
         # Smart-action lock pill follows Pro state.
+        # Smart Actions: Pro = unlimited (no badge); non-Pro shows a "N/5 FREE"
+        # counter, and once exhausted the option locks (PRO badge + disabled).
         if getattr(self, "_smart_pro_badge", None) is not None:
-            self._smart_pro_badge.setVisible(not is_pro)
+            if is_pro:
+                self._smart_pro_badge.setVisible(False)
+                if hasattr(self, "rb_smart"):
+                    self.rb_smart.setEnabled(True)
+            else:
+                try:
+                    rem = entitlements.smart_actions_remaining(None, self.app.cfg if self.app else None)
+                except Exception:
+                    rem = entitlements.FREE_SMART_ACTION_TRIES
+                if rem > 0:
+                    self._smart_pro_badge.setText(f"{rem}/5 FREE")
+                    self._smart_pro_badge.setObjectName("freeBadge")
+                    if hasattr(self, "rb_smart"):
+                        self.rb_smart.setEnabled(True)
+                else:
+                    self._smart_pro_badge.setText("PRO")
+                    self._smart_pro_badge.setObjectName("proBadge")
+                    if hasattr(self, "rb_smart"):
+                        self.rb_smart.setEnabled(False)
+                        if self.rb_smart.isChecked():
+                            self.rb_smart.blockSignals(True)
+                            self.rb_transcribe.setChecked(True)
+                            self.rb_smart.setChecked(False)
+                            self.rb_smart.blockSignals(False)
+                            self.cfg_working["output_action"] = actions.ACTION_TRANSCRIBE_ONLY
+                self._smart_pro_badge.setVisible(True)
+                self._smart_pro_badge.style().unpolish(self._smart_pro_badge)
+                self._smart_pro_badge.style().polish(self._smart_pro_badge)
 
         # Meeting controls: locked but readable for non-Pro (clicking prompts upgrade).
         if hasattr(self, "btn_launch_meeting"):

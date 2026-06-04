@@ -1495,24 +1495,17 @@ class AppController(QObject):
             self.sig_auth_changed.emit()  # refresh tray remaining-time line
 
     def _guest_limit_reached(self):
-        box = QMessageBox()
-        box.setWindowTitle("Free trial used up")
-        box.setText(
-            "You've used your 10 free guest minutes.\n\n"
-            "Create a free account to keep dictating - it's unlimited, and you "
-            "can upgrade to Pro anytime."
-        )
-        signin = box.addButton("Create free account", QMessageBox.AcceptRole)
-        box.addButton("Not now", QMessageBox.RejectRole)
-        if hasattr(self, "style_content"):
-            box.setStyleSheet(self.style_content)
-        box.exec()
-        if box.clickedButton() == signin:
-            self.show_auth_gate()
         try:
             telemetry.track("guest_trial_exhausted", {}, self.cfg, APP_VERSION)
         except Exception:
             pass
+        # Pressing the hotkey when out of free minutes opens the sign in / sign up
+        # screen directly, so the user knows the next step is to create an account.
+        self.show_tray_hint(
+            "Free minutes used up",
+            "Sign in (free) to keep dictating - unlimited local transcription, no charge.",
+        )
+        self.show_auth_gate()
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:
@@ -2008,15 +2001,26 @@ class AppController(QObject):
         action_mode = actions.normalize_action_mode(self.cfg.get("output_action"))
         output_text = text
 
-        # Smart Actions are Pro-only. Free users still get their raw transcription
-        # pasted - we just skip the AI action and nudge them once.
+        # Smart Actions: Pro = unlimited; everyone else gets 5 free tries, then it
+        # falls back to pasting raw text (and we nudge them to upgrade).
         if action_mode != actions.ACTION_TRANSCRIBE_ONLY and not self.is_pro():
-            action_mode = actions.ACTION_TRANSCRIBE_ONLY
-            self.overlay.call_soon(
-                self.show_tray_hint,
-                "Smart Actions are Pro",
-                "Pasted your raw transcription. Upgrade to Transcribe Pro to run AI actions.",
-            )
+            if entitlements.can_use_smart_action(self.auth, self.cfg):
+                entitlements.add_smart_action_use()
+                rem = entitlements.smart_actions_remaining(None, self.cfg)
+                self.overlay.call_soon(
+                    self.show_tray_hint,
+                    "Smart Action (free trial)",
+                    f"{rem} free Smart Action(s) left. Upgrade to Pro for unlimited.",
+                )
+                # Reflect the new count in any open Settings window.
+                self.sig_auth_changed.emit()
+            else:
+                action_mode = actions.ACTION_TRANSCRIBE_ONLY
+                self.overlay.call_soon(
+                    self.show_tray_hint,
+                    "Free Smart Actions used up",
+                    "Pasted your raw text. Upgrade to Transcribe Pro for unlimited Smart Actions.",
+                )
 
         if action_mode != actions.ACTION_TRANSCRIBE_ONLY:
             # Switch the overlay to "Thinking…" while the smart action runs.

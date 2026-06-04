@@ -22,6 +22,7 @@ import storage
 logger = logging.getLogger("transcribe.entitlements")
 
 GUEST_FREE_SECONDS = 600  # 10 minutes of recording for guests
+FREE_SMART_ACTION_TRIES = 5  # free/guest users get 5 Smart Actions to try, then it locks
 
 TIER_GUEST = "guest"
 TIER_FREE = "free"
@@ -122,3 +123,35 @@ def feature_allowed(auth, feature, cfg=None):
     if feature in PRO_FEATURES:
         return tier(auth, cfg) == TIER_PRO
     return True
+
+
+# ── Smart Actions free-trial counter (5 tries for non-Pro) ────────────────────
+def smart_actions_used():
+    try:
+        return int(_load_usage().get("smart_action_uses", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def smart_actions_remaining(auth=None, cfg=None):
+    if auth is not None and tier(auth, cfg) == TIER_PRO:
+        return FREE_SMART_ACTION_TRIES  # display value; Pro is unlimited anyway
+    return max(0, FREE_SMART_ACTION_TRIES - smart_actions_used())
+
+
+def can_use_smart_action(auth, cfg=None):
+    """Pro = unlimited; everyone else gets FREE_SMART_ACTION_TRIES total."""
+    if tier(auth, cfg) == TIER_PRO:
+        return True
+    return smart_actions_used() < FREE_SMART_ACTION_TRIES
+
+
+def add_smart_action_use():
+    data = _load_usage()
+    used = smart_actions_used() + 1
+    data["smart_action_uses"] = used
+    try:
+        storage.atomic_write_json(_USAGE_PATH, data)
+    except Exception:
+        logger.debug("Could not persist smart-action usage", exc_info=True)
+    return used
