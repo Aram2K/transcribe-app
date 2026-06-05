@@ -369,6 +369,9 @@ class Settings(QDialog):
             
         self.tabs.addTab(self._create_about_tab(), about_title)
         self.tabs.addTab(self._create_account_tab(), "Account")
+        # Keep the Pro-state UI (Smart Actions counter, badges, locks) fresh
+        # whenever the user switches tabs.
+        self.tabs.currentChanged.connect(lambda _i: self.refresh_pro_state())
         layout.addWidget(self.tabs)
 
         # Bottom row - Save stays open + shows a small toast; Close dismisses.
@@ -1642,12 +1645,21 @@ class Settings(QDialog):
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(4)
 
+        # Title + badge share the top row, so the badge always has its own space
+        # and never competes with the wrapping description below it.
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
         lbl_title = QLabel(title, row_host)
         lbl_title.setStyleSheet("font-size: 15px; font-weight: 600; color: #0f172a;")
-        lbl_title.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
-        )
-        text_col.addWidget(lbl_title)
+        title_row.addWidget(lbl_title)
+        title_row.addStretch(1)
+        # Hidden PRO / "N/5 FREE" pill - shown for non-Pro users.
+        pro_badge = QLabel("PRO", row_host)
+        pro_badge.setObjectName("proBadge")
+        pro_badge.setVisible(False)
+        title_row.addWidget(pro_badge, 0, Qt.AlignVCenter)
+        text_col.addLayout(title_row)
 
         lbl_desc = QLabel(description, row_host)
         lbl_desc.setObjectName("subtitleLabel")
@@ -1659,12 +1671,6 @@ class Settings(QDialog):
         text_col.addWidget(lbl_desc)
 
         row.addLayout(text_col, 1)
-
-        # Hidden PRO pill - shown on Pro-only modes for non-Pro users.
-        pro_badge = QLabel("PRO", row_host)
-        pro_badge.setObjectName("proBadge")
-        pro_badge.setVisible(False)
-        row.addWidget(pro_badge, 0, Qt.AlignTop)
 
         outer.addWidget(row_host, 0, Qt.AlignTop)
         outer.addStretch(1)
@@ -2893,7 +2899,8 @@ class Settings(QDialog):
                     if hasattr(self, "rb_smart"):
                         self.rb_smart.setEnabled(True)
                 else:
-                    self._smart_pro_badge.setText("PRO")
+                    # Exhausted: show the count is spent AND that it's now Pro-only.
+                    self._smart_pro_badge.setText("0/5 · PRO")
                     self._smart_pro_badge.setObjectName("proBadge")
                     if hasattr(self, "rb_smart"):
                         self.rb_smart.setEnabled(False)

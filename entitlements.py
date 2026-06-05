@@ -111,11 +111,13 @@ def add_guest_seconds(seconds):
 
 
 def can_record(auth, cfg=None):
-    """Guests are capped at GUEST_FREE_SECONDS of total recording; free and pro
-    are unlimited for local dictation."""
-    if tier(auth, cfg) == TIER_GUEST:
-        return guest_seconds_remaining() > 0
-    return True
+    """The guest recording cap applies ONLY to users who are not signed in.
+    Anyone signed in (free, pro, or an admin previewing the guest tier via the
+    force-tier control) always has unlimited local dictation - we gate on real
+    authentication, never on the displayed/forced tier."""
+    if auth is not None and getattr(auth, "is_authenticated", False):
+        return True
+    return guest_seconds_remaining() > 0
 
 
 def feature_allowed(auth, feature, cfg=None):

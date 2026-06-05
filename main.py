@@ -504,25 +504,48 @@ class AudioRecorder:
         # very different gain levels - laptop mic vs. headset vs. far-field).
         self._level_peak      = 0.05
 
+    @staticmethod
+    def _whisper_device():
+        """Prefer a CUDA GPU when one is usable (much faster); else CPU int8.
+        int8_float16 keeps GPU VRAM low so it fits on small cards too."""
+        try:
+            import ctranslate2
+            if ctranslate2.get_cuda_device_count() > 0:
+                return ("cuda", "int8_float16")
+        except Exception:
+            pass
+        return ("cpu", "int8")
+
     def load_model(self, name=None):
         name = name or cfg["whisper_model"]
         with self._model_lock:
             if self._model is None or self._model_name != name:
                 from faster_whisper import WhisperModel
-                # HF cache revalidation can race or fail under flaky network
-                # /proxy conditions, producing "Unable to open file 'model.bin'"
-                # errors even when the model is fully cached on disk. Try
-                # online first, then fall back to local_files_only=True so
-                # we never block the user on a network hiccup.
-                try:
-                    self._model = WhisperModel(name, device="cpu", compute_type="int8")
-                except Exception as e:
-                    logger.warning("Whisper online load failed (%s); trying offline cache", e)
-                    self._model = WhisperModel(
-                        name, device="cpu", compute_type="int8",
-                        local_files_only=True,
-                    )
-                self._model_name = name
+                dev, ct = self._whisper_device()
+                # Try GPU first (if available), then CPU; and online first, then
+                # offline cache (HF revalidation can fail on flaky networks even
+                # when the model is fully cached). A GPU load can fail when the
+                # CUDA libraries are missing or VRAM is short - we fall back to CPU
+                # rather than erroring, so dictation always works.
+                attempts = []
+                if dev == "cuda":
+                    attempts += [("cuda", ct, False), ("cuda", ct, True)]
+                attempts += [("cpu", "int8", False), ("cpu", "int8", True)]
+                last_err = None
+                for d, c, local_only in attempts:
+                    try:
+                        self._model = WhisperModel(
+                            name, device=d, compute_type=c, local_files_only=local_only)
+                        self._model_name = name
+                        if d == "cuda":
+                            logger.info("Whisper on GPU (CUDA, %s)", c)
+                        return
+                    except Exception as e:
+                        last_err = e
+                        logger.warning("Whisper load failed on %s/%s (offline=%s): %s",
+                                       d, c, local_only, e)
+                if last_err:
+                    raise last_err
 
     def unload_model(self, name=None):
         with self._model_lock:
