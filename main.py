@@ -1285,7 +1285,7 @@ class AppController(QObject):
         is_pro = self.is_pro()
         menu = QMenu()
 
-        title_text = f"Transcribe  v{APP_VERSION}" + ("    ✦ PRO" if is_pro else "")
+        title_text = f"Transcribe  v{APP_VERSION}" + ("   ·  PRO" if is_pro else "")
         action_title = QAction(title_text, self)
         action_title.setEnabled(False)
         menu.addAction(action_title)
@@ -1301,7 +1301,7 @@ class AppController(QObject):
                 manage.triggered.connect(lambda: self.open_billing())
                 menu.addAction(manage)
             else:
-                upgrade = QAction("✦ Upgrade to Pro…", self)
+                upgrade = QAction("Upgrade to Pro…", self)
                 upgrade.triggered.connect(lambda: self._pro_upsell())
                 menu.addAction(upgrade)
             signout = QAction("Sign out", self)
@@ -1318,7 +1318,7 @@ class AppController(QObject):
 
         menu.addSeparator()
 
-        action_rec_meet = QAction("Record Meeting..." + ("" if is_pro else "  🔒"), self)
+        action_rec_meet = QAction("Record Meeting..." + ("" if is_pro else "   (Pro)"), self)
         action_rec_meet.triggered.connect(self.show_meeting)
         menu.addAction(action_rec_meet)
 
@@ -1403,6 +1403,20 @@ class AppController(QObject):
             except Exception:
                 pass
         self._was_pro = now_pro
+        # Remember the signed-in email so the sign-in form can prefill it next time
+        # (convenience only - the real session is restored from the encrypted
+        # refresh token in the OS keyring, never from this).
+        try:
+            em = (getattr(self.auth, "user_email", None) or "").strip()
+            if em and self.cfg.get("last_signin_email") != em:
+                self.cfg["last_signin_email"] = em
+                known = list(self.cfg.get("known_emails") or [])
+                if em not in known:
+                    known.insert(0, em)
+                self.cfg["known_emails"] = known[:5]
+                self.save_config()
+        except Exception:
+            logger.debug("could not remember email", exc_info=True)
         try:
             self._build_tray_menu()
         except Exception:

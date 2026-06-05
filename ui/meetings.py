@@ -294,8 +294,8 @@ class MeetingsWindow(QDialog):
     # ── Audio Device Scan ──
     def _populate_audio_devices(self):
         self.combo_device.clear()
-        self.combo_device.addItem("🔊 + 🎙️ Smart Meeting Mode (Record BOTH Computer Sound + My Microphone)", "smart_meeting")
-        self.combo_device.addItem("🎙️ Standard Mode (Record My Microphone Only)", "default_mic")
+        self.combo_device.addItem("Smart Meeting Mode (record computer sound + microphone)", "smart_meeting")
+        self.combo_device.addItem("Standard Mode (record microphone only)", "default_mic")
         
         # Get from active config
         current_dev = "smart_meeting"

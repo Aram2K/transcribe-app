@@ -91,6 +91,7 @@ class Settings(QDialog):
         for name in list(self.llm_cards.keys()):
             self._update_llm_card_ui(name)
         self._update_privacy_ui_state()
+        self._populate_history_list()
 
     def _on_save_clicked(self):
         self._sync_action_settings_from_widgets()
@@ -319,12 +320,22 @@ class Settings(QDialog):
         layout.addWidget(self.tabs)
 
         # Bottom row - Save stays open + shows a small toast; Close dismisses.
+        # Privacy Mode lives here (not in a tab) so it's reachable from anywhere.
         bottom_layout = QHBoxLayout()
+        self.chk_privacy = QCheckBox("Privacy Mode", self)
+        self.chk_privacy.setToolTip(
+            "Keep everything on your device: turns off cloud transcription and "
+            "stops saving local history."
+        )
+        self.chk_privacy.setChecked(bool(self.cfg_working.get("privacy_mode", False)))
+        self.chk_privacy.stateChanged.connect(self._save_general_configs)
+        bottom_layout.addWidget(self.chk_privacy)
+        bottom_layout.addStretch()
+
         self._saved_toast = QLabel("", self)
         self._saved_toast.setStyleSheet("color: #16a34a; font-weight: 700;")
         self._saved_toast.setVisible(False)
         bottom_layout.addWidget(self._saved_toast)
-        bottom_layout.addStretch()
 
         btn_close = QPushButton("Close", self)
         btn_close.clicked.connect(self.reject)
@@ -424,7 +435,7 @@ class Settings(QDialog):
         dev_lay.addWidget(self.combo_device)
         
         # Start meeting launch button
-        self.btn_launch_meeting = QPushButton("🚀 Start Smart Meeting Transcription", dev_frame)
+        self.btn_launch_meeting = QPushButton("Start Smart Meeting Transcription", dev_frame)
         self.btn_launch_meeting.setObjectName("primaryButton")
         self.btn_launch_meeting.setMinimumHeight(38)
         self.btn_launch_meeting.clicked.connect(self._launch_smart_meeting)
@@ -454,20 +465,13 @@ class Settings(QDialog):
         cf_lay.addWidget(cloud_desc)
         layout.addWidget(cloud_frame)
 
-        # Privacy mode checkbox
-        self.chk_privacy = QCheckBox("Privacy Mode (Disable local history, force offline local models)", tab)
-        if self.app:
-            self.chk_privacy.setChecked(bool(self.cfg_working.get("privacy_mode", False)))
-        self.chk_privacy.stateChanged.connect(self._save_general_configs)
-        layout.addWidget(self.chk_privacy)
-
         layout.addStretch()
         return tab
 
     def _populate_audio_devices(self):
         self.combo_device.clear()
-        self.combo_device.addItem("🔊 + 🎙️ Smart Meeting Mode (Record BOTH Computer Sound + My Microphone)", "smart_meeting")
-        self.combo_device.addItem("🎙️ Standard Mode (Record My Microphone Only)", "default_mic")
+        self.combo_device.addItem("Smart Meeting Mode (record computer sound + microphone)", "smart_meeting")
+        self.combo_device.addItem("Standard Mode (record microphone only)", "default_mic")
         
         # Set to current saved meeting capture mode
         current_dev = self.cfg_working.get("meeting_audio_mode", "smart_meeting")
@@ -516,56 +520,103 @@ class Settings(QDialog):
             self.app.show_meeting()
 
     # ── System specs ─────────────────────────────────────────────────────────
-    def _quick_specs(self, gpu="detecting…"):
+    def _quick_specs(self, gpu=None):
+        """A clean, plain-language one-liner: friendly CPU name + cores, RAM, and
+        (only if a real GPU is present) the GPU. No threads, no CUDA noise."""
         try:
             import psutil
-            logical = psutil.cpu_count(logical=True) or 0
-            physical = psutil.cpu_count(logical=False) or logical
+            physical = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True) or 0
             ram = psutil.virtual_memory().total / (1024 ** 3)
-            return f"🧩 CPU: {physical} cores / {logical} threads      🧠 RAM: {ram:.0f} GB      🎮 GPU: {gpu}"
+            cpu = self._cpu_name() or "Processor"
+            if physical:
+                cpu = f"{cpu} · {physical} cores"
+            lbl = lambda t: f"<b style='color:#475569'>{t}</b>&nbsp;&nbsp;"
+            gap = "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+            parts = [f"{lbl('CPU')}{cpu}", f"{lbl('RAM')}{ram:.0f} GB"]
+            if gpu:
+                parts.append(f"{lbl('GPU')}{gpu}")
+            return gap.join(parts)
         except Exception:
             return "System information unavailable."
 
     def _on_specs_ready(self, gpu):
         if hasattr(self, "_specs_label"):
-            self._specs_label.setText(self._quick_specs(gpu))
+            # Empty string → no discrete GPU → omit the GPU part entirely.
+            self._specs_label.setText(self._quick_specs(gpu or None))
 
     def _detect_gpu_async(self):
         threading.Thread(target=lambda: self.specs_ready.emit(self._detect_gpu()), daemon=True).start()
 
     @staticmethod
-    def _detect_gpu():
-        import sys, subprocess
-        try:
-            import ctranslate2
-            cuda = ctranslate2.get_cuda_device_count()
-        except Exception:
-            cuda = 0
+    def _cpu_name():
+        """Friendly processor name, e.g. 'Intel Core i7-14700' or 'AMD Ryzen 7'."""
+        import sys, re
         name = None
+        try:
+            if sys.platform == "win32":
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+                    name = winreg.QueryValueEx(k, "ProcessorNameString")[0]
+            elif sys.platform == "darwin":
+                import subprocess
+                name = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                                      capture_output=True, text=True, timeout=4).stdout.strip()
+            else:
+                with open("/proc/cpuinfo", encoding="utf-8") as f:
+                    for line in f:
+                        if "model name" in line:
+                            name = line.split(":", 1)[1].strip()
+                            break
+        except Exception:
+            name = None
+        if not name:
+            return None
+        # Strip marketing noise: (R)/(TM), "CPU"/"Processor", "@ 2.10GHz", "16-Core".
+        name = re.sub(r"\(R\)|\(TM\)|\(tm\)", "", name)
+        name = re.sub(r"\bCPU\b|\bProcessor\b|\d+-Core", "", name, flags=re.I)
+        name = re.sub(r"@.*$", "", name)
+        name = re.sub(r"\s+", " ", name).strip()
+        return name or None
+
+    @staticmethod
+    def _detect_gpu():
+        """The primary discrete GPU's name, cleaned. Empty string when the machine
+        has only integrated graphics (so the caller omits the GPU line)."""
+        import sys, subprocess, re
+        names = []
         try:
             if sys.platform == "win32":
                 out = subprocess.run(
                     ["powershell", "-NoProfile", "-Command",
-                     "(Get-CimInstance Win32_VideoController).Name -join ', '"],
+                     "(Get-CimInstance Win32_VideoController).Name -join '|'"],
                     capture_output=True, text=True, timeout=6,
                 )
-                name = (out.stdout or "").strip() or None
+                names = [n.strip() for n in (out.stdout or "").split("|") if n.strip()]
             elif sys.platform == "darwin":
                 out = subprocess.run(["system_profiler", "SPDisplaysDataType"],
                                      capture_output=True, text=True, timeout=6)
                 for line in (out.stdout or "").splitlines():
                     if "Chipset Model" in line:
-                        name = line.split(":", 1)[1].strip()
-                        break
+                        names.append(line.split(":", 1)[1].strip())
         except Exception:
-            name = None
-        if name and cuda > 0:
-            return f"{name} (CUDA x{cuda})"
-        if name:
-            return name
-        if cuda > 0:
-            return f"CUDA GPU ×{cuda}"
-        return "CPU only (no GPU acceleration)"
+            names = []
+
+        def clean(n):
+            n = re.sub(r"\(R\)|\(TM\)|\(tm\)", "", n)
+            return re.sub(r"\s+", " ", n).strip()
+
+        # Apple Silicon / Intel Macs: the chipset model is the GPU worth showing.
+        if sys.platform == "darwin":
+            return clean(names[0]) if names else ""
+
+        # Windows/Linux: show the discrete GPU; skip integrated/basic adapters.
+        discrete = ("nvidia", "geforce", "rtx", "gtx", "quadro", "tesla",
+                    "radeon", "arc", "instinct")
+        for n in names:
+            if any(k in n.lower() for k in discrete):
+                return clean(n)
+        return ""
 
     # ── TAB 2: Models Configurator ──────────────────────────────────────────
     def _create_models_tab(self):
@@ -1882,7 +1933,23 @@ class Settings(QDialog):
 
     def _update_privacy_ui_state(self):
         is_private = self.chk_privacy.isChecked() if hasattr(self, "chk_privacy") else False
-        
+
+        # Fast cloud transcription sends audio off-device, so Privacy Mode turns it
+        # off and locks it with a clear reason.
+        if hasattr(self, "chk_managed"):
+            self.chk_managed.setEnabled(not is_private)
+            self.chk_managed.setToolTip(
+                "Disabled by Privacy Mode (everything stays on your device)" if is_private else ""
+            )
+            if is_private and self.chk_managed.isChecked():
+                self.chk_managed.blockSignals(True)
+                self.chk_managed.setChecked(False)
+                self.chk_managed.blockSignals(False)
+                if self.cfg_working.get("backend") == "managed":
+                    self.cfg_working["backend"] = "local"
+        if hasattr(self, "_cloud_pro_badge"):
+            self._cloud_pro_badge.setVisible(not is_private)
+
         # Disable/grey out Mistral cards
         if hasattr(self, "mistral_cards"):
             for name, card in self.mistral_cards.items():
@@ -1964,44 +2031,116 @@ class Settings(QDialog):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
 
+        # Actions row (clear / export).
         hist_frame = QFrame(tab)
         hist_frame.setObjectName("cardFrame")
         h_lay = QVBoxLayout(hist_frame)
-        h_lay.addWidget(QLabel("Transcription History Database", hist_frame))
-        
+        h_lay.addWidget(QLabel("Transcription History", hist_frame))
+
         btn_lay = QHBoxLayout()
         btn_clear = QPushButton("Clear All History", hist_frame)
         btn_clear.clicked.connect(self._clear_all_history)
         btn_lay.addWidget(btn_clear)
-        
+
         btn_exp_csv = QPushButton("Export CSV", hist_frame)
         btn_exp_csv.clicked.connect(lambda: self._export_history("csv"))
         btn_lay.addWidget(btn_exp_csv)
-        
+
         btn_exp_txt = QPushButton("Export TXT", hist_frame)
         btn_exp_txt.clicked.connect(lambda: self._export_history("txt"))
         btn_lay.addWidget(btn_exp_txt)
         h_lay.addLayout(btn_lay)
         layout.addWidget(hist_frame)
 
-        # History toggle checkbox
+        # Search box.
+        self._history_search = QLineEdit(tab)
+        self._history_search.setPlaceholderText("Search your transcripts...")
+        self._history_search.setClearButtonEnabled(True)
+        self._history_search.setMinimumHeight(34)
+        self._history_search.textChanged.connect(lambda _t: self._populate_history_list())
+        layout.addWidget(self._history_search)
+
+        # Scrollable list of past transcripts and AI outputs (newest first).
+        self._history_scroll = QScrollArea(tab)
+        self._history_scroll.setWidgetResizable(True)
+        self._history_scroll.setFrameShape(QFrame.NoFrame)
+        self._history_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._history_container = QWidget()
+        self._history_vlay = QVBoxLayout(self._history_container)
+        self._history_vlay.setContentsMargins(0, 0, 0, 0)
+        self._history_vlay.setSpacing(8)
+        self._history_scroll.setWidget(self._history_container)
+        layout.addWidget(self._history_scroll, 1)
+        self._populate_history_list()
+
+        # History toggle checkbox.
         self.chk_history = QCheckBox("Save local transcription history", tab)
         if self.app:
             self.chk_history.setChecked(bool(self.cfg_working.get("save_history", True)))
         self.chk_history.stateChanged.connect(self._save_history_config)
         layout.addWidget(self.chk_history)
 
-        # Telemetry Consent checkbox
+        # Telemetry Consent checkbox.
         self.chk_telemetry = QCheckBox("Share anonymous usage metrics to improve Armenian AI models", tab)
         if self.app:
             self.chk_telemetry.setChecked(bool(self.app.cfg.get("analytics_enabled", True)))
         self.chk_telemetry.stateChanged.connect(self._save_telemetry_config)
         layout.addWidget(self.chk_telemetry)
 
-        layout.addStretch()
         return tab
+
+    def _populate_history_list(self):
+        """(Re)build the scrollable transcript list from saved history."""
+        if not hasattr(self, "_history_vlay"):
+            return
+        while self._history_vlay.count():
+            item = self._history_vlay.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        query = self._history_search.text().strip() if hasattr(self, "_history_search") else ""
+        try:
+            entries = hist.search(query) if query else hist.load()
+        except Exception:
+            entries = []
+
+        if not entries:
+            if query:
+                msg = "No transcripts match your search."
+            elif not self.cfg_working.get("save_history", True):
+                msg = ("History saving is off. Turn on “Save local transcription "
+                       "history” below to keep a searchable log here.")
+            else:
+                msg = "No transcripts yet. Your dictations and AI outputs will appear here."
+            empty = QLabel(msg)
+            empty.setObjectName("subtitleLabel")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setWordWrap(True)
+            empty.setContentsMargins(0, 28, 0, 28)
+            self._history_vlay.addWidget(empty)
+            self._history_vlay.addStretch()
+            return
+
+        for e in entries[:100]:
+            card = QFrame()
+            card.setObjectName("cardFrame")
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(12, 10, 12, 10)
+            cl.setSpacing(3)
+            meta_bits = [b for b in (e.get("timestamp", ""), e.get("language", ""),
+                                     e.get("backend", "")) if b]
+            meta = QLabel("   ·   ".join(meta_bits), card)
+            meta.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            cl.addWidget(meta)
+            body = QLabel(e.get("text", ""), card)
+            body.setWordWrap(True)
+            body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            cl.addWidget(body)
+            self._history_vlay.addWidget(card)
+        self._history_vlay.addStretch()
 
     def _clear_all_history(self):
         reply = QMessageBox.question(
@@ -2011,6 +2150,7 @@ class Settings(QDialog):
         )
         if reply == QMessageBox.Yes:
             hist.clear()
+            self._populate_history_list()
             QMessageBox.information(self, "Success", "History has been cleared successfully.")
 
     def _export_history(self, fmt):
@@ -2035,6 +2175,7 @@ class Settings(QDialog):
         if not self.app:
             return
         self.cfg_working["save_history"] = self.chk_history.isChecked()
+        self._populate_history_list()
 
     def _save_telemetry_config(self):
         if not self.app:
@@ -2136,13 +2277,13 @@ class Settings(QDialog):
         links_layout.setSpacing(24)
 
         lbl_web_link = QLabel(aibuben_frame)
-        lbl_web_link.setText("<a href='https://aibuben.xyz' style='color: #3b82f6; text-decoration: none; font-weight: bold;'>🌐 Visit aibuben.xyz</a>")
+        lbl_web_link.setText("<a href='https://aibuben.xyz' style='color: #3b82f6; text-decoration: none; font-weight: bold;'>Visit aibuben.xyz</a>")
         lbl_web_link.setOpenExternalLinks(True)
         lbl_web_link.setStyleSheet("font-size: 12px;")
         links_layout.addWidget(lbl_web_link)
 
         lbl_linkedin_link = QLabel(aibuben_frame)
-        lbl_linkedin_link.setText("<a href='https://www.linkedin.com/in/aram-adamyan-2k/' style='color: #0077b5; text-decoration: none; font-weight: bold;'>🔗 Aram Adamyan on LinkedIn</a>")
+        lbl_linkedin_link.setText("<a href='https://www.linkedin.com/in/aram-adamyan-2k/' style='color: #0077b5; text-decoration: none; font-weight: bold;'>Aram Adamyan on LinkedIn</a>")
         lbl_linkedin_link.setOpenExternalLinks(True)
         lbl_linkedin_link.setStyleSheet("font-size: 12px;")
         links_layout.addWidget(lbl_linkedin_link)
@@ -2176,7 +2317,7 @@ class Settings(QDialog):
 
         lbl_github_link = QLabel(contrib_frame)
         lbl_github_link.setText(
-            "<a href='https://github.com/Aram2K/transcribe-app' style='color: #22c55e; text-decoration: none; font-weight: bold;'>💻 Contribute on GitHub / Aram2K/transcribe-app</a>"
+            "<a href='https://github.com/Aram2K/transcribe-app' style='color: #22c55e; text-decoration: none; font-weight: bold;'>Contribute on GitHub / Aram2K/transcribe-app</a>"
         )
         lbl_github_link.setOpenExternalLinks(True)
         lbl_github_link.setStyleSheet("font-size: 12px;")
@@ -2239,7 +2380,7 @@ class Settings(QDialog):
         self._acct_signin_btn.clicked.connect(self._acct_sign_in)
         btns.addWidget(self._acct_signin_btn)
 
-        self._acct_upgrade_btn = QPushButton("✦ Upgrade to Pro", card)
+        self._acct_upgrade_btn = QPushButton("Upgrade to Pro", card)
         self._acct_upgrade_btn.setObjectName("primaryButton")
         self._acct_upgrade_btn.clicked.connect(self._acct_upgrade)
         btns.addWidget(self._acct_upgrade_btn)
@@ -2276,10 +2417,10 @@ class Settings(QDialog):
 
         perks = QLabel(
             "<b>Transcribe Pro</b> unlocks:<br>"
-            "&nbsp;&nbsp;🎤&nbsp; Meeting recording with AI notes<br>"
-            "&nbsp;&nbsp;🧠&nbsp; Smart Actions - rewrite, translate, summarize<br>"
-            "&nbsp;&nbsp;⚡&nbsp; Managed cloud transcription - fast, no API key<br>"
-            "&nbsp;&nbsp;⭐&nbsp; Priority models &amp; support",
+            "&nbsp;&nbsp;<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; Meeting recording with AI notes<br>"
+            "&nbsp;&nbsp;<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; Smart Actions - rewrite, translate, summarize<br>"
+            "&nbsp;&nbsp;<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; Fast cloud transcription - no API key<br>"
+            "&nbsp;&nbsp;<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; Priority models &amp; support",
             tab,
         )
         perks.setWordWrap(True)
@@ -2354,7 +2495,7 @@ class Settings(QDialog):
 
         # Tier badge: purple PRO / green FREE / gray GUEST.
         if is_pro:
-            self._acct_badge.setText("✦ PRO"); self._acct_badge.setObjectName("proBadge")
+            self._acct_badge.setText("PRO"); self._acct_badge.setObjectName("proBadge")
         elif t == entitlements.TIER_FREE:
             self._acct_badge.setText("FREE"); self._acct_badge.setObjectName("freeBadge")
         else:
@@ -2371,7 +2512,7 @@ class Settings(QDialog):
                 )
             self._welcome_label.setText(f"Welcome, {name}" if name else "Welcome")
             if is_pro:
-                self._header_badge.setText("✦ PRO"); self._header_badge.setObjectName("proBadge")
+                self._header_badge.setText("PRO"); self._header_badge.setObjectName("proBadge")
             elif t == entitlements.TIER_FREE:
                 self._header_badge.setText("FREE"); self._header_badge.setObjectName("freeBadge")
             else:

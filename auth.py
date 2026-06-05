@@ -424,24 +424,9 @@ class AuthManager:
         self._notify()
         return True
 
-    def start_trial(self):
-        """Explicitly start the one-time 3-day Pro trial. Returns True if Pro is
-        active afterward. Server-enforced: calling again never resets it."""
-        token = self.get_access_token()
-        if not token:
-            return False
-        try:
-            requests.post(
-                f"{SUPABASE_URL}/rest/v1/rpc/start_pro_trial",
-                headers=self._headers(with_auth=True),
-                json={},
-                timeout=_HTTP_TIMEOUT,
-            )
-        except requests.RequestException as e:
-            logger.warning("start_trial failed: %s", e)
-            return False
-        self.refresh_entitlement()
-        return self.is_pro
+    # The in-app, no-card trial was retired. Pro trials now run exclusively
+    # through Stripe (3-day trial on the subscription, card on file), so there is
+    # no client path to grant Pro; the server RPC is locked down to match.
 
     def _set_entitlement(self, is_pro, plan, period_end, cancel_at_period_end,
                          trial_available=False, is_admin=False):

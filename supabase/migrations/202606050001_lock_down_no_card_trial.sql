@@ -1,0 +1,12 @@
+-- Retire the in-app, no-card Pro trial.
+--
+-- Pro trials now run EXCLUSIVELY through Stripe: each payment link carries a
+-- 3-day trial_period_days with a card on file (payment_method_collection =
+-- 'always'). The old start_pro_trial() RPC could grant 3 days of Pro to any
+-- authenticated user without a card, which is a backdoor a reverse-engineered
+-- client could call directly. We revoke the ability to call it.
+--
+-- This is non-destructive: profiles.pro_trial_ends_at rows already set keep
+-- working until they expire, and my_entitlement() is unchanged. No client calls
+-- this function anymore. Re-granting execute is all it takes to reverse this.
+revoke execute on function public.start_pro_trial() from authenticated, anon, public;

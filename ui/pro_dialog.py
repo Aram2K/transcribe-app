@@ -1,6 +1,5 @@
 # Interactive "Go Pro" upgrade dialog - benefits + plan picker + checkout.
 
-import threading
 import webbrowser
 
 from PySide6.QtCore import Qt
@@ -76,23 +75,6 @@ class ProDialog(QDialog):
             cl.addLayout(row)
         root.addWidget(card)
 
-        # ── Free trial (only for signed-in users who haven't used it) ──
-        authed = bool(self.app and getattr(self.app, "auth", None) and self.app.auth.is_authenticated)
-        if authed and getattr(self.app.auth, "trial_available", False):
-            self.btn_trial = QPushButton("🎁  Start 3-day free trial - no card needed", self)
-            self.btn_trial.setMinimumHeight(44)
-            self.btn_trial.setCursor(Qt.PointingHandCursor)
-            self.btn_trial.setStyleSheet(
-                "background-color: #22c55e; border: 1px solid #16a34a; color: white;"
-                "font-weight: 700; border-radius: 10px;"
-            )
-            self.btn_trial.clicked.connect(self._start_trial)
-            root.addWidget(self.btn_trial)
-            orlbl = QLabel("or subscribe now", self)
-            orlbl.setObjectName("subtitleLabel")
-            orlbl.setAlignment(Qt.AlignCenter)
-            root.addWidget(orlbl)
-
         # ── Plan picker ──
         plans = QHBoxLayout()
         plans.setSpacing(10)
@@ -103,7 +85,7 @@ class ProDialog(QDialog):
         root.addLayout(plans)
 
         # ── CTA ──
-        self.btn_go = QPushButton("Go Pro", self)
+        self.btn_go = QPushButton("Start 3-day free trial", self)
         self.btn_go.setObjectName("primaryButton")
         self.btn_go.setMinimumHeight(46)
         self.btn_go.setStyleSheet(
@@ -188,34 +170,9 @@ class ProDialog(QDialog):
             and self.app.auth.is_authenticated
         )
         if authed:
-            self.note.setText("Secure checkout via Stripe · cancel anytime.")
+            self.note.setText("3 days free, then your plan. Cancel anytime before it ends - no charge. Secure checkout by Stripe.")
         else:
-            self.note.setText("You'll create or sign in to your account first, then checkout.")
-
-    def _start_trial(self):
-        if not (self.app and getattr(self.app, "auth", None)):
-            return
-        self.btn_trial.setEnabled(False)
-        self.btn_trial.setText("Starting your trial…")
-
-        def _run():
-            try:
-                self.app.auth.start_trial()
-            except Exception:
-                pass
-            try:
-                self.app.sig_auth_changed.emit()
-            except Exception:
-                pass
-
-        threading.Thread(target=_run, daemon=True).start()
-        try:
-            import telemetry
-            import main as m
-            telemetry.track("trial_started", {}, self.app.cfg, m.APP_VERSION)
-        except Exception:
-            pass
-        self.accept()
+            self.note.setText("You'll create or sign in to your account first, then start your free trial.")
 
     def _go(self):
         if not self.app:

@@ -4,7 +4,8 @@ import threading
 from PySide6.QtCore import Qt, QEvent, Signal, QSize
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QCheckBox, QStackedWidget, QWidget, QLineEdit, QMessageBox, QFrame
+    QComboBox, QCheckBox, QStackedWidget, QWidget, QLineEdit, QMessageBox, QFrame,
+    QApplication, QCompleter
 )
 from PySide6.QtGui import QFont, QColor, QIcon
 import local_llm
@@ -47,6 +48,18 @@ class Onboarding(QDialog):
         self._build_ui()
         self.btn_hotkey.installEventFilter(self)
         self.installEventFilter(self)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Center on the active screen every time it opens (avoids the window
+        # appearing cut off at the top-left on first launch).
+        scr = self.screen() or QApplication.primaryScreen()
+        if scr:
+            geo = scr.availableGeometry()
+            self.move(
+                geo.x() + (geo.width() - self.width()) // 2,
+                geo.y() + (geo.height() - self.height()) // 2,
+            )
 
     def _build_ui(self):
         self.main_layout = QVBoxLayout(self)
@@ -128,11 +141,21 @@ class Onboarding(QDialog):
         self._name_input.setVisible(False)
         cl.addWidget(self._name_input)
 
-        # Email
+        # Email - prefilled with the last email used, with autocomplete from any
+        # previously used emails so returning users don't retype.
         self._email_input = QLineEdit(card)
         self._email_input.setPlaceholderText("you@email.com")
         self._email_input.setMinimumHeight(38)
         cl.addWidget(self._email_input)
+        known_emails = (self.app.cfg.get("known_emails") if self.app else None) or []
+        last_email = (self.app.cfg.get("last_signin_email") if self.app else "") or ""
+        if last_email:
+            self._email_input.setText(last_email)
+        if known_emails:
+            comp = QCompleter(known_emails, self._email_input)
+            comp.setCaseSensitivity(Qt.CaseInsensitive)
+            comp.setFilterMode(Qt.MatchContains)
+            self._email_input.setCompleter(comp)
 
         # Password + show/hide toggle
         pw_row = QHBoxLayout()
