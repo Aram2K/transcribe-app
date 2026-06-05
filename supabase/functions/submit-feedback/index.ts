@@ -67,28 +67,33 @@ Deno.serve(async (req) => {
   const svc = SERVICE_KEY ? createClient(SUPABASE_URL, SERVICE_KEY) : null;
   if (!svc) return json({ error: "server_misconfigured" }, 500);
 
-  // Optional screenshot -> public storage URL.
-  let imageUrl = "";
-  const imageB64 = (body?.image ?? "").toString();
-  if (imageB64) {
+  // Optional screenshots -> public storage URLs. Accepts a single `image` or an
+  // `images` array (up to 4).
+  const imageList: string[] = Array.isArray(body?.images)
+    ? body.images
+    : (body?.image ? [body.image] : []);
+  const imageUrls: string[] = [];
+  for (const item of imageList.slice(0, 4)) {
     try {
-      const raw = imageB64.includes(",") ? imageB64.split(",", 2)[1] : imageB64;
+      const s = (item ?? "").toString();
+      const raw = s.includes(",") ? s.split(",", 2)[1] : s;
       const bytes = b64ToBytes(raw);
       if (bytes.length > 0 && bytes.length <= 6_000_000) {
-        const path = `${user.id}/${Date.now()}.png`;
+        const path = `${user.id}/${Date.now()}-${imageUrls.length}.png`;
         const up = await svc.storage.from("feedback").upload(path, bytes, {
           contentType: "image/png",
           upsert: false,
         });
         if (!up.error) {
           const { data: pub } = svc.storage.from("feedback").getPublicUrl(path);
-          imageUrl = pub?.publicUrl ?? "";
+          if (pub?.publicUrl) imageUrls.push(pub.publicUrl);
         }
       }
     } catch (_e) {
-      // Non-fatal: still save the feedback without the image.
+      // Non-fatal: still save the feedback without this image.
     }
   }
+  const imageUrl = imageUrls.length ? imageUrls.join("\n") : "";
 
   // Always persist the feedback so "Send" works even before a GitHub token is
   // set. The founder can read it in the Supabase dashboard meanwhile.
@@ -106,7 +111,7 @@ Deno.serve(async (req) => {
   let issueUrl: string | null = null;
   if (GITHUB_TOKEN) {
     try {
-      const imageMd = imageUrl ? `\n\n![screenshot](${imageUrl})` : "";
+      const imageMd = imageUrls.map((u) => `\n\n![screenshot](${u})`).join("");
       const firstLine = message.split("\n")[0].slice(0, 70).trim() || "feedback";
       const title = `[${category}] ${firstLine}`;
       const issueBody =

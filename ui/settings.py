@@ -2522,7 +2522,7 @@ class Settings(QDialog):
 
         fb_sub = QLabel(
             "Tell us what to build next - a feature, a language or model, or a bug. "
-            "Paste a screenshot straight into the box with Ctrl+V.", fb)
+            "Paste up to 4 screenshots with Ctrl+V.", fb)
         fb_sub.setObjectName("subtitleLabel")
         fb_sub.setWordWrap(True)
         fb_lay.addWidget(fb_sub)
@@ -2530,26 +2530,17 @@ class Settings(QDialog):
         # Chat-style input: type text and paste/drop PNG/JPG images with Ctrl+V.
         self._fb_text = FeedbackTextEdit(self._fb_on_image, fb)
         self._fb_text.setPlaceholderText(
-            "Type your feedback, idea, or bug report... (paste a screenshot with Ctrl+V)")
+            "Type your feedback, idea, or bug report... (paste screenshots with Ctrl+V)")
         self._fb_text.setMinimumHeight(90)
         self._fb_text.setMaximumHeight(150)
         fb_lay.addWidget(self._fb_text)
 
-        # Thumbnail preview of a pasted image (hidden until one is added).
+        # Thumbnails of pasted images, each with its own remove button (hidden
+        # until at least one is added).
         self._fb_thumb_row = QWidget(fb)
-        _trow = QHBoxLayout(self._fb_thumb_row)
-        _trow.setContentsMargins(0, 0, 0, 0)
-        _trow.setSpacing(8)
-        self._fb_thumb = QLabel(self._fb_thumb_row)
-        self._fb_thumb.setStyleSheet("border: 1px solid #e2e8f0; border-radius: 6px;")
-        _trow.addWidget(self._fb_thumb)
-        _rm = QPushButton("Remove", self._fb_thumb_row)
-        _rm.setFlat(True)
-        _rm.setCursor(Qt.PointingHandCursor)
-        _rm.setStyleSheet("color: #ef4444; border: none;")
-        _rm.clicked.connect(self._fb_clear_image)
-        _trow.addWidget(_rm)
-        _trow.addStretch()
+        self._fb_thumb_lay = QHBoxLayout(self._fb_thumb_row)
+        self._fb_thumb_lay.setContentsMargins(0, 0, 0, 0)
+        self._fb_thumb_lay.setSpacing(8)
         self._fb_thumb_row.setVisible(False)
         fb_lay.addWidget(self._fb_thumb_row)
 
@@ -2570,7 +2561,7 @@ class Settings(QDialog):
         self._fb_status.setWordWrap(True)
         fb_lay.addWidget(self._fb_status)
 
-        self._fb_image_b64 = None
+        self._fb_images = []  # list of QImage, sent as PNG base64
         layout.addWidget(fb)
         self._fb_update_auth_state()
 
@@ -2593,30 +2584,61 @@ class Settings(QDialog):
         return tab
 
     # ── Feedback / feature request ──────────────────────────────────────────
+    _FB_MAX_IMAGES = 4
+
     def _fb_on_image(self, qimage):
-        """Receive an image pasted/dropped into the feedback box (any format),
-        store it as PNG base64, and show a thumbnail preview."""
+        """Receive an image pasted/dropped into the feedback box (any format).
+        We keep up to 4 and show a thumbnail for each."""
         from PySide6.QtCore import QBuffer, QIODevice
-        from PySide6.QtGui import QPixmap
-        import base64
+        if len(self._fb_images) >= self._FB_MAX_IMAGES:
+            self._fb_set_status(f"You can attach up to {self._FB_MAX_IMAGES} images.", error=True)
+            return
         buf = QBuffer()
         buf.open(QIODevice.WriteOnly)
         qimage.save(buf, "PNG")
-        data = bytes(buf.data())
-        if len(data) > 6_000_000:
+        if len(bytes(buf.data())) > 6_000_000:
             self._fb_set_status("That image is too large (max ~6 MB).", error=True)
             return
-        self._fb_image_b64 = base64.b64encode(data).decode("ascii")
-        self._fb_thumb.setPixmap(QPixmap.fromImage(qimage).scaledToHeight(48, Qt.SmoothTransformation))
-        self._fb_thumb_row.setVisible(True)
-        self._fb_set_status("Screenshot added.", error=False)
+        self._fb_images.append(qimage)
+        self._fb_render_thumbs()
+        self._fb_set_status(f"{len(self._fb_images)} image(s) attached.", error=False)
 
-    def _fb_clear_image(self):
-        self._fb_image_b64 = None
-        if hasattr(self, "_fb_thumb"):
-            self._fb_thumb.clear()
-        if hasattr(self, "_fb_thumb_row"):
-            self._fb_thumb_row.setVisible(False)
+    def _fb_render_thumbs(self):
+        from PySide6.QtGui import QPixmap
+        while self._fb_thumb_lay.count():
+            it = self._fb_thumb_lay.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+        for i, img in enumerate(self._fb_images):
+            cell = QWidget(self._fb_thumb_row)
+            cl = QHBoxLayout(cell)
+            cl.setContentsMargins(0, 0, 0, 0)
+            cl.setSpacing(2)
+            thumb = QLabel(cell)
+            thumb.setPixmap(QPixmap.fromImage(img).scaledToHeight(44, Qt.SmoothTransformation))
+            thumb.setStyleSheet("border: 1px solid #e2e8f0; border-radius: 6px;")
+            cl.addWidget(thumb)
+            x = QPushButton("×", cell)  # ×
+            x.setFixedSize(18, 18)
+            x.setCursor(Qt.PointingHandCursor)
+            x.setStyleSheet("color:#ef4444; border:none; font-weight:800;")
+            x.setAutoDefault(False)
+            x.clicked.connect(lambda _=False, idx=i: self._fb_remove_image(idx))
+            cl.addWidget(x, 0, Qt.AlignTop)
+            self._fb_thumb_lay.addWidget(cell)
+        self._fb_thumb_lay.addStretch()
+        self._fb_thumb_row.setVisible(bool(self._fb_images))
+
+    def _fb_remove_image(self, idx):
+        if 0 <= idx < len(self._fb_images):
+            del self._fb_images[idx]
+            self._fb_render_thumbs()
+
+    def _fb_clear_images(self):
+        self._fb_images = []
+        if hasattr(self, "_fb_thumb_lay"):
+            self._fb_render_thumbs()
 
     def _fb_update_auth_state(self):
         """Only signed-in users can send feedback; guests see a sign-in prompt."""
@@ -2632,7 +2654,7 @@ class Settings(QDialog):
                 "Type your feedback, idea, or bug report... (paste a screenshot with Ctrl+V)")
         else:
             self._fb_text.setPlaceholderText("Sign in to send feedback and feature requests.")
-            self._fb_clear_image()
+            self._fb_clear_images()
             self._fb_set_status("", error=False)
 
     def _fb_set_status(self, text, error=False):
@@ -2654,7 +2676,16 @@ class Settings(QDialog):
             return
         self._fb_send_btn.setEnabled(False)
         self._fb_set_status("Sending...", error=False)
-        img = self._fb_image_b64
+        # Convert the pasted images to PNG base64 on the GUI thread (Qt image ops
+        # belong here), then hand the plain strings to the worker.
+        import base64
+        from PySide6.QtCore import QBuffer, QIODevice
+        imgs_b64 = []
+        for img in self._fb_images:
+            buf = QBuffer()
+            buf.open(QIODevice.WriteOnly)
+            img.save(buf, "PNG")
+            imgs_b64.append(base64.b64encode(bytes(buf.data())).decode("ascii"))
         import main as m
         version = getattr(m, "APP_VERSION", "")
 
@@ -2666,8 +2697,8 @@ class Settings(QDialog):
                     self.feedback_finished.emit(False, "Your session expired. Sign in again.")
                     return
                 payload = {"message": msg, "app_version": version, "category": "feedback"}
-                if img:
-                    payload["image"] = img
+                if imgs_b64:
+                    payload["images"] = imgs_b64
                 resp = requests.post(
                     m.FEEDBACK_URL, json=payload,
                     headers={"Authorization": f"Bearer {token}"}, timeout=30)
@@ -2690,7 +2721,7 @@ class Settings(QDialog):
         self._fb_set_status(message, error=not ok)
         if ok:
             self._fb_text.clear()
-            self._fb_clear_image()
+            self._fb_clear_images()
 
     def _acct_sign_in(self):
         if self.app and hasattr(self.app, "show_auth_gate"):

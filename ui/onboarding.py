@@ -46,6 +46,13 @@ class Onboarding(QDialog):
         self.analytics_val = bool(self.app.cfg.get("analytics_enabled", True)) if self.app else True
         
         self._build_ui()
+        # No button anywhere in this window should be "auto-default": pressing
+        # Enter must never trigger a button by accident. This caused a
+        # password-reset email on every email sign-in (Enter was also firing
+        # "Forgot password?"). The intended submit is handled by returnPressed.
+        for _b in self.findChildren(QPushButton):
+            _b.setAutoDefault(False)
+            _b.setDefault(False)
         self.btn_hotkey.installEventFilter(self)
         self.installEventFilter(self)
 
@@ -226,6 +233,15 @@ class Onboarding(QDialog):
         self.btn_google.clicked.connect(self._choose_google)
         cl.addWidget(self.btn_google)
 
+        # Pressing Enter to sign in must NOT also fire another button. Qt makes
+        # buttons "auto-default" inside dialogs, so Enter was triggering "Forgot
+        # password?" on every email sign-in (a reset email each time). The
+        # password field's returnPressed already submits, so turn auto-default
+        # off everywhere.
+        for _b in card.findChildren(QPushButton):
+            _b.setAutoDefault(False)
+            _b.setDefault(False)
+
         lay.addWidget(card)
 
         # Guest
@@ -233,6 +249,8 @@ class Onboarding(QDialog):
         self.btn_guest.setFlat(True)
         self.btn_guest.setStyleSheet("color: #475569; border: none; font-weight: 600;")
         self.btn_guest.clicked.connect(self._choose_guest)
+        self.btn_guest.setAutoDefault(False)
+        self.btn_guest.setDefault(False)
         lay.addWidget(self.btn_guest, alignment=Qt.AlignCenter)
 
         guest_note = QLabel(
