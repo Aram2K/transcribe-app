@@ -127,12 +127,19 @@ Deno.serve(async (req) => {
       if (ghResp.ok) {
         const issue = await ghResp.json();
         issueUrl = issue.html_url ?? null;
-        if (issueUrl && row?.id) {
-          await svc.from("feedback").update({ issue_url: issueUrl }).eq("id", row.id);
+        if (row?.id) {
+          await svc.from("feedback").update({ issue_url: issueUrl, github_error: null }).eq("id", row.id);
+        }
+      } else {
+        const detail = (await ghResp.text()).slice(0, 250);
+        if (row?.id) {
+          await svc.from("feedback").update({ github_error: `HTTP ${ghResp.status}: ${detail}` }).eq("id", row.id);
         }
       }
-    } catch (_e) {
-      // Non-fatal: feedback is already saved.
+    } catch (e) {
+      if (row?.id) {
+        await svc.from("feedback").update({ github_error: `exception: ${String(e).slice(0, 180)}` }).eq("id", row.id);
+      }
     }
   }
 
