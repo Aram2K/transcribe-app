@@ -21,6 +21,54 @@ class DownloadProgressSignal(QObject):
     progress = Signal(str, int, int, int) # model_name, percent, downloaded, total
     finished = Signal(str, str)          # model_name, state ("downloaded" / "failed")
 
+
+class FeedbackTextEdit(QTextEdit):
+    """A chat-style input: type text and paste or drop PNG/JPG images with Ctrl+V.
+    Pasted images are handed to `on_image(QImage)` instead of being inserted as
+    rich text, so they show up as a thumbnail and get sent with the feedback."""
+
+    def __init__(self, on_image, parent=None):
+        super().__init__(parent)
+        self._on_image = on_image
+        self.setAcceptDrops(True)
+
+    def _extract_image(self, source):
+        from PySide6.QtGui import QImage, QPixmap
+        if source.hasImage():
+            raw = source.imageData()
+            if isinstance(raw, QImage):
+                return raw if not raw.isNull() else None
+            if isinstance(raw, QPixmap):
+                img = raw.toImage()
+                return img if not img.isNull() else None
+        if source.hasUrls():
+            for url in source.urls():
+                p = url.toLocalFile()
+                if p and p.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")):
+                    img = QImage(p)
+                    if not img.isNull():
+                        return img
+        return None
+
+    def canInsertFromMimeData(self, source):
+        if source.hasImage() or source.hasUrls():
+            return True
+        return super().canInsertFromMimeData(source)
+
+    def insertFromMimeData(self, source):
+        img = self._extract_image(source)
+        if img is not None:
+            try:
+                self._on_image(img)
+            except Exception:
+                pass
+            return
+        if source.hasText():
+            self.insertPlainText(source.text())
+        else:
+            super().insertFromMimeData(source)
+
+
 class Settings(QDialog):
     mistral_test_finished = Signal(bool, str)
     google_test_finished = Signal(bool, str)
@@ -2474,27 +2522,42 @@ class Settings(QDialog):
 
         fb_sub = QLabel(
             "Tell us what to build next - a feature, a language or model, or a bug. "
-            "You can attach or paste a screenshot.", fb)
+            "Paste a screenshot straight into the box with Ctrl+V.", fb)
         fb_sub.setObjectName("subtitleLabel")
         fb_sub.setWordWrap(True)
         fb_lay.addWidget(fb_sub)
 
-        self._fb_text = QTextEdit(fb)
-        self._fb_text.setPlaceholderText("Type your feedback, idea, or bug report...")
+        # Chat-style input: type text and paste/drop PNG/JPG images with Ctrl+V.
+        self._fb_text = FeedbackTextEdit(self._fb_on_image, fb)
+        self._fb_text.setPlaceholderText(
+            "Type your feedback, idea, or bug report... (paste a screenshot with Ctrl+V)")
         self._fb_text.setMinimumHeight(90)
         self._fb_text.setMaximumHeight(150)
         fb_lay.addWidget(self._fb_text)
 
+        # Thumbnail preview of a pasted image (hidden until one is added).
+        self._fb_thumb_row = QWidget(fb)
+        _trow = QHBoxLayout(self._fb_thumb_row)
+        _trow.setContentsMargins(0, 0, 0, 0)
+        _trow.setSpacing(8)
+        self._fb_thumb = QLabel(self._fb_thumb_row)
+        self._fb_thumb.setStyleSheet("border: 1px solid #e2e8f0; border-radius: 6px;")
+        _trow.addWidget(self._fb_thumb)
+        _rm = QPushButton("Remove", self._fb_thumb_row)
+        _rm.setFlat(True)
+        _rm.setCursor(Qt.PointingHandCursor)
+        _rm.setStyleSheet("color: #ef4444; border: none;")
+        _rm.clicked.connect(self._fb_clear_image)
+        _trow.addWidget(_rm)
+        _trow.addStretch()
+        self._fb_thumb_row.setVisible(False)
+        fb_lay.addWidget(self._fb_thumb_row)
+
         fb_row = QHBoxLayout()
-        self._fb_attach_btn = QPushButton("Attach image", fb)
-        self._fb_attach_btn.clicked.connect(self._fb_attach_image)
-        fb_row.addWidget(self._fb_attach_btn)
-        self._fb_paste_btn = QPushButton("Paste image", fb)
-        self._fb_paste_btn.clicked.connect(self._fb_paste_image)
-        fb_row.addWidget(self._fb_paste_btn)
-        self._fb_image_label = QLabel("", fb)
-        self._fb_image_label.setObjectName("subtitleLabel")
-        fb_row.addWidget(self._fb_image_label)
+        self._fb_signin_btn = QPushButton("Sign in to send feedback", fb)
+        self._fb_signin_btn.setCursor(Qt.PointingHandCursor)
+        self._fb_signin_btn.clicked.connect(self._acct_sign_in)
+        fb_row.addWidget(self._fb_signin_btn)
         fb_row.addStretch()
         self._fb_send_btn = QPushButton("Send", fb)
         self._fb_send_btn.setObjectName("primaryButton")
@@ -2509,6 +2572,7 @@ class Settings(QDialog):
 
         self._fb_image_b64 = None
         layout.addWidget(fb)
+        self._fb_update_auth_state()
 
         self._acct_perks = QLabel(
             "<div style='font-size:11px; line-height:150%;'>"
@@ -2529,42 +2593,47 @@ class Settings(QDialog):
         return tab
 
     # ── Feedback / feature request ──────────────────────────────────────────
-    def _fb_attach_image(self):
-        from PySide6.QtWidgets import QFileDialog
-        import base64
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Attach image", os.path.expanduser("~"),
-            "Images (*.png *.jpg *.jpeg *.bmp *.gif)")
-        if not path:
-            return
-        try:
-            with open(path, "rb") as f:
-                raw = f.read()
-            if len(raw) > 6_000_000:
-                self._fb_set_status("Image is too large (max ~6 MB).", error=True)
-                return
-            self._fb_image_b64 = base64.b64encode(raw).decode("ascii")
-            self._fb_image_label.setText("Image attached")
-        except Exception as e:
-            self._fb_set_status(f"Could not read image: {e}", error=True)
-
-    def _fb_paste_image(self):
-        from PySide6.QtWidgets import QApplication
+    def _fb_on_image(self, qimage):
+        """Receive an image pasted/dropped into the feedback box (any format),
+        store it as PNG base64, and show a thumbnail preview."""
         from PySide6.QtCore import QBuffer, QIODevice
+        from PySide6.QtGui import QPixmap
         import base64
-        img = QApplication.clipboard().image()
-        if img.isNull():
-            self._fb_set_status("No image found on the clipboard. Copy a screenshot first.", error=True)
-            return
         buf = QBuffer()
         buf.open(QIODevice.WriteOnly)
-        img.save(buf, "PNG")
+        qimage.save(buf, "PNG")
         data = bytes(buf.data())
         if len(data) > 6_000_000:
-            self._fb_set_status("Pasted image is too large (max ~6 MB).", error=True)
+            self._fb_set_status("That image is too large (max ~6 MB).", error=True)
             return
         self._fb_image_b64 = base64.b64encode(data).decode("ascii")
-        self._fb_image_label.setText("Image pasted")
+        self._fb_thumb.setPixmap(QPixmap.fromImage(qimage).scaledToHeight(48, Qt.SmoothTransformation))
+        self._fb_thumb_row.setVisible(True)
+        self._fb_set_status("Screenshot added.", error=False)
+
+    def _fb_clear_image(self):
+        self._fb_image_b64 = None
+        if hasattr(self, "_fb_thumb"):
+            self._fb_thumb.clear()
+        if hasattr(self, "_fb_thumb_row"):
+            self._fb_thumb_row.setVisible(False)
+
+    def _fb_update_auth_state(self):
+        """Only signed-in users can send feedback; guests see a sign-in prompt."""
+        if not hasattr(self, "_fb_text"):
+            return
+        authed = bool(self.app and getattr(self.app, "auth", None)
+                      and self.app.auth.is_authenticated)
+        self._fb_text.setEnabled(authed)
+        self._fb_send_btn.setVisible(authed)
+        self._fb_signin_btn.setVisible(not authed)
+        if authed:
+            self._fb_text.setPlaceholderText(
+                "Type your feedback, idea, or bug report... (paste a screenshot with Ctrl+V)")
+        else:
+            self._fb_text.setPlaceholderText("Sign in to send feedback and feature requests.")
+            self._fb_clear_image()
+            self._fb_set_status("", error=False)
 
     def _fb_set_status(self, text, error=False):
         self._fb_status.setText(text)
@@ -2621,8 +2690,7 @@ class Settings(QDialog):
         self._fb_set_status(message, error=not ok)
         if ok:
             self._fb_text.clear()
-            self._fb_image_b64 = None
-            self._fb_image_label.setText("")
+            self._fb_clear_image()
 
     def _acct_sign_in(self):
         if self.app and hasattr(self.app, "show_auth_gate"):
@@ -2867,6 +2935,9 @@ class Settings(QDialog):
         # Pro users already have everything, so don't sell them the perks list.
         if hasattr(self, "_acct_perks"):
             self._acct_perks.setVisible(not is_pro)
+        # Feedback box is sign-in gated; refresh when auth state changes.
+        if hasattr(self, "_fb_text"):
+            self._fb_update_auth_state()
 
     def _check_for_updates(self):
         if self.app and self.cfg_working.get("pending_update_version"):

@@ -1,14 +1,14 @@
-// In-app feedback -> GitHub issue.
+// In-app feedback -> Supabase table (+ optional GitHub issue).
 //
-// A signed-in user types feedback / a feature request (optionally with a pasted
-// or attached screenshot). We verify their Supabase JWT, upload any image to the
-// public `feedback` storage bucket with the service role, then open a GitHub
-// issue via the REST API using a SERVER-held token. The founder receives
-// GitHub's normal "new issue" notification email, so no separate mail service is
-// needed.
+// A signed-in user types feedback / a feature request, optionally pasting a
+// screenshot. We verify their Supabase JWT, upload any image to the public
+// `feedback` storage bucket, and ALWAYS save the feedback to the `feedback`
+// table (service role) so "Send" works out of the box. If a GitHub token is
+// configured we also open an issue, which sends the founder GitHub's normal
+// "new issue" email - no separate mail service needed.
 //
-// Secrets required:
-//   GITHUB_TOKEN - a fine-grained PAT with "Issues: read and write" on the repo.
+// Optional secrets (the table save works without them):
+//   GITHUB_TOKEN - fine-grained PAT with "Issues: read and write" on the repo.
 //   GITHUB_REPO  - "owner/repo" (defaults to Aram2K/transcribe-app).
 // Auto-provided by Supabase: SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY.
 // Deploy with verify_jwt=false; we validate the token via auth.getUser().
@@ -64,17 +64,17 @@ Deno.serve(async (req) => {
   const appVersion = (body?.app_version ?? "").toString().slice(0, 20);
   const category = (body?.category ?? "feedback").toString().slice(0, 30);
 
-  if (!GITHUB_TOKEN) return json({ error: "feedback_not_configured" }, 503);
+  const svc = SERVICE_KEY ? createClient(SUPABASE_URL, SERVICE_KEY) : null;
+  if (!svc) return json({ error: "server_misconfigured" }, 500);
 
   // Optional screenshot -> public storage URL.
-  let imageMd = "";
+  let imageUrl = "";
   const imageB64 = (body?.image ?? "").toString();
-  if (imageB64 && SERVICE_KEY) {
+  if (imageB64) {
     try {
       const raw = imageB64.includes(",") ? imageB64.split(",", 2)[1] : imageB64;
       const bytes = b64ToBytes(raw);
       if (bytes.length > 0 && bytes.length <= 6_000_000) {
-        const svc = createClient(SUPABASE_URL, SERVICE_KEY);
         const path = `${user.id}/${Date.now()}.png`;
         const up = await svc.storage.from("feedback").upload(path, bytes, {
           contentType: "image/png",
@@ -82,39 +82,59 @@ Deno.serve(async (req) => {
         });
         if (!up.error) {
           const { data: pub } = svc.storage.from("feedback").getPublicUrl(path);
-          if (pub?.publicUrl) imageMd = `\n\n![screenshot](${pub.publicUrl})`;
+          imageUrl = pub?.publicUrl ?? "";
         }
       }
     } catch (_e) {
-      // Non-fatal: still file the issue without the image.
+      // Non-fatal: still save the feedback without the image.
     }
   }
 
-  const firstLine = message.split("\n")[0].slice(0, 70).trim() || "feedback";
-  const title = `[${category}] ${firstLine}`;
-  const issueBody =
-    `${message}${imageMd}\n\n---\n` +
-    `Submitted from Transcribe ${appVersion || "(unknown version)"}\n` +
-    `From: ${user.email ?? "unknown"} (user ${user.id})`;
+  // Always persist the feedback so "Send" works even before a GitHub token is
+  // set. The founder can read it in the Supabase dashboard meanwhile.
+  const { data: row, error: insErr } = await svc.from("feedback").insert({
+    user_id: user.id,
+    email: user.email ?? null,
+    message,
+    image_url: imageUrl || null,
+    app_version: appVersion || null,
+    category,
+  }).select("id").single();
+  if (insErr) return json({ error: "save_failed", detail: (insErr.message ?? "").slice(0, 120) }, 500);
 
-  const ghResp = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/issues`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${GITHUB_TOKEN}`,
-      "Accept": "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "transcribe-feedback",
-      "Content-Type": "application/json",
-    },
-    // No `labels`: GitHub 422s if a label doesn't already exist in the repo.
-    // The "[category]" title prefix categorizes the issue instead.
-    body: JSON.stringify({ title, body: issueBody }),
-  });
-
-  if (!ghResp.ok) {
-    const t = await ghResp.text();
-    return json({ error: "github_failed", detail: t.slice(0, 160) }, 502);
+  // Bonus: open a GitHub issue (which emails the founder) when a token is set.
+  let issueUrl: string | null = null;
+  if (GITHUB_TOKEN) {
+    try {
+      const imageMd = imageUrl ? `\n\n![screenshot](${imageUrl})` : "";
+      const firstLine = message.split("\n")[0].slice(0, 70).trim() || "feedback";
+      const title = `[${category}] ${firstLine}`;
+      const issueBody =
+        `${message}${imageMd}\n\n---\n` +
+        `Submitted from Transcribe ${appVersion || "(unknown version)"}\n` +
+        `From: ${user.email ?? "unknown"} (user ${user.id})`;
+      const ghResp = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/issues`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${GITHUB_TOKEN}`,
+          "Accept": "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "transcribe-feedback",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ title, body: issueBody }),
+      });
+      if (ghResp.ok) {
+        const issue = await ghResp.json();
+        issueUrl = issue.html_url ?? null;
+        if (issueUrl && row?.id) {
+          await svc.from("feedback").update({ issue_url: issueUrl }).eq("id", row.id);
+        }
+      }
+    } catch (_e) {
+      // Non-fatal: feedback is already saved.
+    }
   }
-  const issue = await ghResp.json();
-  return json({ ok: true, url: issue.html_url });
+
+  return json({ ok: true, saved: true, url: issueUrl });
 });
