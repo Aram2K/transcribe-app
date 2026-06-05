@@ -2604,33 +2604,47 @@ class Settings(QDialog):
         self._fb_set_status(f"{len(self._fb_images)} image(s) attached.", error=False)
 
     def _fb_render_thumbs(self):
+        from PySide6.QtWidgets import QGridLayout
         from PySide6.QtGui import QPixmap
         while self._fb_thumb_lay.count():
             it = self._fb_thumb_lay.takeAt(0)
             w = it.widget()
             if w:
                 w.deleteLater()
+        SIZE = 54
         for i, img in enumerate(self._fb_images):
-            pm = QPixmap.fromImage(img).scaledToHeight(48, Qt.SmoothTransformation)
-            # The thumbnail is a fixed-size label; the remove button is overlaid
-            # in its top-right corner (a red circle with a white x), like a chat
-            # input. A little top/right padding leaves room for that badge.
-            cell = QLabel(self._fb_thumb_row)
-            cell.setPixmap(pm)
-            cell.setFixedSize(pm.width() + 8, pm.height() + 8)
-            cell.setStyleSheet("border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 8px 0 0;")
-            x = QPushButton("×", cell)
-            x.setFixedSize(16, 16)
-            x.setCursor(Qt.PointingHandCursor)
-            x.setToolTip("Remove image")
-            x.setAutoDefault(False)
-            x.setStyleSheet(
-                "QPushButton { background:#ef4444; color:white; border:none;"
-                " border-radius:8px; font-weight:800; font-size:12px; }"
-                "QPushButton:hover { background:#dc2626; }")
-            x.move(cell.width() - 16, 0)
-            x.clicked.connect(lambda _=False, idx=i: self._fb_remove_image(idx))
-            self._fb_thumb_lay.addWidget(cell)
+            # A fixed-size chip. The remove badge is placed by a QGridLayout in the
+            # chip's top-right corner (no absolute positioning, so it can never
+            # drift over the text box).
+            chip = QFrame(self._fb_thumb_row)
+            chip.setObjectName("fbChip")  # scope the style so it won't hit the child QLabel
+            chip.setFixedSize(SIZE, SIZE)
+            chip.setStyleSheet(
+                "QFrame#fbChip { background:#f1f5f9; border:1px solid #e2e8f0; border-radius:8px; }")
+            g = QGridLayout(chip)
+            g.setContentsMargins(3, 3, 3, 3)
+            g.setSpacing(0)
+
+            thumb = QLabel(chip)
+            thumb.setAlignment(Qt.AlignCenter)
+            thumb.setStyleSheet("background: transparent; border: none;")
+            thumb.setPixmap(QPixmap.fromImage(img).scaled(
+                SIZE - 6, SIZE - 6, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            g.addWidget(thumb, 0, 0)
+
+            rm = QPushButton("×", chip)  # multiplication sign
+            rm.setFixedSize(18, 18)
+            rm.setCursor(Qt.PointingHandCursor)
+            rm.setToolTip("Remove image")
+            rm.setAutoDefault(False)
+            rm.setStyleSheet(
+                "QPushButton { background: rgba(15,23,42,0.72); color: white; border: none;"
+                " border-radius: 9px; font-weight: 700; font-size: 12px; }"
+                "QPushButton:hover { background: #0f172a; }")
+            rm.clicked.connect(lambda _=False, idx=i: self._fb_remove_image(idx))
+            g.addWidget(rm, 0, 0, Qt.AlignTop | Qt.AlignRight)
+
+            self._fb_thumb_lay.addWidget(chip)
         self._fb_thumb_lay.addStretch()
         self._fb_thumb_row.setVisible(bool(self._fb_images))
 
