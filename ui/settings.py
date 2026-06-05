@@ -736,7 +736,11 @@ class Settings(QDialog):
         section_mistral.setStyleSheet("color: #3b82f6; margin-top: 14px; margin-bottom: 2px;")
         scroll_lay.addWidget(section_mistral)
 
-        mistral_notice = QLabel("Mistral's Voxtral transcription runs via the cloud (API key required).")
+        mistral_notice = QLabel(
+            "Cloud transcription. Pro: no key needed. Free: add your Mistral key below.  "
+            "Best for English and major European languages; for Armenian, use local "
+            "Whisper (Recommended) or Gemini.")
+        mistral_notice.setWordWrap(True)
         mistral_notice.setObjectName("subtitleLabel")
         mistral_notice.setStyleSheet("margin-bottom: 8px;")
         scroll_lay.addWidget(mistral_notice)
@@ -891,17 +895,87 @@ class Settings(QDialog):
         card_lay.addLayout(btn_lay)
         return card
 
+    def _cloud_card_needs_key(self, provider_name):
+        """Free users must add their own key (or upgrade to Pro for keyless cloud)."""
+        from PySide6.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setWindowTitle("Cloud transcription")
+        box.setText(
+            f"To use {provider_name} cloud transcription, add your API key below in "
+            f"Cloud API Credentials.\n\nOr upgrade to Pro to use it with no key - we "
+            f"handle the cloud for you.")
+        up = box.addButton("Upgrade to Pro", QMessageBox.AcceptRole)
+        box.addButton("Add my key", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() == up and self.app and hasattr(self.app, "_pro_upsell"):
+            self.app._pro_upsell("Keyless cloud transcription")
+
+    def _refresh_cloud_cards(self):
+        for m_name in list(self.whisper_cards.keys()):
+            self._update_whisper_card_ui(m_name)
+        for m_name in list(getattr(self, "mistral_cards", {}).keys()):
+            self._update_mistral_card_ui(m_name)
+        self._update_google_card_ui()
+
     def _use_mistral(self, name):
-        if self.app:
+        if not self.app:
+            return
+        if self._is_pro():
+            # Pro: managed cloud (server key) - no BYO key needed.
+            self.cfg_working["backend"] = "managed"
+            self.cfg_working["managed_provider"] = "mistral"
+            self.cfg_working["mistral_stt_model"] = name
+        else:
+            if not (self.cfg_working.get("mistral_api_key") or "").strip():
+                self._cloud_card_needs_key("Mistral Voxtral")
+                return
             self.cfg_working["backend"] = "mistral"
             self.cfg_working["mistral_stt_model"] = name
-            
-            # Repopulate UIs
-            for m_name in list(self.whisper_cards.keys()):
-                self._update_whisper_card_ui(m_name)
-            for m_name in list(self.mistral_cards.keys()):
-                self._update_mistral_card_ui(m_name)
-            self._update_google_card_ui()
+        self._refresh_cloud_cards()
+
+    def _apply_cloud_card_state(self, card, provider, byo_selected, is_verified):
+        """Render a cloud STT card. Pro users get a keyless, Pro-styled button that
+        routes through the managed cloud; free users use their own key."""
+        pro = self._is_pro()
+        cw = self.cfg_working
+        managed_here = (cw.get("backend") == "managed" and cw.get("managed_provider") == provider)
+        is_active = (pro and managed_here) or (byo_selected and is_verified)
+
+        card.setStyleSheet("")
+        card.btn_action.setStyleSheet("")
+        card.btn_action.setEnabled(True)
+
+        if is_active:
+            card.setObjectName("activeCardFrame")
+            card.lbl_state.setText("Active")
+            card.lbl_state.setStyleSheet("color: #22c55e; font-weight: bold;")
+            card.btn_action.setText("Currently Active")
+            card.btn_action.setEnabled(False)
+            card.btn_action.setObjectName("")
+        else:
+            card.setObjectName("cardFrame")
+            if pro:
+                card.lbl_state.setText("Pro · no key needed")
+                card.lbl_state.setStyleSheet("color: #a855f7; font-weight: bold;")
+                card.btn_action.setText("Use with Pro")
+                card.btn_action.setObjectName("")
+                card.btn_action.setStyleSheet(
+                    "background-color:#a855f7; border:1px solid #9333ea; color:white;"
+                    " font-weight:700; border-radius:6px; padding:6px 14px;")
+            elif byo_selected:
+                card.lbl_state.setText("Selected · needs key")
+                card.lbl_state.setStyleSheet("color: #f97316; font-weight: bold;")
+                card.btn_action.setText("Use Model")
+                card.btn_action.setObjectName("primaryButton")
+            else:
+                card.lbl_state.setText("Cloud Model")
+                card.lbl_state.setStyleSheet("color: #64748b;")
+                card.btn_action.setText("Use Model")
+                card.btn_action.setObjectName("primaryButton")
+
+        card.style().unpolish(card); card.style().polish(card)
+        card.btn_action.style().unpolish(card.btn_action)
+        card.btn_action.style().polish(card.btn_action)
 
     def _privacy_on(self):
         return bool(getattr(self, "chk_privacy", None) and self.chk_privacy.isChecked())
@@ -933,42 +1007,12 @@ class Settings(QDialog):
         if self._privacy_on():
             self._apply_disabled_cloud_card(card)
             return
-
-        # Clear any privacy styling left over from a previous pass.
-        card.setStyleSheet("")
-        card.btn_action.setStyleSheet("")
-
-        is_selected = (
+        byo_selected = (
             self.cfg_working.get("backend") == "mistral" and
             self.cfg_working.get("mistral_stt_model") == name
         )
-
-        is_verified = getattr(self, "_mistral_key_verified", False)
-        is_active = is_selected and is_verified
-
-        if is_active:
-            card.setObjectName("activeCardFrame")
-            card.lbl_state.setText("Active")
-            card.lbl_state.setStyleSheet("color: #22c55e; font-weight: bold;")
-            card.btn_action.setText("Currently Active")
-            card.btn_action.setEnabled(False)
-            card.btn_action.setObjectName("")
-        else:
-            card.setObjectName("cardFrame")
-            if is_selected:
-                card.lbl_state.setText("Selected · needs key")
-                card.lbl_state.setStyleSheet("color: #f97316; font-weight: bold;")
-            else:
-                card.lbl_state.setText("Cloud Model")
-                card.lbl_state.setStyleSheet("color: #64748b;")
-            card.btn_action.setText("Use Model")
-            card.btn_action.setEnabled(True)
-            card.btn_action.setObjectName("primaryButton")
-
-        card.style().unpolish(card)
-        card.style().polish(card)
-        card.btn_action.style().unpolish(card.btn_action)
-        card.btn_action.style().polish(card.btn_action)
+        self._apply_cloud_card_state(
+            card, "mistral", byo_selected, getattr(self, "_mistral_key_verified", False))
 
     def _build_google_card(self, info):
         card = QFrame()
@@ -1021,16 +1065,17 @@ class Settings(QDialog):
         return card
 
     def _use_google(self):
-        if self.app:
+        if not self.app:
+            return
+        if self._is_pro():
+            self.cfg_working["backend"] = "managed"
+            self.cfg_working["managed_provider"] = "gemini"
+        else:
+            if not (self.cfg_working.get("google_api_key") or "").strip():
+                self._cloud_card_needs_key("Google Gemini")
+                return
             self.cfg_working["backend"] = "google"
-            
-            # Repopulate UIs
-            for m_name in list(self.whisper_cards.keys()):
-                self._update_whisper_card_ui(m_name)
-            if hasattr(self, "mistral_cards"):
-                for m_name in list(self.mistral_cards.keys()):
-                    self._update_mistral_card_ui(m_name)
-            self._update_google_card_ui()
+        self._refresh_cloud_cards()
 
     def _update_google_card_ui(self):
         card = getattr(self, "google_card", None)
@@ -1039,39 +1084,9 @@ class Settings(QDialog):
         if self._privacy_on():
             self._apply_disabled_cloud_card(card)
             return
-
-        # Clear any privacy styling left over from a previous pass.
-        card.setStyleSheet("")
-        card.btn_action.setStyleSheet("")
-
-        is_selected = (self.cfg_working.get("backend") == "google")
-        is_verified = getattr(self, "_google_key_verified", False)
-        is_active = is_selected and is_verified
-
-        if is_active:
-            card.setObjectName("activeCardFrame")
-            card.lbl_state.setText("Active")
-            card.lbl_state.setStyleSheet("color: #22c55e; font-weight: bold;")
-            card.btn_action.setText("Currently Active")
-            card.btn_action.setEnabled(False)
-            card.btn_action.setObjectName("")
-        else:
-            card.setObjectName("cardFrame")
-            if is_selected:
-                card.lbl_state.setText("Selected · needs key")
-                card.lbl_state.setStyleSheet("color: #f97316; font-weight: bold;")
-            else:
-                card.lbl_state.setText("Cloud Model")
-                card.lbl_state.setStyleSheet("color: #64748b;")
-            card.btn_action.setText("Use Model")
-            card.btn_action.setEnabled(True)
-            card.btn_action.setObjectName("primaryButton")
-
-        card.style().unpolish(card)
-        card.style().polish(card)
-        if hasattr(card, "btn_action"):
-            card.btn_action.style().unpolish(card.btn_action)
-            card.btn_action.style().polish(card.btn_action)
+        byo_selected = (self.cfg_working.get("backend") == "google")
+        self._apply_cloud_card_state(
+            card, "gemini", byo_selected, getattr(self, "_google_key_verified", False))
 
     def _test_mistral_key(self):
         key = self.mistral_key_input.text().strip()
@@ -3052,6 +3067,9 @@ class Settings(QDialog):
         # Feedback box is sign-in gated; refresh when auth state changes.
         if hasattr(self, "_fb_text"):
             self._fb_update_auth_state()
+        # Cloud STT cards switch between Pro (keyless) and free (BYO key) styling.
+        if hasattr(self, "google_card") or hasattr(self, "mistral_cards"):
+            self._refresh_cloud_cards()
 
     def _check_for_updates(self):
         if self.app and self.cfg_working.get("pending_update_version"):

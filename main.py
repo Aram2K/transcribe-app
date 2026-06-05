@@ -1069,7 +1069,12 @@ class AudioRecorder:
                           "fr": "French", "de": "German", "es": "Spanish", "ar": "Arabic"}
             lang_hint = ""
             if lang_setting in lang_names:
-                lang_hint = f" The audio is spoken in {lang_names[lang_setting]}."
+                nm = lang_names[lang_setting]
+                # A strong, explicit instruction makes Gemini stay in the target
+                # language and native script (e.g. Armenian) instead of drifting
+                # to English or transliteration.
+                lang_hint = (f" The speaker is speaking {nm}. Transcribe in {nm} using its"
+                             f" native script and return only {nm} text.")
 
             model_name = cfg.get("google_stt_model", "gemini-2.5-flash")
             url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -1117,15 +1122,19 @@ class AudioRecorder:
             wav_bytes = self._float_to_wav(audio)  # full WAV; the proxy sends it to Gemini
             b64_data = base64.b64encode(wav_bytes).decode("utf-8")
 
+            # Pro users pick which managed provider to use (server keys): Gemini
+            # (default) or Mistral. No BYO key is involved here.
+            provider = cfg.get("managed_provider", "gemini")
             resp = requests.post(
                 MANAGED_PROXY_URL,
                 json={
                     "audio": b64_data,
                     "sample_rate": cfg["sample_rate"],
                     "language": cfg["language"],
+                    "provider": provider,
                 },
                 headers={"Authorization": f"Bearer {token}"},
-                timeout=20,
+                timeout=30,
             )
             if resp.status_code == 403:
                 return "", "!managed:Pro required for managed cloud transcription."
