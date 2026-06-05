@@ -225,13 +225,17 @@ def start_ipc_server(server_sock, on_action):
 # ── System Info ───────────────────────────────────────────────────────────────
 RAM_GB = psutil.virtual_memory().total / (1024 ** 3)
 
+# speed_rank is a relative compute cost (1 = fastest). The UI turns it into a
+# plain-language estimate adjusted for the user's hardware (GPU vs CPU), instead
+# of a fixed "~Ns" that is meaningless across machines. min_ram is a realistic,
+# monotonic minimum-recommended system RAM for the int8 runtime.
 MODELS = {
-    "tiny":           {"min_ram": 2,  "speed": "~0.5s", "quality": "Good",        "size": "75 MB",   "armenian": None},
-    "base":           {"min_ram": 4,  "speed": "~1s",   "quality": "Better",      "size": "140 MB",  "armenian": None},
-    "small":          {"min_ram": 6,  "speed": "~3s",   "quality": "Great",       "size": "460 MB",  "armenian": None},
-    "medium":         {"min_ram": 10, "speed": "~8s",   "quality": "Excellent",   "size": "1.4 GB",  "armenian": None},
-    "large-v3-turbo": {"min_ram": 8,  "speed": "~5s",   "quality": "Best (fast)", "size": "1.6 GB",  "armenian": "Recommended for Armenian"},
-    "large-v3":       {"min_ram": 16, "speed": "~15s",  "quality": "Best",        "size": "3 GB",    "armenian": None},
+    "tiny":           {"min_ram": 2,  "speed_rank": 1, "quality": "Good",        "size": "75 MB",   "armenian": None},
+    "base":           {"min_ram": 2,  "speed_rank": 2, "quality": "Better",      "size": "140 MB",  "armenian": None},
+    "small":          {"min_ram": 4,  "speed_rank": 3, "quality": "Great",       "size": "460 MB",  "armenian": None},
+    "medium":         {"min_ram": 6,  "speed_rank": 5, "quality": "Excellent",   "size": "1.4 GB",  "armenian": None},
+    "large-v3-turbo": {"min_ram": 6,  "speed_rank": 4, "quality": "Best (fast)", "size": "1.6 GB",  "armenian": "Recommended for Armenian"},
+    "large-v3":       {"min_ram": 8,  "speed_rank": 6, "quality": "Best",        "size": "3 GB",    "armenian": None},
 }
 
 LANG_NAMES = {
@@ -960,47 +964,55 @@ class AudioRecorder:
         return text, lang_arg
 
     def _run_google(self, audio):
+        # Uses the Google AI Studio (Gemini) API, which accepts a plain API key.
+        # (Google Cloud Speech-to-Text rejects API keys and needs OAuth/service
+        # accounts, so the key people copy from AI Studio could never work there.)
         try:
             import requests
-            url = f"https://speech.googleapis.com/v1/speech:recognize?key={cfg['google_api_key']}"
-            
-            # Convert float32 back to linear16 bytes
-            wav_bytes = self._float_to_wav(audio)
-            
-            # Strip WAV header (44 bytes) to get raw PCM data
-            raw_pcm = wav_bytes[44:]
-            
-            b64_data = base64.b64encode(raw_pcm).decode("utf-8")
-            
-            lang_setting = cfg["language"]
-            main_lang = "hy-AM" if lang_setting == "hy" else ("ru-RU" if lang_setting == "ru" else "en-US")
-            
+            key = (cfg.get("google_api_key") or "").strip()
+            if not key:
+                return "", "!google:Add your Google AI Studio (Gemini) API key in Settings."
+
+            wav_bytes = self._float_to_wav(audio)  # full WAV; Gemini reads the header
+            b64_data = base64.b64encode(wav_bytes).decode("utf-8")
+
+            lang_setting = cfg.get("language", "auto")
+            lang_names = {"hy": "Armenian", "ru": "Russian", "en": "English",
+                          "fr": "French", "de": "German", "es": "Spanish", "ar": "Arabic"}
+            lang_hint = ""
+            if lang_setting in lang_names:
+                lang_hint = f" The audio is spoken in {lang_names[lang_setting]}."
+
+            model_name = cfg.get("google_stt_model", "gemini-2.5-flash")
+            url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+                   f"{model_name}:generateContent?key={key}")
             payload = {
-                "config": {
-                    "encoding": "LINEAR16",
-                    "sampleRateHertz": cfg["sample_rate"],
-                    "languageCode": main_lang,
-                },
-                "audio": {
-                    "content": b64_data
-                }
+                "contents": [{
+                    "parts": [
+                        {"text": ("Transcribe this audio verbatim. Output only the exact "
+                                  "spoken words with correct punctuation and capitalization, "
+                                  "and nothing else." + lang_hint)},
+                        {"inline_data": {"mime_type": "audio/wav", "data": b64_data}},
+                    ]
+                }],
+                "generationConfig": {"temperature": 0},
             }
-            
-            if lang_setting == "auto":
-                payload["config"]["alternativeLanguageCodes"] = ["hy-AM", "en-US", "ru-RU", "fr-FR", "de-DE", "es-ES", "ar-EG"]
-                
-            resp = requests.post(url, json=payload, timeout=20)
+            resp = requests.post(url, json=payload, timeout=30)
             if resp.status_code != 200:
-                return "", f"!google:HTTP {resp.status_code}: {resp.text[:80]}"
-                
+                detail = resp.text[:120]
+                try:
+                    detail = resp.json().get("error", {}).get("message", detail)[:120]
+                except Exception:
+                    pass
+                return "", f"!google:HTTP {resp.status_code}: {detail}"
+
             data = resp.json()
-            results = data.get("results", [])
-            if not results:
+            cands = data.get("candidates", [])
+            if not cands:
                 return "", "en"
-                
-            text = " ".join(r.get("alternatives", [{}])[0].get("transcript", "") for r in results)
-            lang = results[0].get("languageCode", "en-US").split("-")[0]
-            return text, lang
+            parts = cands[0].get("content", {}).get("parts", [])
+            text = "".join(p.get("text", "") for p in parts).strip()
+            return text, (lang_setting if lang_setting != "auto" else "en")
         except Exception as e:
             return "", f"!google:{e}"
 
@@ -1019,9 +1031,8 @@ class AudioRecorder:
             if not token:
                 return "", "!managed:Sign in to use managed cloud transcription."
 
-            wav_bytes = self._float_to_wav(audio)
-            raw_pcm = wav_bytes[44:]  # strip 44-byte WAV header → raw LINEAR16
-            b64_data = base64.b64encode(raw_pcm).decode("utf-8")
+            wav_bytes = self._float_to_wav(audio)  # full WAV; the proxy sends it to Gemini
+            b64_data = base64.b64encode(wav_bytes).decode("utf-8")
 
             resp = requests.post(
                 MANAGED_PROXY_URL,
@@ -1450,25 +1461,33 @@ class AppController(QObject):
                 "(Customer Portal not configured yet)."
             )
 
-    def toggle_privacy_mode(self):
-        """Flip Privacy Mode from anywhere (tray). Privacy forces everything local:
-        no cloud/managed backend, no history."""
-        new = not self.cfg.get("privacy_mode", False)
-        self.cfg["privacy_mode"] = new
-        if new:
+    def set_privacy_mode(self, on, notify=True):
+        """Apply Privacy Mode globally and immediately. Privacy forces everything
+        local: no cloud/managed backend, no history. Called from the tray and from
+        the in-app footer checkbox so the two stay in lockstep."""
+        on = bool(on)
+        if on == bool(self.cfg.get("privacy_mode", False)):
+            return  # no change
+        self.cfg["privacy_mode"] = on
+        if on:
             self.cfg["backend"] = "local"   # privacy = on-device only
         self.save_config()
-        self.show_tray_hint(
-            "Privacy Mode ON" if new else "Privacy Mode OFF",
-            "Everything stays on your device - cloud features are disabled."
-            if new else "Cloud features are available again.",
-        )
+        if notify:
+            self.show_tray_hint(
+                "Privacy Mode ON" if on else "Privacy Mode OFF",
+                "Everything stays on your device - cloud features are disabled."
+                if on else "Cloud features are available again.",
+            )
         # Refresh any open Settings window + rebuild the tray checkmark.
         self.sig_auth_changed.emit()
         try:
             self._build_tray_menu()
         except Exception:
             pass
+
+    def toggle_privacy_mode(self):
+        """Flip Privacy Mode from the tray."""
+        self.set_privacy_mode(not self.cfg.get("privacy_mode", False))
 
     def _pro_upsell(self, feature=None):
         try:

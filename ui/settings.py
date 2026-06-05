@@ -34,8 +34,10 @@ class Settings(QDialog):
         self.cfg_working = copy.deepcopy(self.app.cfg if self.app else {})
         
         self.setWindowTitle("Settings")
-        self.setMinimumSize(580, 680)
-        self.resize(600, 760)
+        # Wider so the cloud model cards (badge + state + buttons) are not clipped
+        # on the right.
+        self.setMinimumSize(660, 680)
+        self.resize(720, 780)
         
         # Apply global stylesheet
         if self.app and hasattr(self.app, "style_content"):
@@ -138,7 +140,7 @@ class Settings(QDialog):
                 QMessageBox.warning(
                     self,
                     "API Key Required",
-                    "Google Cloud Speech STT requires a valid Google Speech API Key. Please enter it below before saving."
+                    "Google Gemini Speech requires a valid Google AI Studio (Gemini) API key. Please enter it below before saving."
                 )
                 return
             if getattr(self, "_google_key_verified", False) is False:
@@ -150,7 +152,7 @@ class Settings(QDialog):
                 QMessageBox.warning(
                     self,
                     "Invalid API Key",
-                    "The provided Google Speech API Key failed connection tests. Please test a valid API key before saving."
+                    "The provided Google AI Studio (Gemini) API key failed connection tests. Please test a valid key before saving."
                 )
                 return
 
@@ -328,7 +330,7 @@ class Settings(QDialog):
             "stops saving local history."
         )
         self.chk_privacy.setChecked(bool(self.cfg_working.get("privacy_mode", False)))
-        self.chk_privacy.stateChanged.connect(self._save_general_configs)
+        self.chk_privacy.stateChanged.connect(self._on_privacy_toggled)
         bottom_layout.addWidget(self.chk_privacy)
         bottom_layout.addStretch()
 
@@ -544,6 +546,25 @@ class Settings(QDialog):
             # Empty string → no discrete GPU → omit the GPU part entirely.
             self._specs_label.setText(self._quick_specs(gpu or None))
 
+    def _speed_phrase(self, rank):
+        """Plain-language speed estimate adjusted for this machine's hardware
+        (whether a CUDA GPU is usable), instead of a meaningless fixed '~Ns'."""
+        if getattr(self, "_cuda", None) is None:
+            try:
+                import ctranslate2
+                self._cuda = ctranslate2.get_cuda_device_count() > 0
+            except Exception:
+                self._cuda = False
+        try:
+            rank = int(rank)
+        except (TypeError, ValueError):
+            rank = 3
+        if self._cuda:
+            words = {1: "Instant", 2: "Instant", 3: "Very fast", 4: "Very fast", 5: "Fast", 6: "Fast"}
+            return f"{words.get(rank, 'Fast')} on your GPU"
+        words = {1: "Very fast", 2: "Fast", 3: "Fast", 4: "Moderate", 5: "Slow", 6: "Slower"}
+        return f"{words.get(rank, 'Moderate')} on your CPU"
+
     def _detect_gpu_async(self):
         threading.Thread(target=lambda: self.specs_ready.emit(self._detect_gpu()), daemon=True).start()
 
@@ -670,19 +691,19 @@ class Settings(QDialog):
             "voxtral-mini-latest": {
                 "name": "Voxtral Mini",
                 "badge": "Fast / Low Cost",
-                "specs": "Speed: Ultra Fast (~0.2s response)  ·  Smart dictation & audio understanding",
+                "specs": "Fastest  ·  smart dictation and audio understanding",
                 "description": "Optimized for basic edge and standard transcription tasks."
             },
             "voxtral-small-latest": {
                 "name": "Voxtral Small",
                 "badge": "Balanced",
-                "specs": "Speed: Fast (~0.5s response)  ·  High accuracy & multi-language translation",
+                "specs": "Balanced  ·  high accuracy, multilingual",
                 "description": "Production-scale high-capability model for balanced performance."
             },
             "voxtral-large-latest": {
                 "name": "Voxtral Large",
                 "badge": "Highest Quality",
-                "specs": "Speed: Moderate (~1.0s response)  ·  SOTA transcription & complex understanding",
+                "specs": "Highest quality  ·  SOTA transcription and understanding",
                 "description": "Mistral's flagship, largest, and most capable voice understanding model."
             }
         }
@@ -694,16 +715,16 @@ class Settings(QDialog):
             self._update_mistral_card_ui(name)
             
         # Section 3: Google Cloud STT
-        section_google = QLabel("Google Cloud Speech STT")
+        section_google = QLabel("Google Gemini Speech (AI Studio)")
         section_google.setFont(QFont("Segoe UI", 12, QFont.Bold))
         section_google.setStyleSheet("color: #3b82f6; margin-top: 14px; margin-bottom: 2px;")
         scroll_lay.addWidget(section_google)
         
         google_info = {
-            "name": "Google Cloud Speech-to-Text API",
-            "badge": "Enterprise Cloud",
-            "specs": "Speed: Fast (~0.4s response)  ·  Robust, enterprise-grade cloud recognition",
-            "description": "Google's production speech recognition API with support for over 120 languages."
+            "name": "Google Gemini Speech",
+            "badge": "AI Studio key",
+            "specs": "Fast cloud transcription  ·  120+ languages",
+            "description": "Uses your free Google AI Studio (Gemini) API key. Paste it in Cloud API Credentials below."
         }
         self.google_card = self._build_google_card(google_info)
         scroll_lay.addWidget(self.google_card)
@@ -742,7 +763,13 @@ class Settings(QDialog):
         m_test_lay.addWidget(self.lbl_status_mistral)
         kf_lay.addLayout(m_test_lay)
         
-        kf_lay.addWidget(QLabel("Google Speech API Key", self.keys_frame))
+        kf_lay.addWidget(QLabel("Google AI Studio (Gemini) API Key", self.keys_frame))
+        google_hint = QLabel(
+            "Get a free key at aistudio.google.com/apikey (this is a Gemini key, "
+            "not a Google Cloud Speech key).", self.keys_frame)
+        google_hint.setObjectName("subtitleLabel")
+        google_hint.setWordWrap(True)
+        kf_lay.addWidget(google_hint)
         self.google_key_input = QLineEdit(self.keys_frame)
         self.google_key_input.setPlaceholderText("AIzaSy...")
         self.google_key_input.setEchoMode(QLineEdit.Password)
@@ -831,19 +858,49 @@ class Settings(QDialog):
                 self._update_mistral_card_ui(m_name)
             self._update_google_card_ui()
 
+    def _privacy_on(self):
+        return bool(getattr(self, "chk_privacy", None) and self.chk_privacy.isChecked())
+
+    def _apply_disabled_cloud_card(self, card, state_text="Off in Privacy Mode"):
+        """Clean, readable 'deactivated' look for a cloud STT card: pale card, muted
+        state, and a clearly disabled (non-clickable) button - no dashed borders."""
+        card.setObjectName("cardFrame")
+        card.setEnabled(True)  # keep the text readable; only the button is disabled
+        card.setStyleSheet("QFrame#cardFrame { background-color: #f8fafc; border: 1px solid #e9eef5; }")
+        if hasattr(card, "lbl_state"):
+            card.lbl_state.setText(state_text)
+            card.lbl_state.setStyleSheet("color: #94a3b8; font-weight: 600;")
+        if hasattr(card, "btn_action"):
+            card.btn_action.setText("Use Model")
+            card.btn_action.setEnabled(False)
+            card.btn_action.setObjectName("")
+            card.btn_action.setStyleSheet(
+                "color:#94a3b8; background-color:#eef2f7; border:1px solid #e2e8f0; border-radius:6px;")
+        card.style().unpolish(card); card.style().polish(card)
+        if hasattr(card, "btn_action"):
+            card.btn_action.style().unpolish(card.btn_action)
+            card.btn_action.style().polish(card.btn_action)
+
     def _update_mistral_card_ui(self, name):
         card = self.mistral_cards.get(name)
         if not card:
             return
-            
+        if self._privacy_on():
+            self._apply_disabled_cloud_card(card)
+            return
+
+        # Clear any privacy styling left over from a previous pass.
+        card.setStyleSheet("")
+        card.btn_action.setStyleSheet("")
+
         is_selected = (
-            self.cfg_working.get("backend") == "mistral" and 
+            self.cfg_working.get("backend") == "mistral" and
             self.cfg_working.get("mistral_stt_model") == name
         )
-        
+
         is_verified = getattr(self, "_mistral_key_verified", False)
         is_active = is_selected and is_verified
-        
+
         if is_active:
             card.setObjectName("activeCardFrame")
             card.lbl_state.setText("Active")
@@ -854,7 +911,7 @@ class Settings(QDialog):
         else:
             card.setObjectName("cardFrame")
             if is_selected:
-                card.lbl_state.setText("Selected (Needs Working Key)")
+                card.lbl_state.setText("Selected · needs key")
                 card.lbl_state.setStyleSheet("color: #f97316; font-weight: bold;")
             else:
                 card.lbl_state.setText("Cloud Model")
@@ -862,7 +919,7 @@ class Settings(QDialog):
             card.btn_action.setText("Use Model")
             card.btn_action.setEnabled(True)
             card.btn_action.setObjectName("primaryButton")
-            
+
         card.style().unpolish(card)
         card.style().polish(card)
         card.btn_action.style().unpolish(card.btn_action)
@@ -934,11 +991,18 @@ class Settings(QDialog):
         card = getattr(self, "google_card", None)
         if not card:
             return
-            
+        if self._privacy_on():
+            self._apply_disabled_cloud_card(card)
+            return
+
+        # Clear any privacy styling left over from a previous pass.
+        card.setStyleSheet("")
+        card.btn_action.setStyleSheet("")
+
         is_selected = (self.cfg_working.get("backend") == "google")
         is_verified = getattr(self, "_google_key_verified", False)
         is_active = is_selected and is_verified
-        
+
         if is_active:
             card.setObjectName("activeCardFrame")
             card.lbl_state.setText("Active")
@@ -949,7 +1013,7 @@ class Settings(QDialog):
         else:
             card.setObjectName("cardFrame")
             if is_selected:
-                card.lbl_state.setText("Selected (Needs Working Key)")
+                card.lbl_state.setText("Selected · needs key")
                 card.lbl_state.setStyleSheet("color: #f97316; font-weight: bold;")
             else:
                 card.lbl_state.setText("Cloud Model")
@@ -957,13 +1021,12 @@ class Settings(QDialog):
             card.btn_action.setText("Use Model")
             card.btn_action.setEnabled(True)
             card.btn_action.setObjectName("primaryButton")
-            
-        if card:
-            card.style().unpolish(card)
-            card.style().polish(card)
-            if hasattr(card, "btn_action"):
-                card.btn_action.style().unpolish(card.btn_action)
-                card.btn_action.style().polish(card.btn_action)
+
+        card.style().unpolish(card)
+        card.style().polish(card)
+        if hasattr(card, "btn_action"):
+            card.btn_action.style().unpolish(card.btn_action)
+            card.btn_action.style().polish(card.btn_action)
 
     def _test_mistral_key(self):
         key = self.mistral_key_input.text().strip()
@@ -1015,43 +1078,26 @@ class Settings(QDialog):
         def worker():
             import requests
             try:
-                url = f"https://speech.googleapis.com/v1/speech:recognize?key={key}"
-                payload = {
-                    "config": {
-                        "encoding": "LINEAR16",
-                        "sampleRateHertz": 16000,
-                        "languageCode": "en-US"
-                    },
-                    "audio": {
-                        "content": "AAAA"
-                    }
-                }
-                resp = requests.post(url, json=payload, timeout=10)
+                # Google AI Studio (Gemini) keys are validated against the models
+                # endpoint, which accepts a plain API key (unlike Cloud Speech).
+                url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
+                resp = requests.get(url, timeout=10)
                 if resp.status_code == 200:
                     self.google_test_finished.emit(True, "Working!")
                 else:
-                    err_msg, status = "", ""
+                    err_msg = ""
                     try:
-                        err_obj = resp.json().get("error", {})
-                        err_msg = err_obj.get("message", "")
-                        status = err_obj.get("status", "")
+                        err_msg = resp.json().get("error", {}).get("message", "")
                     except Exception:
                         err_msg = (resp.text or "")[:80]
-
                     low = err_msg.lower()
-                    if "api key not valid" in low or "api_key_invalid" in low:
-                        self.google_test_finished.emit(False, "Invalid API Key")
-                    elif status == "PERMISSION_DENIED" or "disabled" in low or "has not been used" in low:
-                        self.google_test_finished.emit(False, f"API key valid, but: {err_msg[:60]}")
-                    elif resp.status_code == 400:
-                        # Auth succeeded; the request was rejected only because of
-                        # the dummy test audio - the key itself works.
-                        self.google_test_finished.emit(True, "Working!")
+                    if "api key not valid" in low or "api_key_invalid" in low or resp.status_code == 400:
+                        self.google_test_finished.emit(False, "Invalid API key")
                     else:
                         self.google_test_finished.emit(False, f"HTTP {resp.status_code}: {err_msg[:50]}")
             except Exception as e:
                 self.google_test_finished.emit(False, f"Connection error: {str(e)[:50]}")
-                
+
         import threading
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1110,7 +1156,7 @@ class Settings(QDialog):
         card_lay.addLayout(title_row)
 
         # Specs row
-        specs = f"RAM: min {info.get('min_ram')} GB  ·  Speed: {info.get('speed')}"
+        specs = f"Needs ~{info.get('min_ram')} GB RAM  ·  {self._speed_phrase(info.get('speed_rank', 3))}"
         if info.get("armenian"):
             specs += f"  ·  {info.get('armenian')}"
         lbl_specs = QLabel(specs, card)
@@ -1860,6 +1906,14 @@ class Settings(QDialog):
             
         self._save_action_configs()
 
+    def _on_privacy_toggled(self, _state=None):
+        # Privacy Mode is global and immediate (mirrors the tray toggle): apply it
+        # to the live app config and rebuild the tray now, not only on Save, so the
+        # in-app checkbox and the tray switch always agree.
+        self._save_general_configs()
+        if self.app and hasattr(self.app, "set_privacy_mode"):
+            self.app.set_privacy_mode(self.chk_privacy.isChecked(), notify=False)
+
     def _save_general_configs(self):
         if not self.app:
             return
@@ -1933,9 +1987,10 @@ class Settings(QDialog):
 
     def _update_privacy_ui_state(self):
         is_private = self.chk_privacy.isChecked() if hasattr(self, "chk_privacy") else False
+        PALE = "QFrame { background-color: #f8fafc; border: 1px solid #e9eef5; border-radius: 10px; }"
 
         # Fast cloud transcription sends audio off-device, so Privacy Mode turns it
-        # off and locks it with a clear reason.
+        # off and locks it. The PRO badge stays visible but pales (not hidden).
         if hasattr(self, "chk_managed"):
             self.chk_managed.setEnabled(not is_private)
             self.chk_managed.setToolTip(
@@ -1948,58 +2003,36 @@ class Settings(QDialog):
                 if self.cfg_working.get("backend") == "managed":
                     self.cfg_working["backend"] = "local"
         if hasattr(self, "_cloud_pro_badge"):
-            self._cloud_pro_badge.setVisible(not is_private)
+            self._cloud_pro_badge.setStyleSheet(
+                "background-color:#e2e8f0; color:#94a3b8; border-radius:6px; padding:1px 6px; font-weight:700;"
+                if is_private else ""
+            )
 
-        # Disable/grey out Mistral cards
+        # Cloud STT cards render their own privacy-aware disabled look (pale card +
+        # disabled button), so just refresh them - no dashed overlay.
         if hasattr(self, "mistral_cards"):
-            for name, card in self.mistral_cards.items():
-                card.setEnabled(not is_private)
-                if is_private:
-                    card.setStyleSheet("background-color: #f1f5f9; border: 1px dashed #cbd5e1;")
-                else:
-                    self._update_mistral_card_ui(name)
-                    
-        # Disable/grey out Google card
-        if hasattr(self, "google_card") and self.google_card:
-            self.google_card.setEnabled(not is_private)
-            if is_private:
-                self.google_card.setStyleSheet("background-color: #f1f5f9; border: 1px dashed #cbd5e1;")
-            else:
-                self._update_google_card_ui()
-                
-        # Disable/grey out API credentials frame
-        if hasattr(self, "keys_frame") and self.keys_frame:
-            self.keys_frame.setEnabled(not is_private)
-            if is_private:
-                self.keys_frame.setStyleSheet("background-color: #f1f5f9; border: 1px dashed #cbd5e1;")
-            else:
-                self.keys_frame.setStyleSheet("")
+            for name in list(self.mistral_cards.keys()):
+                self._update_mistral_card_ui(name)
+        if getattr(self, "google_card", None):
+            self._update_google_card_ui()
 
-        # Disable/grey out cloud options in combo_engine dropdown
-        if hasattr(self, "combo_engine") and self.combo_engine:
+        # Cloud API credentials + cloud action config frames: clean pale lock.
+        for attr in ("keys_frame", "card_cloud"):
+            frame = getattr(self, attr, None)
+            if frame:
+                frame.setEnabled(not is_private)
+                frame.setStyleSheet(PALE if is_private else "")
+
+        # Cloud engines in the AI Actions dropdown (indexes 2,3,4).
+        if getattr(self, "combo_engine", None):
             model = self.combo_engine.model()
-            # Indexes 2, 3, and 4 in self.combo_engine are the cloud engines:
-            # Index 2: Google Gemini API
-            # Index 3: OpenAI-compatible API
-            # Index 4: Anthropic Claude API
             for i in (2, 3, 4):
                 item = model.item(i)
                 if item:
                     item.setEnabled(not is_private)
-                    if is_private:
-                        item.setForeground(QColor("#cbd5e1"))
-                    else:
-                        item.setForeground(QColor("#1e293b"))
+                    item.setForeground(QColor("#cbd5e1") if is_private else QColor("#1e293b"))
             if is_private and self.combo_engine.currentIndex() in (2, 3, 4):
-                self.combo_engine.setCurrentIndex(1) # Switch to Rule-based Formatter
-
-        # Disable/grey out card_cloud API config frame
-        if hasattr(self, "card_cloud") and self.card_cloud:
-            self.card_cloud.setEnabled(not is_private)
-            if is_private:
-                self.card_cloud.setStyleSheet("background-color: #f1f5f9; border: 1px dashed #cbd5e1;")
-            else:
-                self.card_cloud.setStyleSheet("")
+                self.combo_engine.setCurrentIndex(1)  # back to Rule-based Formatter
 
     def _save_action_configs(self):
         if not self.app:
@@ -2415,17 +2448,19 @@ class Settings(QDialog):
 
         layout.addWidget(card)
 
-        perks = QLabel(
-            "<b>Transcribe Pro</b> unlocks:<br>"
-            "&nbsp;&nbsp;<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; Meeting recording with AI notes<br>"
-            "&nbsp;&nbsp;<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; Smart Actions - rewrite, translate, summarize<br>"
-            "&nbsp;&nbsp;<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; Fast cloud transcription - no API key<br>"
-            "&nbsp;&nbsp;<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; Priority models &amp; support",
+        self._acct_perks = QLabel(
+            "<div style='font-size:11px; line-height:150%;'>"
+            "<b>Transcribe Pro</b> includes:<br>"
+            "<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; <b>Unlimited Smart Actions</b> - rewrite, translate, summarize and draft emails by voice<br>"
+            "<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; <b>Smart meeting recording</b> with AI-generated notes and summaries<br>"
+            "<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; <b>Fast cloud transcription</b> - no setup, no API key, no timeouts<br>"
+            "<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; <b>Priority access</b> to new models, plus direct support"
+            "</div>",
             tab,
         )
-        perks.setWordWrap(True)
-        perks.setObjectName("subtitleLabel")
-        layout.addWidget(perks)
+        self._acct_perks.setWordWrap(True)
+        self._acct_perks.setObjectName("subtitleLabel")
+        layout.addWidget(self._acct_perks)
         layout.addStretch()
 
         self.refresh_pro_state()
@@ -2671,6 +2706,9 @@ class Settings(QDialog):
         self._acct_upgrade_btn.setVisible(authed and not is_pro)
         self._acct_manage_btn.setVisible(authed and is_pro)
         self._acct_signout_btn.setVisible(authed)
+        # Pro users already have everything, so don't sell them the perks list.
+        if hasattr(self, "_acct_perks"):
+            self._acct_perks.setVisible(not is_pro)
 
     def _check_for_updates(self):
         if self.app and self.cfg_working.get("pending_update_version"):

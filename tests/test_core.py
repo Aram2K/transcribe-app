@@ -407,10 +407,10 @@ class TestModelOk(unittest.TestCase):
 
     def test_models_dict_complete(self):
         for name in MODELS:
-            self.assertIn("min_ram", MODELS[name])
-            self.assertIn("speed",   MODELS[name])
-            self.assertIn("quality", MODELS[name])
-            self.assertIn("size",    MODELS[name])
+            self.assertIn("min_ram",    MODELS[name])
+            self.assertIn("speed_rank", MODELS[name])
+            self.assertIn("quality",    MODELS[name])
+            self.assertIn("size",       MODELS[name])
 
 
 class TestLangNames(unittest.TestCase):
@@ -811,37 +811,38 @@ class TestCaptureMode(unittest.TestCase):
 
 
 class TestGoogleKeyTest(unittest.TestCase):
+    # The key check now hits the Gemini (AI Studio) models endpoint with a GET,
+    # because Google Cloud Speech rejects API keys. 200 = valid; 400 = invalid key.
     def _run_worker(self, status_code, json_data):
         from ui.settings import Settings
         dialog = MagicMock()
         dialog.google_key_input.text.return_value = "some-key"
-        with patch("requests.post") as mock_post:
+        with patch("requests.get") as mock_get:
             mock_resp = MagicMock()
             mock_resp.status_code = status_code
             mock_resp.json.return_value = json_data
-            mock_post.return_value = mock_resp
+            mock_get.return_value = mock_resp
             with patch("threading.Thread") as mock_thread:
                 Settings._test_google_key(dialog)
                 worker = mock_thread.call_args[1]["target"]
                 worker()
         return dialog.google_test_finished.emit
 
-    def test_dummy_audio_400_reports_working(self):
-        # Valid key + intentional dummy audio → auth passed, key works.
-        emit = self._run_worker(400, {"error": {
-            "status": "INVALID_ARGUMENT", "message": "Invalid recognition audio"}})
+    def test_valid_key_reports_working(self):
+        # 200 from the models endpoint means the AI Studio key is valid.
+        emit = self._run_worker(200, {"models": []})
         emit.assert_called_once_with(True, "Working!")
 
     def test_invalid_key_reports_invalid(self):
         emit = self._run_worker(400, {"error": {
             "status": "INVALID_ARGUMENT",
             "message": "API key not valid. Please pass a valid API key."}})
-        emit.assert_called_once_with(False, "Invalid API Key")
+        emit.assert_called_once_with(False, "Invalid API key")
 
     def test_permission_denied_not_reported_as_working(self):
         emit = self._run_worker(403, {"error": {
             "status": "PERMISSION_DENIED",
-            "message": "Cloud Speech-to-Text API has not been used in project X or it is disabled"}})
+            "message": "Permission denied on this API"}})
         self.assertFalse(emit.call_args[0][0])
 
     def test_server_error_not_reported_as_working(self):

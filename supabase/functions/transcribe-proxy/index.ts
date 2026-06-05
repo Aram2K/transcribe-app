@@ -1,12 +1,16 @@
 // Managed cloud transcription proxy - the Pro moat.
 //
 // Flow: verify the caller's Supabase JWT → confirm is_pro() server-side (paid
-// or trial) → enforce a daily quota → call Google Speech-to-Text with the
-// SERVER-held key → return the transcript. The Google key never reaches the
-// client, so Pro cloud transcription cannot be used without a valid account +
-// entitlement, even though the app is open source.
+// or trial) → enforce a daily quota → transcribe with Google Gemini using the
+// SERVER-held key → return the transcript. The key never reaches the client, so
+// Pro cloud transcription cannot be used without a valid account + entitlement,
+// even though the app is open source.
 //
-// Secret required: GOOGLE_STT_KEY (the rotated Google Cloud Speech key).
+// We use the Gemini (AI Studio) API because it accepts a plain API key; Google
+// Cloud Speech-to-Text rejects API keys (it requires OAuth/service accounts).
+// The client sends a full base64 WAV (with header) in `audio`.
+//
+// Secret required: GOOGLE_STT_KEY (a Google AI Studio / Gemini API key).
 // Auto-provided by Supabase: SUPABASE_URL, SUPABASE_ANON_KEY.
 // Deploy with verify_jwt=false; we validate the token via auth.getUser().
 
@@ -58,21 +62,28 @@ Deno.serve(async (req) => {
   let body: any;
   try { body = await req.json(); } catch { return json({ error: "bad_request" }, 400); }
   const audio = body?.audio;
-  const sampleRate = body?.sample_rate ?? 16000;
   const language = body?.language ?? "auto";
   if (!audio || typeof audio !== "string") return json({ error: "no_audio" }, 400);
 
-  const langCode = language === "hy" ? "hy-AM" : language === "ru" ? "ru-RU" : "en-US";
-  const payload: any = {
-    config: { encoding: "LINEAR16", sampleRateHertz: sampleRate, languageCode: langCode },
-    audio: { content: audio },
+  const langNames: Record<string, string> = {
+    hy: "Armenian", ru: "Russian", en: "English", fr: "French",
+    de: "German", es: "Spanish", ar: "Arabic",
   };
-  if (language === "auto") {
-    payload.config.alternativeLanguageCodes = ["hy-AM", "en-US", "ru-RU", "fr-FR", "de-DE", "es-ES", "ar-EG"];
-  }
+  const langHint = langNames[language] ? ` The audio is spoken in ${langNames[language]}.` : "";
+  const model = "gemini-2.5-flash";
+  const payload = {
+    contents: [{
+      parts: [
+        { text: "Transcribe this audio verbatim. Output only the exact spoken words " +
+                "with correct punctuation and capitalization, and nothing else." + langHint },
+        { inline_data: { mime_type: "audio/wav", data: audio } },
+      ],
+    }],
+    generationConfig: { temperature: 0 },
+  };
 
   const gResp = await fetch(
-    `https://speech.googleapis.com/v1/speech:recognize?key=${GOOGLE_KEY}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GOOGLE_KEY}`,
     { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) },
   );
   if (!gResp.ok) {
@@ -80,8 +91,8 @@ Deno.serve(async (req) => {
     return json({ error: "stt_failed", detail: t.slice(0, 160) }, 502);
   }
   const gData = await gResp.json();
-  const results = gData.results ?? [];
-  const text = results.map((r: any) => r.alternatives?.[0]?.transcript ?? "").join(" ").trim();
-  const detected = (results[0]?.languageCode ?? "en-US").split("-")[0];
+  const parts = gData.candidates?.[0]?.content?.parts ?? [];
+  const text = parts.map((p: any) => p.text ?? "").join("").trim();
+  const detected = language && language !== "auto" ? language : "en";
   return json({ text, lang: detected });
 });
