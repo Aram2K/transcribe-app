@@ -1047,11 +1047,25 @@ class AudioRecorder:
         return full_text.strip(), detected or "en"
 
     def _run_local(self, audio):
-        self.load_model()
         sr = cfg["sample_rate"]
         if len(audio) < sr // 2:
             return "", "en"
+        try:
+            return self._run_local_once(audio)
+        except Exception as e:
+            # If we were running on the GPU and it failed mid-dictation (OOM,
+            # driver hiccup, a CUDA lib problem), drop to CPU and retry once so the
+            # transcription still succeeds instead of erroring.
+            if getattr(self, "_cuda_usable", None):
+                logger.warning("GPU transcription failed (%s); retrying on CPU.", e)
+                self._cuda_usable = False
+                self.unload_model()
+                return self._run_local_once(audio)
+            raise
 
+    def _run_local_once(self, audio):
+        self.load_model()
+        sr = cfg["sample_rate"]
         with self._model_lock:
             model = self._model
 
