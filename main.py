@@ -1,5 +1,6 @@
 # Transcribe App - PySide6 Entry Point and Logic Controller
 
+import os
 import sys
 import threading
 import time
@@ -522,17 +523,28 @@ class AudioRecorder:
         discoverable on Windows, so GPU works after a simple
         `pip install nvidia-cublas-cu12 nvidia-cudnn-cu12` - no system CUDA needed.
         No-op if the packages aren't installed."""
-        if sys.platform != "win32" or not hasattr(os, "add_dll_directory"):
+        if sys.platform != "win32":
             return
         try:
             import importlib.util
             for pkg in ("nvidia.cublas", "nvidia.cudnn"):
                 spec = importlib.util.find_spec(pkg)
                 locs = getattr(spec, "submodule_search_locations", None) if spec else None
-                if locs:
-                    binp = os.path.join(list(locs)[0], "bin")
-                    if os.path.isdir(binp):
+                if not locs:
+                    continue
+                binp = os.path.join(list(locs)[0], "bin")
+                if not os.path.isdir(binp):
+                    continue
+                if hasattr(os, "add_dll_directory"):
+                    try:
                         os.add_dll_directory(binp)
+                    except Exception:
+                        pass
+                # ctranslate2 loads cuBLAS/cuDNN lazily via the standard search
+                # order, so the bin dir must also be on PATH (add_dll_directory
+                # alone isn't honored for its delayed loads).
+                if binp not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = binp + os.pathsep + os.environ.get("PATH", "")
         except Exception:
             pass
 
