@@ -79,6 +79,17 @@ def is_pro(auth, cfg=None):
     return tier(auth, cfg) == TIER_PRO
 
 
+def has_pro_access(auth, cfg=None):
+    """Pro access used for FEATURE GATING. A genuine Pro/trial entitlement (from
+    the server) is NEVER downgraded - so a real Pro user can never be blocked or
+    upsold. An admin can also preview Pro by forcing it. The admin force-tier's
+    guest/free options only change the displayed badge, not real Pro access; they
+    still gate a non-Pro admin (useful for testing on a free account)."""
+    if auth is not None and getattr(auth, "is_pro", False):
+        return True
+    return _override_tier(auth, cfg) == TIER_PRO
+
+
 def guest_seconds_used():
     try:
         return max(0.0, float(_load_usage().get("guest_seconds_used", 0.0)))
@@ -121,9 +132,9 @@ def can_record(auth, cfg=None):
 
 
 def feature_allowed(auth, feature, cfg=None):
-    """Pro-only features require the pro tier; everything else is allowed."""
+    """Pro-only features require real Pro access; everything else is allowed."""
     if feature in PRO_FEATURES:
-        return tier(auth, cfg) == TIER_PRO
+        return has_pro_access(auth, cfg)
     return True
 
 
@@ -143,7 +154,7 @@ def smart_actions_remaining(auth=None, cfg=None):
 
 def can_use_smart_action(auth, cfg=None):
     """Pro = unlimited; everyone else gets FREE_SMART_ACTION_TRIES total."""
-    if tier(auth, cfg) == TIER_PRO:
+    if has_pro_access(auth, cfg):
         return True
     return smart_actions_used() < FREE_SMART_ACTION_TRIES
 

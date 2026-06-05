@@ -527,6 +527,13 @@ class AudioRecorder:
                 # when the model is fully cached). A GPU load can fail when the
                 # CUDA libraries are missing or VRAM is short - we fall back to CPU
                 # rather than erroring, so dictation always works.
+                # Use all physical CPU cores (ctranslate2 otherwise caps at a low
+                # default), so transcription runs as fast as the machine allows.
+                try:
+                    import psutil
+                    cpu_threads = psutil.cpu_count(logical=False) or 0
+                except Exception:
+                    cpu_threads = os.cpu_count() or 0
                 attempts = []
                 if dev == "cuda":
                     attempts += [("cuda", ct, False), ("cuda", ct, True)]
@@ -535,10 +542,10 @@ class AudioRecorder:
                 for d, c, local_only in attempts:
                     try:
                         self._model = WhisperModel(
-                            name, device=d, compute_type=c, local_files_only=local_only)
+                            name, device=d, compute_type=c, local_files_only=local_only,
+                            cpu_threads=cpu_threads, num_workers=1)
                         self._model_name = name
-                        if d == "cuda":
-                            logger.info("Whisper on GPU (CUDA, %s)", c)
+                        logger.info("Whisper on %s (%s, cpu_threads=%s)", d, c, cpu_threads)
                         return
                     except Exception as e:
                         last_err = e
@@ -1439,8 +1446,10 @@ class AppController(QObject):
 
     # ── Auth / Pro helpers ────────────────────────────────────────────────────
     def is_pro(self):
+        # has_pro_access: a real Pro/trial entitlement is never downgraded by the
+        # admin force-tier preview, so a genuine Pro user is never blocked/upsold.
         try:
-            return entitlements.tier(self.auth, self.cfg) == entitlements.TIER_PRO
+            return entitlements.has_pro_access(self.auth, self.cfg)
         except Exception:
             return bool(getattr(self, "auth", None) and self.auth.is_pro)
 

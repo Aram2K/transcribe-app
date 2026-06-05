@@ -251,14 +251,16 @@ class Settings(QDialog):
         # 1b. Output mode (Transcribe only vs Smart actions)
         if hasattr(self, "rb_smart"):
             current_mode = self.cfg_working.get("output_action", "transcribe_only")
+            is_smart = (current_mode == actions.ACTION_SMART_AUTO)
             self.rb_smart.blockSignals(True)
             self.rb_transcribe.blockSignals(True)
-            if current_mode == actions.ACTION_SMART_AUTO:
-                self.rb_smart.setChecked(True)
-            else:
-                self.rb_transcribe.setChecked(True)
+            # Set BOTH explicitly: with signals blocked the QButtonGroup can't
+            # auto-uncheck the other, so checking just one would leave both lit.
+            self.rb_smart.setChecked(is_smart)
+            self.rb_transcribe.setChecked(not is_smart)
             self.rb_smart.blockSignals(False)
             self.rb_transcribe.blockSignals(False)
+            self._refresh_mode_card_styles()
             if hasattr(self, "engine_section"):
                 self.engine_section.setEnabled(True)  # always selectable, even in transcribe-only
         
@@ -1696,6 +1698,16 @@ class Settings(QDialog):
             "}"
         )
 
+    def _refresh_mode_card_styles(self):
+        """Apply the selected/unselected highlight to both mode cards from the
+        current radio state (so exactly one ever looks selected)."""
+        for card, rb in (
+            (getattr(self, "card_transcribe", None), getattr(self, "rb_transcribe", None)),
+            (getattr(self, "card_smart", None), getattr(self, "rb_smart", None)),
+        ):
+            if card is not None and rb is not None:
+                card.setStyleSheet(self._mode_card_style(rb.isChecked()))
+
     def _build_llm_card(self, name, info):
         card = QFrame()
         card.setObjectName("cardFrame")
@@ -2846,12 +2858,14 @@ class Settings(QDialog):
         auth = getattr(self.app, "auth", None) if self.app else None
         authed = bool(auth and auth.is_authenticated)
 
-        # Effective tier honors the super-admin override.
+        # Effective tier honors the super-admin override (used for the badge).
         if self.app and hasattr(self.app, "current_tier"):
             t = self.app.current_tier()
         else:
             t = entitlements.tier(auth)
-        is_pro = (t == entitlements.TIER_PRO)
+        # Feature gating uses real Pro access so a genuine Pro user is never shown
+        # upgrade prompts or the free counter, regardless of the preview tier.
+        is_pro = entitlements.has_pro_access(auth, self.app.cfg if self.app else None)
 
         # Tier badge: purple PRO / green FREE / gray GUEST.
         if is_pro:
