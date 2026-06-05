@@ -2436,8 +2436,19 @@ class Settings(QDialog):
 
     # ── TAB 6: Account & Billing ─────────────────────────────────────────────
     def _create_account_tab(self):
+        # Scrollable: the account card + feedback box (with up to 4 image chips)
+        # + perks can exceed the window height. Without a scroll area the layout
+        # over-constrains and widgets collide (the chips were overlapping the
+        # text box).
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        _outer = QVBoxLayout(tab)
+        _outer.setContentsMargins(0, 0, 0, 0)
+        _scroll = QScrollArea(tab)
+        _scroll.setWidgetResizable(True)
+        _scroll.setFrameShape(QFrame.NoFrame)
+        _scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
@@ -2580,6 +2591,8 @@ class Settings(QDialog):
         layout.addWidget(self._acct_perks)
         layout.addStretch()
 
+        _scroll.setWidget(content)
+        _outer.addWidget(_scroll)
         self.refresh_pro_state()
         return tab
 
