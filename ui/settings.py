@@ -2603,6 +2603,31 @@ class Settings(QDialog):
         self._fb_render_thumbs()
         self._fb_set_status(f"{len(self._fb_images)} image(s) attached.", error=False)
 
+    def _fb_remove_icon(self):
+        """A crisp painted 'remove' badge (dark circle + white x). Painted rather
+        than a font glyph so it renders on every system. Cached after first use."""
+        if getattr(self, "_fb_rm_icon", None) is not None:
+            return self._fb_rm_icon
+        from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QIcon
+        S = 40
+        pm = QPixmap(S, S)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(15, 23, 42, 215))
+        p.drawEllipse(0, 0, S, S)
+        pen = QPen(QColor(255, 255, 255))
+        pen.setWidth(4)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        m = S * 0.34
+        p.drawLine(int(m), int(m), int(S - m), int(S - m))
+        p.drawLine(int(S - m), int(m), int(m), int(S - m))
+        p.end()
+        self._fb_rm_icon = QIcon(pm)
+        return self._fb_rm_icon
+
     def _fb_render_thumbs(self):
         from PySide6.QtWidgets import QGridLayout
         from PySide6.QtGui import QPixmap
@@ -2632,15 +2657,21 @@ class Settings(QDialog):
                 SIZE - 6, SIZE - 6, Qt.KeepAspectRatio, Qt.SmoothTransformation))
             g.addWidget(thumb, 0, 0)
 
-            rm = QPushButton("×", chip)  # multiplication sign
+            from PySide6.QtCore import QSize
+            # The badge is a PAINTED icon (dark circle + white x), not a text
+            # glyph, so it always renders regardless of the available fonts and
+            # the global QPushButton padding.
+            rm = QPushButton(chip)
             rm.setFixedSize(18, 18)
+            rm.setIcon(self._fb_remove_icon())
+            rm.setIconSize(QSize(18, 18))
             rm.setCursor(Qt.PointingHandCursor)
             rm.setToolTip("Remove image")
             rm.setAutoDefault(False)
+            rm.setFlat(True)
             rm.setStyleSheet(
-                "QPushButton { background: rgba(15,23,42,0.72); color: white; border: none;"
-                " border-radius: 9px; font-weight: 700; font-size: 12px; }"
-                "QPushButton:hover { background: #0f172a; }")
+                "QPushButton { background: transparent; border: none;"
+                " padding: 0; margin: 0; min-width: 0; min-height: 0; }")
             rm.clicked.connect(lambda _=False, idx=i: self._fb_remove_image(idx))
             g.addWidget(rm, 0, 0, Qt.AlignTop | Qt.AlignRight)
 
