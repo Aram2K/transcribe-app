@@ -329,7 +329,8 @@ class Settings(QDialog):
         self.chk_privacy = QCheckBox("Privacy Mode", self)
         self.chk_privacy.setToolTip(
             "Keep everything on your device: turns off cloud transcription and "
-            "stops saving local history."
+            "cloud AI. Your local history is independent - control it on the "
+            "History tab."
         )
         self.chk_privacy.setChecked(bool(self.cfg_working.get("privacy_mode", False)))
         self.chk_privacy.stateChanged.connect(self._on_privacy_toggled)
@@ -677,37 +678,26 @@ class Settings(QDialog):
             self._update_whisper_card_ui(name)
             
         # Section 2: Mistral AI Cloud STT Models
-        section_mistral = QLabel("Mistral AI Voxtral STT Models")
+        section_mistral = QLabel("Mistral Voxtral STT (Cloud)")
         section_mistral.setFont(QFont("Segoe UI", 12, QFont.Bold))
         section_mistral.setStyleSheet("color: #3b82f6; margin-top: 14px; margin-bottom: 2px;")
         scroll_lay.addWidget(section_mistral)
-        
-        mistral_notice = QLabel("Mistral's state-of-the-art Voxtral models run via the cloud (API Key Required).")
+
+        mistral_notice = QLabel("Mistral's Voxtral transcription runs via the cloud (API key required).")
         mistral_notice.setObjectName("subtitleLabel")
         mistral_notice.setStyleSheet("margin-bottom: 8px;")
         scroll_lay.addWidget(mistral_notice)
-        
-        # Define Mistral STT catalog
+
+        # Define Mistral STT catalog. The /audio/transcriptions endpoint only
+        # supports Voxtral Mini Transcribe; "small"/"large" are not valid there.
         self.mistral_cards = {}
         self.mistral_model_catalog = {
             "voxtral-mini-latest": {
-                "name": "Voxtral Mini",
+                "name": "Voxtral Mini Transcribe",
                 "badge": "Fast / Low Cost",
-                "specs": "Fastest  ·  smart dictation and audio understanding",
-                "description": "Optimized for basic edge and standard transcription tasks."
+                "specs": "Fast, accurate cloud transcription  ·  ~$0.003 / min",
+                "description": "Mistral's dedicated transcription model, optimized for speed and cost."
             },
-            "voxtral-small-latest": {
-                "name": "Voxtral Small",
-                "badge": "Balanced",
-                "specs": "Balanced  ·  high accuracy, multilingual",
-                "description": "Production-scale high-capability model for balanced performance."
-            },
-            "voxtral-large-latest": {
-                "name": "Voxtral Large",
-                "badge": "Highest Quality",
-                "specs": "Highest quality  ·  SOTA transcription and understanding",
-                "description": "Mistral's flagship, largest, and most capable voice understanding model."
-            }
         }
         
         for name, info in self.mistral_model_catalog.items():
@@ -1041,7 +1031,8 @@ class Settings(QDialog):
         self.lbl_status_mistral.setStyleSheet("color: #3b82f6; font-size: 11px; font-weight: bold;")
         self.btn_test_mistral.setEnabled(False)
         
-        model = self.cfg_working.get("mistral_stt_model", "voxtral-mini-latest")
+        import main as _m
+        model = _m.normalize_mistral_model(self.cfg_working.get("mistral_stt_model", "voxtral-mini-latest"))
 
         def worker():
             import requests, io, wave, math, struct
@@ -1973,12 +1964,10 @@ class Settings(QDialog):
                     for m_name in list(self.mistral_cards.keys()):
                         self._update_mistral_card_ui(m_name)
         if self.chk_privacy.isChecked():
-            self.cfg_working["save_history"] = False
-            if hasattr(self, "chk_history"):
-                self.chk_history.blockSignals(True)
-                self.chk_history.setChecked(False)
-                self.chk_history.blockSignals(False)
-            
+            # Privacy Mode only blocks the cloud - local history is left to the
+            # user's own "Save local transcription history" setting (it stays on
+            # the device).
+
             # Force backend to local offline Whisper if privacy is on
             if self.cfg_working.get("backend") in ("mistral", "google"):
                 self.cfg_working["backend"] = "local"

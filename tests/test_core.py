@@ -242,10 +242,10 @@ class TestConfig(unittest.TestCase):
         finally:
             m.CONFIG_PATH = orig
 
-    def test_privacy_mode_forces_local_no_history_keeps_analytics(self):
-        # Privacy Mode forces backend=local and disables history, but it
-        # intentionally leaves analytics_enabled untouched - the user
-        # controls that independently via the Settings checkbox.
+    def test_privacy_mode_forces_local_keeps_history_and_analytics(self):
+        # Privacy Mode forces backend=local and resets cloud action models, but it
+        # leaves local history AND analytics to the user's own settings (local
+        # history never leaves the device, so Privacy Mode does not touch it).
         import main as m
         import actions
         orig = m.CONFIG_PATH
@@ -261,7 +261,7 @@ class TestConfig(unittest.TestCase):
             })
             c = load_config()
             self.assertEqual(c["backend"], "local")
-            self.assertFalse(c["save_history"])
+            self.assertTrue(c["save_history"])  # local history is independent of Privacy Mode
             self.assertTrue(c["analytics_enabled"])  # NOT forced off anymore
             self.assertEqual(c["action_model"], actions.RULE_BASED_ID)
         finally:

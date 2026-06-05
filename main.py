@@ -112,6 +112,19 @@ DEFAULT = {
 
 storage.migrate_legacy_file(LEGACY_CONFIG_PATH, CONFIG_PATH)
 
+# Mistral's /audio/transcriptions endpoint only accepts the Voxtral Mini
+# Transcribe model. "voxtral-small/large-latest" are NOT valid there (Small is a
+# chat model; there is no Large), which is why selecting them returned
+# "Invalid model". We normalize any stale/invalid choice to the working alias.
+# Defined above load_config() because load_config() calls it at import time.
+MISTRAL_STT_DEFAULT = "voxtral-mini-latest"
+MISTRAL_STT_MODELS = {"voxtral-mini-latest", "voxtral-mini-2602", "voxtral-mini-2507"}
+
+
+def normalize_mistral_model(model):
+    return model if model in MISTRAL_STT_MODELS else MISTRAL_STT_DEFAULT
+
+
 def load_config():
     data = storage.read_json(CONFIG_PATH, DEFAULT)
     if not isinstance(data, dict):
@@ -132,10 +145,14 @@ def load_config():
 
     if loaded.get("privacy_mode"):
         loaded["backend"] = "local"
-        loaded["save_history"] = False
+        # Privacy Mode only blocks the cloud; local history stays on the device
+        # under the user's own "Save local transcription history" setting.
         if actions.ACTION_MODELS.get(actions.normalize_action_model(loaded.get("action_model")), {}).get("kind") == "cloud":
             loaded["action_model"] = actions.RULE_BASED_ID
     loaded["action_model"] = actions.normalize_action_model(loaded.get("action_model"))
+    # Heal any stale/invalid Mistral STT choice (e.g. the removed voxtral-small).
+    if loaded.get("mistral_stt_model"):
+        loaded["mistral_stt_model"] = normalize_mistral_model(loaded["mistral_stt_model"])
 
     # Output mode stays on "transcribe_only" by default. Smart Actions are a
     # Pro feature and must be turned on explicitly - we never auto-enable them.
@@ -168,7 +185,7 @@ def save_config(c):
     disk = {**c}
     if disk.get("privacy_mode"):
         disk["backend"] = "local"
-        disk["save_history"] = False
+        # Local history is independent of Privacy Mode (it never leaves the device).
         if actions.ACTION_MODELS.get(actions.normalize_action_model(disk.get("action_model")), {}).get("kind") == "cloud":
             disk["action_model"] = actions.RULE_BASED_ID
     key = (disk.get("google_api_key") or "").strip()
@@ -1111,7 +1128,7 @@ class AudioRecorder:
             if not api_key:
                 return "", "!mistral:Add your Mistral API key in Settings."
 
-            model = cfg.get("mistral_stt_model", "voxtral-mini-latest")
+            model = normalize_mistral_model(cfg.get("mistral_stt_model", MISTRAL_STT_DEFAULT))
             lang_setting = cfg.get("language", "auto")
 
             wav_bytes = self._float_to_wav(audio)
