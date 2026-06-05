@@ -516,6 +516,26 @@ class AudioRecorder:
             pass
         return ("cpu", "int8")
 
+    @staticmethod
+    def _add_cuda_dll_dirs():
+        """Make CUDA libs (cuBLAS/cuDNN) from the `nvidia-*-cu12` pip packages
+        discoverable on Windows, so GPU works after a simple
+        `pip install nvidia-cublas-cu12 nvidia-cudnn-cu12` - no system CUDA needed.
+        No-op if the packages aren't installed."""
+        if sys.platform != "win32" or not hasattr(os, "add_dll_directory"):
+            return
+        try:
+            import importlib.util
+            for pkg in ("nvidia.cublas", "nvidia.cudnn"):
+                spec = importlib.util.find_spec(pkg)
+                locs = getattr(spec, "submodule_search_locations", None) if spec else None
+                if locs:
+                    binp = os.path.join(list(locs)[0], "bin")
+                    if os.path.isdir(binp):
+                        os.add_dll_directory(binp)
+        except Exception:
+            pass
+
     def load_model(self, name=None):
         name = name or cfg["whisper_model"]
         with self._model_lock:
@@ -534,6 +554,12 @@ class AudioRecorder:
                     cpu_threads = psutil.cpu_count(logical=False) or 0
                 except Exception:
                     cpu_threads = os.cpu_count() or 0
+                # Once we learn the CUDA libs are missing, don't keep retrying GPU
+                # on every model switch - go straight to CPU.
+                if getattr(self, "_cuda_usable", None) is False:
+                    dev = "cpu"
+                if dev == "cuda":
+                    self._add_cuda_dll_dirs()
                 attempts = []
                 if dev == "cuda":
                     attempts += [("cuda", ct, False), ("cuda", ct, True)]
@@ -541,14 +567,26 @@ class AudioRecorder:
                 last_err = None
                 for d, c, local_only in attempts:
                     try:
-                        self._model = WhisperModel(
+                        m = WhisperModel(
                             name, device=d, compute_type=c, local_files_only=local_only,
                             cpu_threads=cpu_threads, num_workers=1)
+                        if d == "cuda":
+                            # A CUDA model constructs even when the CUDA runtime libs
+                            # (cuBLAS/cuDNN, e.g. cublas64_12.dll) are missing - it
+                            # only fails when it actually computes. Force a tiny warm-up
+                            # now so we catch that here and fall back to CPU, instead
+                            # of erroring on the user's first real dictation.
+                            seg, _ = m.transcribe(np.zeros(16000, dtype=np.float32), beam_size=1)
+                            list(seg)
+                            self._cuda_usable = True
+                        self._model = m
                         self._model_name = name
                         logger.info("Whisper on %s (%s, cpu_threads=%s)", d, c, cpu_threads)
                         return
                     except Exception as e:
                         last_err = e
+                        if d == "cuda":
+                            self._cuda_usable = False  # remember: skip GPU next time
                         logger.warning("Whisper load failed on %s/%s (offline=%s): %s",
                                        d, c, local_only, e)
                 if last_err:
