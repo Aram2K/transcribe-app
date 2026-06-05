@@ -724,30 +724,33 @@ class TestSettingsValidation(unittest.TestCase):
 
     def test_mistral_test_key_success(self):
         from ui.settings import Settings
-        
+
         dialog = MagicMock()
         dialog.mistral_key_input = MagicMock()
         dialog.mistral_key_input.text.return_value = "valid-key"
+        dialog.cfg_working = {"mistral_stt_model": "voxtral-mini-latest"}
         dialog.lbl_status_mistral = MagicMock()
         dialog.btn_test_mistral = MagicMock()
         dialog.mistral_test_finished = MagicMock()
-        
-        with patch("requests.get") as mock_get:
+
+        with patch("requests.post") as mock_post:
             mock_resp = MagicMock()
             mock_resp.status_code = 200
-            mock_get.return_value = mock_resp
-            
+            mock_post.return_value = mock_resp
+
             with patch("threading.Thread") as mock_thread:
                 Settings._test_mistral_key(dialog)
-                
+
                 worker_func = mock_thread.call_args[1]["target"]
                 worker_func()
-                
-                mock_get.assert_called_once_with(
-                    "https://api.mistral.ai/v1/models",
-                    headers={"Authorization": "Bearer valid-key"},
-                    timeout=10
-                )
+
+                # The test now does a real transcription call (validates the key,
+                # model access AND credits), not just a key-only models check.
+                self.assertEqual(mock_post.call_count, 1)
+                args, kwargs = mock_post.call_args
+                self.assertEqual(args[0], "https://api.mistral.ai/v1/audio/transcriptions")
+                self.assertEqual(kwargs["headers"], {"Authorization": "Bearer valid-key"})
+                self.assertEqual(kwargs["data"], {"model": "voxtral-mini-latest"})
                 dialog.mistral_test_finished.emit.assert_called_once_with(True, "Working!")
 
 

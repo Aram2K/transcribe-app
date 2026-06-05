@@ -43,6 +43,7 @@ APP_VERSION = "1.5.48"
 
 # ── Managed cloud transcription (Pro moat) ────────────────────────────────────
 MANAGED_PROXY_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-proxy"
+FEEDBACK_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/submit-feedback"
 
 # ── Monetization links (Stripe) ───────────────────────────────────────────────
 PRO_MONTHLY_URL = "https://buy.stripe.com/3cI5kC30N1oeari7rh0Ba00"
@@ -249,6 +250,46 @@ LANG_NAMES = {
     "es":    "Spanish",
     "ar":    "Arabic",
 }
+
+# Languages Mistral Voxtral transcription accepts (ISO-639-1). Anything else -
+# including our "auto"/"multi" pseudo-codes - is omitted so we never send an
+# unsupported code, which Voxtral rejects with a 400 (this was the cause of cloud
+# transcription failing even when the API key tested fine).
+MISTRAL_LANGS = {"en", "es", "fr", "de", "it", "nl", "pt", "hi", "ar", "ru",
+                 "uk", "pl", "tr", "ja", "ko", "zh", "ro", "cs", "el"}
+
+
+def cloud_error_message(provider, status, body_text):
+    """Turn a cloud provider's HTTP error into one clear, user-facing sentence."""
+    msg = ""
+    try:
+        j = json.loads(body_text)
+        if isinstance(j, dict):
+            err = j.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message", "") or ""
+            elif isinstance(err, str):
+                msg = err
+            if not msg:
+                msg = j.get("message") or j.get("detail") or ""
+            if isinstance(msg, (dict, list)):
+                msg = str(msg)
+    except Exception:
+        msg = ""
+    msg = (msg or (body_text or "")).strip()
+    low = msg.lower()
+    if status in (401, 403) or "unauthorized" in low or "invalid api key" in low or "api key not valid" in low:
+        return f"{provider} API key is invalid or unauthorized. Check it in Settings."
+    if status == 402 or "insufficient" in low or "out of credit" in low or "no credit" in low or "billing" in low:
+        return f"Your {provider} account is out of credits. Add billing/credits to keep using it."
+    if status == 429 or "rate limit" in low or "quota" in low or "resource_exhausted" in low or "exhausted" in low:
+        return f"{provider} rate limit or quota reached. Wait a moment and try again."
+    if status == 400 and "language" in low:
+        return f"{provider} does not support the selected language. Pick another or use Auto-detect."
+    if status == 400:
+        return f"{provider} rejected the request: {msg[:90]}" if msg else f"{provider}: bad request."
+    return (f"{provider} error (HTTP {status}). {msg[:90]}").strip()
+
 
 def model_ok(name):
     return RAM_GB >= MODELS[name]["min_ram"]
@@ -999,12 +1040,7 @@ class AudioRecorder:
             }
             resp = requests.post(url, json=payload, timeout=30)
             if resp.status_code != 200:
-                detail = resp.text[:120]
-                try:
-                    detail = resp.json().get("error", {}).get("message", detail)[:120]
-                except Exception:
-                    pass
-                return "", f"!google:HTTP {resp.status_code}: {detail}"
+                return "", "!google:" + cloud_error_message("Google", resp.status_code, resp.text)
 
             data = resp.json()
             cands = data.get("candidates", [])
@@ -1073,35 +1109,32 @@ class AudioRecorder:
             
             api_key = cfg.get("mistral_api_key", "")
             if not api_key:
-                return "", "!mistral:API key not configured"
-                
+                return "", "!mistral:Add your Mistral API key in Settings."
+
             model = cfg.get("mistral_stt_model", "voxtral-mini-latest")
             lang_setting = cfg.get("language", "auto")
-            
+
             wav_bytes = self._float_to_wav(audio)
             wav_io = io.BytesIO(wav_bytes)
-            
+
             url = "https://api.mistral.ai/v1/audio/transcriptions"
-            headers = {
-                "Authorization": f"Bearer {api_key}"
-            }
-            files = {
-                "file": ("audio.wav", wav_io, "audio/wav")
-            }
-            data = {
-                "model": model
-            }
-            if lang_setting and lang_setting != "auto":
+            headers = {"Authorization": f"Bearer {api_key}"}
+            files = {"file": ("audio.wav", wav_io, "audio/wav")}
+            data = {"model": model}
+            # Only send a language Voxtral actually supports; "auto"/"multi" and
+            # unsupported codes (e.g. Armenian) are omitted so it auto-detects
+            # instead of 400-ing.
+            if lang_setting in MISTRAL_LANGS:
                 data["language"] = lang_setting
-                
+
             resp = requests.post(url, headers=headers, files=files, data=data, timeout=20)
             if resp.status_code != 200:
-                return "", f"!mistral:HTTP {resp.status_code}: {resp.text[:80]}"
-                
+                return "", "!mistral:" + cloud_error_message("Mistral", resp.status_code, resp.text)
+
             resp_data = resp.json()
             text = resp_data.get("text", "").strip()
-            detected_lang = resp_data.get("language", lang_setting if lang_setting != "auto" else "en")
-            
+            detected_lang = resp_data.get("language", lang_setting if lang_setting in MISTRAL_LANGS else "en")
+
             return text, detected_lang
         except Exception as e:
             return "", f"!mistral:{e}"
@@ -1902,6 +1935,18 @@ class AppController(QObject):
         if self.is_rec:
             threading.Thread(target=self._cancel, daemon=True).start()
 
+    def _cloud_preflight_warn(self):
+        """Immediate, friendly warning if a cloud backend is selected but clearly
+        misconfigured (no key). Recording still proceeds and transcription falls
+        back to the local model, so a dictation is never lost. Returns (title,
+        body) or None."""
+        b = self.cfg.get("backend", "local")
+        if b == "mistral" and not (self.cfg.get("mistral_api_key") or "").strip():
+            return ("Mistral key missing", "Add it in Settings - recording with the local model for now.")
+        if b == "google" and not (self.cfg.get("google_api_key") or "").strip():
+            return ("Google key missing", "Add your AI Studio key in Settings - recording with the local model for now.")
+        return None
+
     def _start(self):
         if self.is_rec:
             return
@@ -1909,6 +1954,12 @@ class AppController(QObject):
         if not entitlements.can_record(self.auth, self.cfg):
             self._guest_limit_reached()
             return
+        warn = self._cloud_preflight_warn()
+        if warn:
+            try:
+                self.show_tray_hint(*warn)
+            except Exception:
+                pass
         try:
             self.is_rec = True
             self._rec_started_at = time.time()

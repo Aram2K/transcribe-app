@@ -24,6 +24,7 @@ class DownloadProgressSignal(QObject):
 class Settings(QDialog):
     mistral_test_finished = Signal(bool, str)
     google_test_finished = Signal(bool, str)
+    feedback_finished = Signal(bool, str)
     specs_ready = Signal(str)  # GPU name detected on a worker thread
 
     def __init__(self, parent=None, main_app=None):
@@ -62,6 +63,7 @@ class Settings(QDialog):
         # Connect test signals
         self.mistral_test_finished.connect(self._on_mistral_test_finished)
         self.google_test_finished.connect(self._on_google_test_finished)
+        self.feedback_finished.connect(self._on_feedback_finished)
         self.specs_ready.connect(self._on_specs_ready)
         
         # Whisper model card controls references
@@ -1039,28 +1041,37 @@ class Settings(QDialog):
         self.lbl_status_mistral.setStyleSheet("color: #3b82f6; font-size: 11px; font-weight: bold;")
         self.btn_test_mistral.setEnabled(False)
         
+        model = self.cfg_working.get("mistral_stt_model", "voxtral-mini-latest")
+
         def worker():
-            import requests
+            import requests, io, wave, math, struct
+            import main as m
             try:
+                # Real end-to-end check: transcribe ~1s of a quiet tone with the
+                # selected Voxtral model. This validates the key AND model access
+                # AND credits - a plain key check would pass even when transcription
+                # later fails.
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as wf:
+                    wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
+                    frames = bytearray()
+                    for i in range(16000):
+                        frames += struct.pack("<h", int(800 * math.sin(2 * math.pi * 220 * i / 16000)))
+                    wf.writeframes(bytes(frames))
                 headers = {"Authorization": f"Bearer {key}"}
-                resp = requests.get("https://api.mistral.ai/v1/models", headers=headers, timeout=10)
+                files = {"file": ("test.wav", io.BytesIO(buf.getvalue()), "audio/wav")}
+                resp = requests.post(
+                    "https://api.mistral.ai/v1/audio/transcriptions",
+                    headers=headers, files=files, data={"model": model}, timeout=20,
+                )
                 if resp.status_code == 200:
                     self.mistral_test_finished.emit(True, "Working!")
                 else:
-                    err_msg = f"HTTP {resp.status_code}"
-                    try:
-                        err_json = resp.json()
-                        if "message" in err_json:
-                            err_msg = err_json["message"]
-                        elif "detail" in err_json:
-                            err_msg = str(err_json["detail"])
-                    except:
-                        if resp.text:
-                            err_msg = resp.text[:50]
-                    self.mistral_test_finished.emit(False, f"Invalid: {err_msg}")
+                    self.mistral_test_finished.emit(
+                        False, m.cloud_error_message("Mistral", resp.status_code, resp.text))
             except Exception as e:
                 self.mistral_test_finished.emit(False, f"Connection error: {str(e)[:50]}")
-                
+
         import threading
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1332,6 +1343,11 @@ class Settings(QDialog):
         # Make clicking anywhere on the card select that option.
         self.card_transcribe.mousePressEvent = lambda _e: self.rb_transcribe.setChecked(True)
         self.card_smart.mousePressEvent = lambda _e: self.rb_smart.setChecked(True)
+        # Apply the selected-card highlight to the initial state (the toggle
+        # handler isn't connected until after the initial setChecked above).
+        for _card, _sel in ((self.card_transcribe, self.rb_transcribe.isChecked()),
+                            (self.card_smart, self.rb_smart.isChecked())):
+            _card.setStyleSheet(self._mode_card_style(_sel))
 
         # Engine picker + config (only meaningful when Smart actions is on)
         self.engine_section = QWidget(content)
@@ -1569,6 +1585,9 @@ class Settings(QDialog):
         outer.setSpacing(0)
 
         row_host = QWidget(card)
+        # Plain QWidget containers otherwise inherit the global grey QWidget
+        # background (#f8fafc), which shows up as an ugly box behind the text.
+        row_host.setStyleSheet("background: transparent;")
         row_host.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
         )
@@ -2207,7 +2226,12 @@ class Settings(QDialog):
     def _save_history_config(self):
         if not self.app:
             return
-        self.cfg_working["save_history"] = self.chk_history.isChecked()
+        on = self.chk_history.isChecked()
+        self.cfg_working["save_history"] = on
+        # Apply immediately (not only on Save): turning it off must stop saving
+        # right away, and turning it on must start saving right away.
+        self.app.cfg["save_history"] = on
+        self.app.save_config()
         self._populate_history_list()
 
     def _save_telemetry_config(self):
@@ -2448,6 +2472,55 @@ class Settings(QDialog):
 
         layout.addWidget(card)
 
+        # ── Feedback / feature request ──────────────────────────────────────
+        fb = QFrame(tab)
+        fb.setObjectName("cardFrame")
+        fb_lay = QVBoxLayout(fb)
+        fb_lay.setContentsMargins(16, 14, 16, 14)
+        fb_lay.setSpacing(8)
+
+        fb_title = QLabel("Send feedback or request a feature", fb)
+        fb_title.setStyleSheet("font-weight: 700; color: #0f172a;")
+        fb_lay.addWidget(fb_title)
+
+        fb_sub = QLabel(
+            "Tell us what to build next - a feature, a language or model, or a bug. "
+            "You can attach or paste a screenshot.", fb)
+        fb_sub.setObjectName("subtitleLabel")
+        fb_sub.setWordWrap(True)
+        fb_lay.addWidget(fb_sub)
+
+        self._fb_text = QTextEdit(fb)
+        self._fb_text.setPlaceholderText("Type your feedback, idea, or bug report...")
+        self._fb_text.setMinimumHeight(90)
+        self._fb_text.setMaximumHeight(150)
+        fb_lay.addWidget(self._fb_text)
+
+        fb_row = QHBoxLayout()
+        self._fb_attach_btn = QPushButton("Attach image", fb)
+        self._fb_attach_btn.clicked.connect(self._fb_attach_image)
+        fb_row.addWidget(self._fb_attach_btn)
+        self._fb_paste_btn = QPushButton("Paste image", fb)
+        self._fb_paste_btn.clicked.connect(self._fb_paste_image)
+        fb_row.addWidget(self._fb_paste_btn)
+        self._fb_image_label = QLabel("", fb)
+        self._fb_image_label.setObjectName("subtitleLabel")
+        fb_row.addWidget(self._fb_image_label)
+        fb_row.addStretch()
+        self._fb_send_btn = QPushButton("Send", fb)
+        self._fb_send_btn.setObjectName("primaryButton")
+        self._fb_send_btn.clicked.connect(self._send_feedback)
+        fb_row.addWidget(self._fb_send_btn)
+        fb_lay.addLayout(fb_row)
+
+        self._fb_status = QLabel("", fb)
+        self._fb_status.setObjectName("subtitleLabel")
+        self._fb_status.setWordWrap(True)
+        fb_lay.addWidget(self._fb_status)
+
+        self._fb_image_b64 = None
+        layout.addWidget(fb)
+
         self._acct_perks = QLabel(
             "<div style='font-size:11px; line-height:150%;'>"
             "<b>Transcribe Pro</b> includes:<br>"
@@ -2465,6 +2538,102 @@ class Settings(QDialog):
 
         self.refresh_pro_state()
         return tab
+
+    # ── Feedback / feature request ──────────────────────────────────────────
+    def _fb_attach_image(self):
+        from PySide6.QtWidgets import QFileDialog
+        import base64
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Attach image", os.path.expanduser("~"),
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif)")
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            if len(raw) > 6_000_000:
+                self._fb_set_status("Image is too large (max ~6 MB).", error=True)
+                return
+            self._fb_image_b64 = base64.b64encode(raw).decode("ascii")
+            self._fb_image_label.setText("Image attached")
+        except Exception as e:
+            self._fb_set_status(f"Could not read image: {e}", error=True)
+
+    def _fb_paste_image(self):
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import QBuffer, QIODevice
+        import base64
+        img = QApplication.clipboard().image()
+        if img.isNull():
+            self._fb_set_status("No image found on the clipboard. Copy a screenshot first.", error=True)
+            return
+        buf = QBuffer()
+        buf.open(QIODevice.WriteOnly)
+        img.save(buf, "PNG")
+        data = bytes(buf.data())
+        if len(data) > 6_000_000:
+            self._fb_set_status("Pasted image is too large (max ~6 MB).", error=True)
+            return
+        self._fb_image_b64 = base64.b64encode(data).decode("ascii")
+        self._fb_image_label.setText("Image pasted")
+
+    def _fb_set_status(self, text, error=False):
+        self._fb_status.setText(text)
+        self._fb_status.setStyleSheet("color: #ef4444;" if error else "color: #16a34a;")
+
+    def _send_feedback(self):
+        if not self.app:
+            return
+        msg = self._fb_text.toPlainText().strip()
+        if not msg:
+            self._fb_set_status("Please type a message first.", error=True)
+            return
+        auth = getattr(self.app, "auth", None)
+        if not (auth and auth.is_authenticated):
+            self._fb_set_status("Please sign in first so we can follow up with you.", error=True)
+            if hasattr(self.app, "show_auth_gate"):
+                self.app.show_auth_gate()
+            return
+        self._fb_send_btn.setEnabled(False)
+        self._fb_set_status("Sending...", error=False)
+        img = self._fb_image_b64
+        import main as m
+        version = getattr(m, "APP_VERSION", "")
+
+        def worker():
+            import requests
+            try:
+                token = auth.get_access_token()
+                if not token:
+                    self.feedback_finished.emit(False, "Your session expired. Sign in again.")
+                    return
+                payload = {"message": msg, "app_version": version, "category": "feedback"}
+                if img:
+                    payload["image"] = img
+                resp = requests.post(
+                    m.FEEDBACK_URL, json=payload,
+                    headers={"Authorization": f"Bearer {token}"}, timeout=30)
+                if resp.status_code == 200:
+                    self.feedback_finished.emit(True, "Thanks! Your feedback was sent. We read every message.")
+                elif resp.status_code == 503:
+                    self.feedback_finished.emit(False, "Feedback isn't fully set up on the server yet. Please try later.")
+                elif resp.status_code in (401, 403):
+                    self.feedback_finished.emit(False, "Your session expired. Sign in again and retry.")
+                else:
+                    self.feedback_finished.emit(False, f"Could not send right now (HTTP {resp.status_code}). Please try again later.")
+            except Exception as e:
+                self.feedback_finished.emit(False, f"Network error: {str(e)[:60]}")
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_feedback_finished(self, ok, message):
+        self._fb_send_btn.setEnabled(True)
+        self._fb_set_status(message, error=not ok)
+        if ok:
+            self._fb_text.clear()
+            self._fb_image_b64 = None
+            self._fb_image_label.setText("")
 
     def _acct_sign_in(self):
         if self.app and hasattr(self.app, "show_auth_gate"):
