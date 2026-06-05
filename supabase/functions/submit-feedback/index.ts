@@ -106,7 +106,9 @@ Deno.serve(async (req) => {
       "User-Agent": "transcribe-feedback",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ title, body: issueBody, labels: [category] }),
+    // No `labels`: GitHub 422s if a label doesn't already exist in the repo.
+    // The "[category]" title prefix categorizes the issue instead.
+    body: JSON.stringify({ title, body: issueBody }),
   });
 
   if (!ghResp.ok) {
