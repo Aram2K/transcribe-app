@@ -80,14 +80,20 @@ def is_pro(auth, cfg=None):
 
 
 def has_pro_access(auth, cfg=None):
-    """Pro access used for FEATURE GATING. A genuine Pro/trial entitlement (from
-    the server) is NEVER downgraded - so a real Pro user can never be blocked or
-    upsold. An admin can also preview Pro by forcing it. The admin force-tier's
-    guest/free options only change the displayed badge, not real Pro access; they
-    still gate a non-Pro admin (useful for testing on a free account)."""
+    """Pro access used for FEATURE GATING.
+
+    When a super admin sets the force-tier preview, that choice is AUTHORITATIVE
+    here - forcing guest/free actually locks Pro features and forcing pro unlocks
+    them - so an admin can see exactly what each tier looks like. The override
+    only ever applies to super admins (see _override_tier), so a normal Pro user
+    is never affected: with no override active, their real server entitlement
+    always wins and can never be downgraded or upsold."""
+    ov = _override_tier(auth, cfg)
+    if ov is not None:
+        return ov == TIER_PRO
     if auth is not None and getattr(auth, "is_pro", False):
         return True
-    return _override_tier(auth, cfg) == TIER_PRO
+    return False
 
 
 def guest_seconds_used():
@@ -122,10 +128,12 @@ def add_guest_seconds(seconds):
 
 
 def can_record(auth, cfg=None):
-    """The guest recording cap applies ONLY to users who are not signed in.
-    Anyone signed in (free, pro, or an admin previewing the guest tier via the
-    force-tier control) always has unlimited local dictation - we gate on real
-    authentication, never on the displayed/forced tier."""
+    """The guest recording cap applies to users who are not signed in. Signed-in
+    free/pro users have unlimited local dictation. An admin can preview the guest
+    cap by forcing the guest tier (so the 10-minute limit is honored even though
+    they're signed in); forcing free/pro keeps dictation unlimited as expected."""
+    if _override_tier(auth, cfg) == TIER_GUEST:
+        return guest_seconds_remaining() > 0
     if auth is not None and getattr(auth, "is_authenticated", False):
         return True
     return guest_seconds_remaining() > 0

@@ -1564,7 +1564,10 @@ class AppController(QObject):
     def _on_auth_changed(self):
         # Runs on the GUI thread (QueuedConnection). Refresh tray + any open UI.
         # Track the moment a user becomes Pro (trial or paid) for the funnel.
-        now_pro = self.is_pro()
+        # Use the REAL server entitlement here (not is_pro(), which honors the
+        # admin force-tier preview) so toggling the preview never fires the
+        # activation funnel or wipes the managed-engine choice during a preview.
+        now_pro = bool(getattr(self.auth, "is_pro", False))
         if now_pro and not getattr(self, "_was_pro", False):
             try:
                 telemetry.track("pro_activated", {"plan": getattr(self.auth, "plan", "") or ""}, self.cfg, APP_VERSION)
