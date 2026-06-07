@@ -10,10 +10,11 @@ import entitlements
 
 
 class FakeAuth:
-    def __init__(self, authed=False, pro=False, admin=False):
+    def __init__(self, authed=False, pro=False, admin=False, uid=None):
         self.is_authenticated = authed
         self.is_pro = pro
         self.is_admin = admin
+        self.user_id = uid
 
 
 class TestEntitlements(unittest.TestCase):
@@ -59,6 +60,69 @@ class TestEntitlements(unittest.TestCase):
     def test_minutes_remaining_rounds_up(self):
         entitlements.add_guest_seconds(539)  # 61s left -> 2 minutes (ceil)
         self.assertEqual(entitlements.guest_minutes_remaining(), 2)
+
+
+class TestPerUserSmartTrial(unittest.TestCase):
+    """The free Smart Actions trial must follow the user, not the device."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = entitlements._USAGE_PATH
+        entitlements._USAGE_PATH = Path(self._tmp.name) / "usage.json"
+
+    def tearDown(self):
+        entitlements._USAGE_PATH = self._orig
+        self._tmp.cleanup()
+
+    def test_counter_is_per_user(self):
+        a = FakeAuth(True, False, uid="A")
+        b = FakeAuth(True, False, uid="B")
+        for _ in range(entitlements.FREE_SMART_ACTION_TRIES):
+            entitlements.add_smart_action_use(a)
+        # A is exhausted...
+        self.assertEqual(entitlements.smart_actions_remaining(a, {}), 0)
+        self.assertFalse(entitlements.can_use_smart_action(a, {}))
+        # ...but B (a different account on the same device) still has a full 5.
+        self.assertEqual(entitlements.smart_actions_remaining(b, {}), entitlements.FREE_SMART_ACTION_TRIES)
+        self.assertTrue(entitlements.can_use_smart_action(b, {}))
+        # Guests get their own bucket too.
+        self.assertEqual(entitlements.smart_actions_remaining(None, {}), entitlements.FREE_SMART_ACTION_TRIES)
+
+    def test_legacy_global_counter_maps_to_guest(self):
+        import storage
+        storage.atomic_write_json(entitlements._USAGE_PATH, {"smart_action_uses": 3})
+        self.assertEqual(entitlements.smart_actions_used(None), 3)  # guest inherits legacy
+        self.assertEqual(entitlements.smart_actions_used(FakeAuth(True, False, uid="A")), 0)
+
+
+class TestUserSecretIsolation(unittest.TestCase):
+    """API keys must not leak between accounts on a shared computer."""
+
+    def test_switching_users_hides_then_restores_keys(self):
+        cfg = {"google_api_key": "AAA", "action_model": "api_gemini", "backend": "local"}
+        # First run as user A adopts the existing key without clearing it.
+        self.assertFalse(entitlements.reconcile_user_secrets(cfg, "user:A"))
+        self.assertEqual(cfg["secrets_owner"], "user:A")
+        self.assertEqual(cfg["google_api_key"], "AAA")
+        # User B signs in: A's key must disappear and engine resets to defaults.
+        self.assertTrue(entitlements.reconcile_user_secrets(cfg, "user:B"))
+        self.assertEqual(cfg["google_api_key"], "")
+        self.assertEqual(cfg["action_model"], "rule_based")
+        # B saves their own key, then A returns: each sees only their own key.
+        cfg["google_api_key"] = "BBB"
+        self.assertTrue(entitlements.reconcile_user_secrets(cfg, "user:A"))
+        self.assertEqual(cfg["google_api_key"], "AAA")
+        self.assertTrue(entitlements.reconcile_user_secrets(cfg, "user:B"))
+        self.assertEqual(cfg["google_api_key"], "BBB")
+
+    def test_same_user_is_noop(self):
+        cfg = {"google_api_key": "AAA", "secrets_owner": "user:A"}
+        self.assertFalse(entitlements.reconcile_user_secrets(cfg, "user:A"))
+        self.assertEqual(cfg["google_api_key"], "AAA")
+
+    def test_user_secret_id(self):
+        self.assertEqual(entitlements.user_secret_id(None), "guest")
+        self.assertEqual(entitlements.user_secret_id(FakeAuth(True, True, uid="Z")), "user:Z")
 
 
 class TestAdminTierPreview(unittest.TestCase):

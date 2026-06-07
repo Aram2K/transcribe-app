@@ -72,6 +72,7 @@ class FeedbackTextEdit(QTextEdit):
 class Settings(QDialog):
     mistral_test_finished = Signal(bool, str)
     google_test_finished = Signal(bool, str)
+    action_key_test_finished = Signal(bool, str)  # AI Actions cloud key test
     feedback_finished = Signal(bool, str)
     specs_ready = Signal(str)  # GPU name detected on a worker thread
 
@@ -111,6 +112,7 @@ class Settings(QDialog):
         # Connect test signals
         self.mistral_test_finished.connect(self._on_mistral_test_finished)
         self.google_test_finished.connect(self._on_google_test_finished)
+        self.action_key_test_finished.connect(self._on_action_key_test_finished)
         self.feedback_finished.connect(self._on_feedback_finished)
         self.specs_ready.connect(self._on_specs_ready)
         
@@ -487,7 +489,7 @@ class Settings(QDialog):
         dev_head.addStretch()
         self._meeting_pro_badge = QLabel("PRO", dev_frame)
         self._meeting_pro_badge.setObjectName("proBadge")
-        self._meeting_pro_badge.setVisible(not self._is_pro())
+        self._meeting_pro_badge.setVisible(True)  # shown for all tiers, incl. Pro
         dev_head.addWidget(self._meeting_pro_badge)
         dev_lay.addLayout(dev_head)
         
@@ -517,10 +519,12 @@ class Settings(QDialog):
         self.chk_managed.setChecked(self.cfg_working.get("backend") == "managed")
         self.chk_managed.stateChanged.connect(self._on_managed_toggled)
         ch_row.addWidget(self.chk_managed)
+        # Right-align the PRO badge so it sits on the same level as the meeting
+        # card's PRO badge (label/control - stretch - PRO).
+        ch_row.addStretch()
         self._cloud_pro_badge = QLabel("PRO", cloud_frame)
         self._cloud_pro_badge.setObjectName("proBadge")
         ch_row.addWidget(self._cloud_pro_badge)
-        ch_row.addStretch()
         cf_lay.addLayout(ch_row)
         cloud_desc = QLabel("Transcribe on our servers - no setup, no API key.", cloud_frame)
         cloud_desc.setObjectName("subtitleLabel")
@@ -805,7 +809,7 @@ class Settings(QDialog):
         kf_lay.addWidget(self.mistral_key_input)
         
         m_test_lay = QHBoxLayout()
-        self.btn_test_mistral = QPushButton("Test API Key", self.keys_frame)
+        self.btn_test_mistral = QPushButton("Test", self.keys_frame)
         self.btn_test_mistral.setObjectName("secondaryButton")
         self.btn_test_mistral.setStyleSheet("padding: 4px 10px; font-size: 11px;")
         self.btn_test_mistral.clicked.connect(self._test_mistral_key)
@@ -813,7 +817,13 @@ class Settings(QDialog):
         self.lbl_status_mistral.setWordWrap(True)
         self.lbl_status_mistral.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.lbl_status_mistral.setStyleSheet("color: #64748b; font-size: 11px;")
+        _m_show, _m_copy, _m_save = self._make_key_tool_buttons(
+            self.keys_frame, self.mistral_key_input, self.lbl_status_mistral,
+            lambda: self._save_single_key("mistral_api_key", self.mistral_key_input, self.lbl_status_mistral))
+        m_test_lay.addWidget(_m_show)
+        m_test_lay.addWidget(_m_copy)
         m_test_lay.addWidget(self.btn_test_mistral)
+        m_test_lay.addWidget(_m_save)
         m_test_lay.addWidget(self.lbl_status_mistral)
         kf_lay.addLayout(m_test_lay)
         
@@ -832,7 +842,7 @@ class Settings(QDialog):
         kf_lay.addWidget(self.google_key_input)
 
         g_test_lay = QHBoxLayout()
-        self.btn_test_google = QPushButton("Test API Key", self.keys_frame)
+        self.btn_test_google = QPushButton("Test", self.keys_frame)
         self.btn_test_google.setObjectName("secondaryButton")
         self.btn_test_google.setStyleSheet("padding: 4px 10px; font-size: 11px;")
         self.btn_test_google.clicked.connect(self._test_google_key)
@@ -840,7 +850,13 @@ class Settings(QDialog):
         self.lbl_status_google.setWordWrap(True)
         self.lbl_status_google.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.lbl_status_google.setStyleSheet("color: #64748b; font-size: 11px;")
+        _g_show, _g_copy, _g_save = self._make_key_tool_buttons(
+            self.keys_frame, self.google_key_input, self.lbl_status_google,
+            lambda: self._save_single_key("google_api_key", self.google_key_input, self.lbl_status_google))
+        g_test_lay.addWidget(_g_show)
+        g_test_lay.addWidget(_g_copy)
         g_test_lay.addWidget(self.btn_test_google)
+        g_test_lay.addWidget(_g_save)
         g_test_lay.addWidget(self.lbl_status_google)
         kf_lay.addLayout(g_test_lay)
         
@@ -1100,6 +1116,132 @@ class Settings(QDialog):
         byo_selected = (self.cfg_working.get("backend") == "google")
         self._apply_cloud_card_state(
             card, "gemini", byo_selected, getattr(self, "_google_key_verified", False))
+
+    # ── Reusable API-key field controls: Show/Hide · Copy · Save ─────────────
+    def _set_key_status(self, label, text, color="#64748b"):
+        if label is not None:
+            label.setText(text)
+            label.setStyleSheet(f"color: {color}; font-size: 11px;")
+
+    def _toggle_key_echo(self, line_edit, btn, checked):
+        from PySide6.QtWidgets import QLineEdit as _QLE
+        line_edit.setEchoMode(_QLE.Normal if checked else _QLE.Password)
+        btn.setText("Hide" if checked else "Show")
+
+    def _copy_key(self, line_edit, status_label=None):
+        from PySide6.QtWidgets import QApplication
+        txt = (line_edit.text() or "").strip()
+        if not txt:
+            self._set_key_status(status_label, "Nothing to copy")
+            return
+        QApplication.clipboard().setText(txt)
+        self._set_key_status(status_label, "Copied to clipboard", "#16a34a")
+
+    def _mark_secrets_owner(self):
+        """Tag the saved keys as belonging to the current user so they survive an
+        account switch (and aren't shown to a different user)."""
+        if self.app is not None and hasattr(self.app, "_user_secret_id"):
+            try:
+                self.app.cfg["secrets_owner"] = self.app._user_secret_id()
+            except Exception:
+                pass
+
+    def _save_single_key(self, cfg_key, line_edit, status_label=None):
+        """Persist one key field (Mistral / Google) immediately + confirm."""
+        val = (line_edit.text() or "").strip()
+        self.cfg_working[cfg_key] = val
+        line_edit.setStyleSheet("")
+        if self.app:
+            self.app.cfg[cfg_key] = val
+            self._mark_secrets_owner()
+            self.app.save_config()
+        self._set_key_status(status_label, "Saved" if val else "Cleared", "#16a34a")
+
+    def _save_cloud_key(self):
+        """Persist the AI Actions cloud engine key (mapped to the right cfg field
+        by provider) immediately + confirm."""
+        self._save_action_configs()
+        if self.app:
+            self.app.cfg.update(self.cfg_working)
+            self._mark_secrets_owner()
+            self.app.save_config()
+        self._set_key_status(getattr(self, "_cloud_key_status", None), "Saved", "#16a34a")
+
+    def _make_key_tool_buttons(self, parent, line_edit, status_label, on_save):
+        """Return (show, copy, save) buttons wired to a key field."""
+        show = QPushButton("Show", parent)
+        show.setObjectName("secondaryButton")
+        show.setStyleSheet("padding: 4px 10px; font-size: 11px;")
+        show.setCheckable(True)
+        show.setToolTip("Show or hide the key")
+        show.toggled.connect(lambda checked, le=line_edit, b=show: self._toggle_key_echo(le, b, checked))
+        copy = QPushButton("Copy", parent)
+        copy.setObjectName("secondaryButton")
+        copy.setStyleSheet("padding: 4px 10px; font-size: 11px;")
+        copy.setToolTip("Copy the key to the clipboard")
+        copy.clicked.connect(lambda _=False, le=line_edit, sl=status_label: self._copy_key(le, sl))
+        save = QPushButton("Save", parent)
+        save.setObjectName("primaryButton")
+        save.setStyleSheet("padding: 4px 12px; font-size: 11px;")
+        save.setToolTip("Save this key")
+        save.clicked.connect(lambda _=False: on_save())
+        return show, copy, save
+
+    def _test_action_cloud_key(self):
+        """Validate the AI Actions cloud key for the selected provider."""
+        provider = self.combo_engine.currentData() if hasattr(self, "combo_engine") else None
+        key = self.cloud_api_key.text().strip()
+        if not key:
+            self._set_key_status(self._cloud_key_status, "✗ Key is empty", "#ef4444")
+            return
+        base = self.cloud_api_url.text().strip() if hasattr(self, "cloud_api_url") else ""
+        model = ""
+        if hasattr(self, "cloud_api_model"):
+            model = self.cloud_api_model.currentData() or self.cloud_api_model.currentText().strip()
+        self._set_key_status(self._cloud_key_status, "Testing…", "#3b82f6")
+        self.btn_test_cloud_key.setEnabled(False)
+
+        def worker():
+            ok, msg = self._validate_action_key(provider, key, base, model)
+            self.action_key_test_finished.emit(ok, msg)
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _validate_action_key(self, provider, key, base, model):
+        import requests
+        try:
+            if provider == actions.API_GEMINI_ID:
+                b = (base or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+                m = model or "gemini-2.5-flash"
+                r = requests.post(
+                    f"{b}/models/{m}:generateContent",
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    json={"contents": [{"parts": [{"text": "ping"}]}],
+                          "generationConfig": {"maxOutputTokens": 1}}, timeout=20)
+            elif provider == actions.API_ANTHROPIC_ID:
+                b = (base or "https://api.anthropic.com/v1").rstrip("/")
+                m = model or "claude-3-5-haiku-latest"
+                r = requests.post(
+                    f"{b}/messages",
+                    headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                             "Content-Type": "application/json"},
+                    json={"model": m, "max_tokens": 1,
+                          "messages": [{"role": "user", "content": "ping"}]}, timeout=20)
+            else:  # OpenAI-compatible
+                b = (base or "https://api.openai.com/v1").rstrip("/")
+                r = requests.get(f"{b}/models", headers={"Authorization": f"Bearer {key}"}, timeout=20)
+            if 200 <= r.status_code < 300:
+                return True, "✓ Working"
+            if r.status_code in (401, 403):
+                return False, "✗ Invalid API key"
+            return False, f"✗ HTTP {r.status_code}"
+        except requests.RequestException as e:
+            return False, f"✗ Connection error: {str(e)[:40]}"
+
+    def _on_action_key_test_finished(self, ok, message):
+        if hasattr(self, "btn_test_cloud_key"):
+            self.btn_test_cloud_key.setEnabled(True)
+        self._set_key_status(self._cloud_key_status, message, "#16a34a" if ok else "#ef4444")
 
     def _test_mistral_key(self):
         key = self.mistral_key_input.text().strip()
@@ -1498,6 +1640,26 @@ class Settings(QDialog):
         self.cloud_api_key.setEchoMode(QLineEdit.Password)
         self.cloud_api_key.textChanged.connect(self._save_action_configs)
         self.lay_cloud.addWidget(self.cloud_api_key)
+
+        # Show/Hide · Copy · Test · Save controls for the cloud action key.
+        ck_row = QHBoxLayout()
+        ck_row.setSpacing(6)
+        self._cloud_key_status = QLabel("", self.card_cloud)
+        self._cloud_key_status.setWordWrap(True)
+        self._cloud_key_status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._cloud_key_status.setStyleSheet("color: #64748b; font-size: 11px;")
+        _c_show, _c_copy, _c_save = self._make_key_tool_buttons(
+            self.card_cloud, self.cloud_api_key, self._cloud_key_status, self._save_cloud_key)
+        self.btn_test_cloud_key = QPushButton("Test", self.card_cloud)
+        self.btn_test_cloud_key.setObjectName("secondaryButton")
+        self.btn_test_cloud_key.setStyleSheet("padding: 4px 10px; font-size: 11px;")
+        self.btn_test_cloud_key.clicked.connect(self._test_action_cloud_key)
+        ck_row.addWidget(_c_show)
+        ck_row.addWidget(_c_copy)
+        ck_row.addWidget(self.btn_test_cloud_key)
+        ck_row.addWidget(_c_save)
+        ck_row.addWidget(self._cloud_key_status)
+        self.lay_cloud.addLayout(ck_row)
 
         self.lbl_cloud_url = QLabel("API Base URL (Optional for standard endpoints)", self.card_cloud)
         self.lay_cloud.addWidget(self.lbl_cloud_url)
@@ -2915,6 +3077,48 @@ class Settings(QDialog):
         except Exception:
             return 0
 
+    def reload_secret_fields(self):
+        """Pull the (just-swapped) per-user API keys + engine config from the app
+        config into the working copy and the visible inputs. Called when the
+        signed-in user changes so a different account never sees the old keys."""
+        if not self.app:
+            return
+        scoped = (
+            "google_api_key", "action_api_key", "mistral_api_key",
+            "action_model", "action_api_provider", "action_api_base_url",
+            "action_api_model", "backend", "managed_provider",
+        )
+        for k in scoped:
+            if k in self.app.cfg:
+                self.cfg_working[k] = self.app.cfg.get(k)
+        # Mistral / Google key inputs (General tab).
+        for attr, key in (("mistral_key_input", "mistral_api_key"),
+                          ("google_key_input", "google_api_key")):
+            w = getattr(self, attr, None)
+            if w is not None:
+                w.blockSignals(True)
+                w.setText(self.cfg_working.get(key, ""))
+                w.setStyleSheet("")
+                w.blockSignals(False)
+        # Managed-cloud toggle (Models tab).
+        if hasattr(self, "chk_managed"):
+            self.chk_managed.blockSignals(True)
+            self.chk_managed.setChecked(self.cfg_working.get("backend") == "managed")
+            self.chk_managed.blockSignals(False)
+        # AI Actions engine dropdown + its cloud key field.
+        if hasattr(self, "combo_engine"):
+            prov = self.cfg_working.get("action_model", "rule_based")
+            import local_llm
+            if prov in (local_llm.QWEN_TINY_ID, local_llm.QWEN_3B_ID,
+                        local_llm.QWEN_7B_ID, local_llm.GEMMA_2B_ID):
+                prov = "local_llm"
+            idx = self.combo_engine.findData(prov)
+            if idx >= 0:
+                self.combo_engine.blockSignals(True)
+                self.combo_engine.setCurrentIndex(idx)
+                self.combo_engine.blockSignals(False)
+            self._set_backend_layout(self.combo_engine.currentData())
+
     def refresh_pro_state(self):
         """Update the Account tab to reflect the current auth/entitlement state.
         Safe to call from main.py's auth-changed handler (and before the tab is
@@ -2964,13 +3168,17 @@ class Settings(QDialog):
         # Smart Actions: Pro = unlimited (no badge); non-Pro shows a "N/5 FREE"
         # counter, and once exhausted the option locks (PRO badge + disabled).
         if getattr(self, "_smart_pro_badge", None) is not None:
+            auth = getattr(self.app, "auth", None) if self.app else None
             if is_pro:
-                self._smart_pro_badge.setVisible(False)
+                # Pro keeps the PRO tag visible (so the premium feature stays
+                # recognizable) but the control is unlimited + enabled.
+                self._smart_pro_badge.setText("PRO")
+                self._smart_pro_badge.setObjectName("proBadge")
                 if hasattr(self, "rb_smart"):
                     self.rb_smart.setEnabled(True)
             else:
                 try:
-                    rem = entitlements.smart_actions_remaining(None, self.app.cfg if self.app else None)
+                    rem = entitlements.smart_actions_remaining(auth, self.app.cfg if self.app else None)
                 except Exception:
                     rem = entitlements.FREE_SMART_ACTION_TRIES
                 if rem > 0:
@@ -2990,9 +3198,9 @@ class Settings(QDialog):
                             self.rb_smart.setChecked(False)
                             self.rb_smart.blockSignals(False)
                             self.cfg_working["output_action"] = actions.ACTION_TRANSCRIBE_ONLY
-                self._smart_pro_badge.setVisible(True)
-                self._smart_pro_badge.style().unpolish(self._smart_pro_badge)
-                self._smart_pro_badge.style().polish(self._smart_pro_badge)
+            self._smart_pro_badge.setVisible(True)
+            self._smart_pro_badge.style().unpolish(self._smart_pro_badge)
+            self._smart_pro_badge.style().polish(self._smart_pro_badge)
 
         # Meeting controls: locked but readable for non-Pro (clicking prompts upgrade).
         if hasattr(self, "btn_launch_meeting"):
@@ -3010,7 +3218,9 @@ class Settings(QDialog):
         if hasattr(self, "combo_device"):
             self.combo_device.setEnabled(is_pro)
         if hasattr(self, "_meeting_pro_badge"):
-            self._meeting_pro_badge.setVisible(not is_pro)
+            # Keep the PRO tag visible for Pro users too, so the premium feature
+            # stays recognizable (only the gating/enablement changes with tier).
+            self._meeting_pro_badge.setVisible(True)
 
         # Privacy Mode (can be toggled from the tray) deactivates cloud options
         # with a clear reason so users know why they're disabled.

@@ -1534,6 +1534,19 @@ class AppController(QObject):
         except Exception:
             return entitlements.TIER_GUEST
 
+    def _user_secret_id(self):
+        return entitlements.user_secret_id(getattr(self, "auth", None))
+
+    def _reconcile_user_secrets(self):
+        """Keep BYO API keys + cloud-engine config scoped per user. Returns True if
+        the active keys were swapped for a different user (so callers refresh UI)."""
+        current = self._user_secret_id()
+        if self.cfg.get("secrets_owner") == current:
+            return False  # same user (or same guest session) - nothing to do
+        switched = entitlements.reconcile_user_secrets(self.cfg, current)
+        self.save_config()
+        return switched
+
     def _tier_color(self):
         """Green = Free, Purple = Pro, Gray = Guest."""
         return {
@@ -1563,6 +1576,13 @@ class AppController(QObject):
 
     def _on_auth_changed(self):
         # Runs on the GUI thread (QueuedConnection). Refresh tray + any open UI.
+        # First: swap in/out the per-user API keys if the signed-in user changed,
+        # so we never expose the previous account's keys on a shared computer.
+        switched = False
+        try:
+            switched = self._reconcile_user_secrets()
+        except Exception:
+            logger.debug("user secret reconcile failed", exc_info=True)
         # Track the moment a user becomes Pro (trial or paid) for the funnel.
         # Use the REAL server entitlement here (not is_pro(), which honors the
         # admin force-tier preview) so toggling the preview never fires the
@@ -1607,6 +1627,8 @@ class AppController(QObject):
         sw = getattr(self, "settings_win", None)
         if sw is not None and hasattr(sw, "refresh_pro_state"):
             try:
+                if switched and hasattr(sw, "reload_secret_fields"):
+                    sw.reload_secret_fields()  # pull the swapped-in user's keys
                 sw.refresh_pro_state()
             except Exception:
                 pass
@@ -2255,8 +2277,8 @@ class AppController(QObject):
         # falls back to pasting raw text (and we nudge them to upgrade).
         if action_mode != actions.ACTION_TRANSCRIBE_ONLY and not self.is_pro():
             if entitlements.can_use_smart_action(self.auth, self.cfg):
-                entitlements.add_smart_action_use()
-                rem = entitlements.smart_actions_remaining(None, self.cfg)
+                entitlements.add_smart_action_use(self.auth)
+                rem = entitlements.smart_actions_remaining(self.auth, self.cfg)
                 self.overlay.call_soon(
                     self.show_tray_hint,
                     "Smart Action (free trial)",
