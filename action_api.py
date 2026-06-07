@@ -121,6 +121,34 @@ def build_messages(text, mode, source_lang="auto", target_lang="en"):
     ]
 
 
+SMART_ACTION_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/smart-action"
+
+
+def run_managed_action(text, mode, token, source_lang="auto", target_lang="en"):
+    """Pro Smart Actions via the server (no BYO key): we build the messages here
+    and the edge function runs them through the founder's Mistral key."""
+    if not token:
+        raise ActionAPIError("Sign in with Pro to use managed Smart Actions.")
+    messages = build_messages(text, mode, source_lang, target_lang)
+    try:
+        resp = requests.post(
+            SMART_ACTION_URL,
+            json={"messages": messages, "max_tokens": _max_tokens_for(mode)},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=45,
+        )
+    except requests.RequestException as e:
+        raise ActionAPIError(f"Network error reaching Smart Actions: {e}")
+    if resp.status_code == 403:
+        raise ActionAPIError("Pro is required for managed Smart Actions.")
+    if resp.status_code == 429:
+        raise ActionAPIError("Daily Smart Actions limit reached - try again tomorrow.")
+    if resp.status_code == 503:
+        raise ActionAPIError("Managed Smart Actions aren't set up on the server yet.")
+    data = _json_or_error(resp)
+    return (data.get("text") or "").strip()
+
+
 def run_action(text, mode, config, source_lang="auto", target_lang="en"):
     provider = normalize_provider(config.get("action_api_provider"))
     key = (config.get("action_api_key") or "").strip()

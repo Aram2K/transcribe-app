@@ -136,6 +136,43 @@ class TestActions(unittest.TestCase):
         self.assertIn("Subject:", out)
         run_action.assert_not_called()
 
+    def test_managed_engine_calls_server_with_token(self):
+        # Pro managed Smart Actions run through the server (founder's Mistral key);
+        # the auth token is injected into config by the caller.
+        with patch.object(actions.action_api, "run_managed_action", return_value="MANAGED") as run_managed:
+            out = actions.process(
+                "summarize the meeting we just had",
+                actions.ACTION_SMART_AUTO,
+                model=actions.API_MANAGED_ID,
+                config={"_managed_token": "tok123"},
+            )
+        self.assertEqual(out, "MANAGED")
+        run_managed.assert_called_once()
+
+    def test_managed_engine_without_token_degrades_to_rule_based(self):
+        # A lapsed/free user whose engine is still "managed" must not error - it
+        # should quietly fall back to local rule-based output.
+        with patch.object(actions.action_api, "run_managed_action") as run_managed:
+            out = actions.process(
+                "write an email to john that the report is ready tonight",
+                actions.ACTION_SMART_AUTO,
+                model=actions.API_MANAGED_ID,
+                config={},
+            )
+        self.assertIn("Subject:", out)
+        run_managed.assert_not_called()
+
+    def test_managed_engine_blocked_by_privacy_mode(self):
+        with patch.object(actions.action_api, "run_managed_action") as run_managed:
+            out = actions.process(
+                "send the report today",
+                actions.ACTION_SMART_AUTO,
+                model=actions.API_MANAGED_ID,
+                config={"privacy_mode": True, "_managed_token": "tok"},
+            )
+        self.assertTrue(out)
+        run_managed.assert_not_called()
+
 
 class TestMeetingNotes(unittest.TestCase):
     SAMPLE = (

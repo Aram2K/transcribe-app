@@ -147,7 +147,7 @@ def smart_actions_used():
 
 
 def smart_actions_remaining(auth=None, cfg=None):
-    if auth is not None and tier(auth, cfg) == TIER_PRO:
+    if has_pro_access(auth, cfg):
         return FREE_SMART_ACTION_TRIES  # display value; Pro is unlimited anyway
     return max(0, FREE_SMART_ACTION_TRIES - smart_actions_used())
 

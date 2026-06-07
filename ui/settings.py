@@ -124,7 +124,10 @@ class Settings(QDialog):
         self._build_ui()
         self.btn_hotkey.installEventFilter(self)
         self.installEventFilter(self)
-        self._set_backend_layout(self.cfg_working.get("action_api_provider", "api_openai_compatible") if self.app else "api_openai_compatible")
+        # Match the config stack to the engine actually selected in the dropdown
+        # (so managed/local/rule show their own panel, not a stale cloud form).
+        _init_engine = self.combo_engine.currentData() if hasattr(self, "combo_engine") else None
+        self._set_backend_layout(_init_engine or (self.cfg_working.get("action_api_provider", "api_openai_compatible") if self.app else "api_openai_compatible"))
         self._load_values_into_widgets()
 
     def showEvent(self, event):
@@ -281,8 +284,10 @@ class Settings(QDialog):
         self.chk_privacy.setChecked(bool(self.cfg_working.get("privacy_mode", False)))
         self.chk_privacy.blockSignals(False)
         
-        # 5. Engine Provider
-        provider = self.cfg_working.get("action_model", "rule_based")
+        # 5. Engine Provider - Pro defaults to the managed cloud (matches the
+        # actual routing in main._stop), everyone else to rule-based.
+        _pro = entitlements.has_pro_access(self.app.auth if self.app else None, self.cfg_working)
+        provider = self.cfg_working.get("action_model", actions.API_MANAGED_ID if _pro else "rule_based")
         import local_llm
         if provider in (local_llm.QWEN_TINY_ID, local_llm.QWEN_3B_ID, local_llm.QWEN_7B_ID, local_llm.GEMMA_2B_ID):
             provider = "local_llm"
@@ -905,10 +910,18 @@ class Settings(QDialog):
             f"Cloud API Credentials.\n\nOr upgrade to Pro to use it with no key - we "
             f"handle the cloud for you.")
         up = box.addButton("Upgrade to Pro", QMessageBox.AcceptRole)
-        box.addButton("Add my key", QMessageBox.RejectRole)
+        addk = box.addButton("Add my key", QMessageBox.RejectRole)
         box.exec()
-        if box.clickedButton() == up and self.app and hasattr(self.app, "_pro_upsell"):
+        clicked = box.clickedButton()
+        if clicked == up and self.app and hasattr(self.app, "_pro_upsell"):
             self.app._pro_upsell("Keyless cloud transcription")
+        elif clicked == addk:
+            # Jump straight to the relevant key field so they can paste it.
+            fld = (self.mistral_key_input if "Mistral" in provider_name
+                   else getattr(self, "google_key_input", None))
+            if fld is not None:
+                fld.setFocus()
+                fld.setStyleSheet("border: 2px solid #3b82f6; background-color: #eff6ff;")
 
     def _refresh_cloud_cards(self):
         for m_name in list(self.whisper_cards.keys()):
@@ -1431,14 +1444,18 @@ class Settings(QDialog):
         engine_lay.addWidget(QLabel("Primary Action Engine", engine_frame))
         
         self.combo_engine = QComboBox(engine_frame)
+        self.combo_engine.addItem("Transcribe Pro - managed cloud (no key needed)", actions.API_MANAGED_ID)
         self.combo_engine.addItem("Local Offline LLM Engine (Qwen / Gemma)", "local_llm")
         self.combo_engine.addItem("Rule-based Formatter (Fast, Local, Offline)", actions.RULE_BASED_ID)
         self.combo_engine.addItem("Google Gemini API (Cloud Engine)", actions.API_GEMINI_ID)
         self.combo_engine.addItem("OpenAI-compatible API (Cloud Engine)", actions.API_OPENAI_ID)
         self.combo_engine.addItem("Anthropic Claude API (Cloud Engine)", actions.API_ANTHROPIC_ID)
-        
+
         if self.app:
-            provider = self.cfg_working.get("action_model", "local_llm")
+            # Pro users default to the managed cloud (our key, zero setup);
+            # everyone else defaults to the local LLM.
+            _pro = entitlements.has_pro_access(self.app.auth, self.cfg_working)
+            provider = self.cfg_working.get("action_model", actions.API_MANAGED_ID if _pro else "local_llm")
             # Convert legacy values if present
             if provider in (local_llm.QWEN_TINY_ID, local_llm.QWEN_3B_ID, local_llm.QWEN_7B_ID, local_llm.GEMMA_2B_ID):
                 provider = "local_llm"
@@ -1539,6 +1556,26 @@ class Settings(QDialog):
             self._update_llm_card_ui(name)
 
         self.engine_stack.addWidget(self.card_local_llm)
+
+        # Card 3: Managed Pro cloud (no configuration, no key)
+        self.card_managed = QFrame()
+        self.card_managed.setObjectName("cardFrame")
+        lay_managed = QVBoxLayout(self.card_managed)
+        lay_managed.setContentsMargins(14, 14, 14, 14)
+        lay_managed.setSpacing(6)
+        _mtitle = QLabel("Managed by Transcribe Pro", self.card_managed)
+        _mtitle.setStyleSheet("font-weight: 700; color: #6d28d9;")
+        lay_managed.addWidget(_mtitle)
+        _mbody = QLabel(
+            "Your Smart Actions run on our servers with a high-quality model - "
+            "no API key, no setup, included with Pro. Nothing to configure here.",
+            self.card_managed,
+        )
+        _mbody.setWordWrap(True)
+        _mbody.setStyleSheet("color: #475569;")
+        lay_managed.addWidget(_mbody)
+        lay_managed.addStretch(1)
+        self.engine_stack.addWidget(self.card_managed)
 
         engine_section_lay.addWidget(self.engine_stack)
         layout.addWidget(self.engine_section)
@@ -1852,6 +1889,8 @@ class Settings(QDialog):
             self.engine_stack.setCurrentIndex(0)
         elif provider == "local_llm":
             self.engine_stack.setCurrentIndex(2)
+        elif provider == actions.API_MANAGED_ID:
+            self.engine_stack.setCurrentIndex(3)
         else:
             self.engine_stack.setCurrentIndex(1)
             
@@ -2112,26 +2151,36 @@ class Settings(QDialog):
                 frame.setEnabled(not is_private)
                 frame.setStyleSheet(PALE if is_private else "")
 
-        # Cloud engines in the AI Actions dropdown (indexes 2,3,4).
+        # Cloud engines in the AI Actions dropdown - disable any engine that
+        # leaves the device under Privacy Mode (matched by id, not index).
         if getattr(self, "combo_engine", None):
+            cloud_ids = {
+                actions.API_MANAGED_ID, actions.API_GEMINI_ID,
+                actions.API_OPENAI_ID, actions.API_ANTHROPIC_ID,
+            }
             model = self.combo_engine.model()
-            for i in (2, 3, 4):
+            for i in range(self.combo_engine.count()):
                 item = model.item(i)
-                if item:
+                if item and self.combo_engine.itemData(i) in cloud_ids:
                     item.setEnabled(not is_private)
                     item.setForeground(QColor("#cbd5e1") if is_private else QColor("#1e293b"))
-            if is_private and self.combo_engine.currentIndex() in (2, 3, 4):
-                self.combo_engine.setCurrentIndex(1)  # back to Rule-based Formatter
+            if is_private and self.combo_engine.currentData() in cloud_ids:
+                idx = self.combo_engine.findData(actions.RULE_BASED_ID)
+                if idx >= 0:
+                    self.combo_engine.setCurrentIndex(idx)  # back to Rule-based Formatter
 
     def _save_action_configs(self):
         if not self.app:
             return
         provider = self.combo_engine.currentData()
-        
+
         if provider == "local_llm":
             self.cfg_working["action_model"] = self.combo_local_model.currentData()
         elif provider == actions.RULE_BASED_ID:
             self.cfg_working["action_model"] = actions.RULE_BASED_ID
+        elif provider == actions.API_MANAGED_ID:
+            # Managed Pro cloud: nothing to configure, no key to store.
+            self.cfg_working["action_model"] = actions.API_MANAGED_ID
         else: # Cloud API config saving
             self.cfg_working["action_model"] = provider
             key_text = self.cloud_api_key.text().strip()
@@ -2801,6 +2850,8 @@ class Settings(QDialog):
                     self.feedback_finished.emit(True, "Thanks! Your feedback was sent. We read every message.")
                 elif resp.status_code == 503:
                     self.feedback_finished.emit(False, "Feedback isn't fully set up on the server yet. Please try later.")
+                elif resp.status_code == 429:
+                    self.feedback_finished.emit(False, "You've sent a lot of feedback today - thank you! Please try again tomorrow.")
                 elif resp.status_code in (401, 403):
                     self.feedback_finished.emit(False, "Your session expired. Sign in again and retry.")
                 else:

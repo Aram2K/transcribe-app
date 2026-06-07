@@ -55,6 +55,23 @@ Deno.serve(async (req) => {
   if (userErr || !userData?.user) return json({ error: "unauthorized" }, 401);
   const user = userData.user;
 
+  const svc = SERVICE_KEY ? createClient(SUPABASE_URL, SERVICE_KEY) : null;
+  if (!svc) return json({ error: "server_misconfigured" }, 500);
+
+  // Per-user daily rate-limit: stop one account from flooding the feedback
+  // table (and, via GitHub, the founder's inbox). Count this user's rows in the
+  // last 24h and cap them. Fail-open if the count query itself errors.
+  const DAILY_FEEDBACK_CAP = 20;
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const { count: recentCount, error: countErr } = await svc
+    .from("feedback")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", user.id)
+    .gte("created_at", since);
+  if (!countErr && (recentCount ?? 0) >= DAILY_FEEDBACK_CAP) {
+    return json({ error: "rate_limited", detail: "Daily feedback limit reached - please try again tomorrow." }, 429);
+  }
+
   let body: any;
   try { body = await req.json(); } catch { return json({ error: "bad_request" }, 400); }
 
@@ -63,9 +80,6 @@ Deno.serve(async (req) => {
   if (message.length > 5000) return json({ error: "message_too_long" }, 400);
   const appVersion = (body?.app_version ?? "").toString().slice(0, 20);
   const category = (body?.category ?? "feedback").toString().slice(0, 30);
-
-  const svc = SERVICE_KEY ? createClient(SUPABASE_URL, SERVICE_KEY) : null;
-  if (!svc) return json({ error: "server_misconfigured" }, 500);
 
   // Optional screenshots -> public storage URLs. Accepts a single `image` or an
   // `images` array (up to 4).

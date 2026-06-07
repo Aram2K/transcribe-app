@@ -585,11 +585,13 @@ class AudioRecorder:
                         if d == "cuda":
                             # A CUDA model constructs even when the CUDA runtime libs
                             # (cuBLAS/cuDNN, e.g. cublas64_12.dll) are missing - it
-                            # only fails when it actually computes. Force a tiny warm-up
-                            # now so we catch that here and fall back to CPU, instead
-                            # of erroring on the user's first real dictation.
-                            seg, _ = m.transcribe(np.zeros(16000, dtype=np.float32), beam_size=1)
-                            list(seg)
+                            # only fails when it actually computes. The first time
+                            # only, force a tiny warm-up so we catch that here and
+                            # fall back to CPU instead of erroring on a real dictation.
+                            # After we know GPU works, skip the warm-up on later loads.
+                            if getattr(self, "_cuda_usable", None) is None:
+                                seg, _ = m.transcribe(np.zeros(16000, dtype=np.float32), beam_size=1)
+                                list(seg)
                             self._cuda_usable = True
                         self._model = m
                         self._model_name = name
@@ -1569,6 +1571,18 @@ class AppController(QObject):
             except Exception:
                 pass
         self._was_pro = now_pro
+        # If Pro lapsed while a keyless managed engine/backend was selected, fall
+        # back to local so the UI and behavior stay consistent (managed = Pro).
+        if not now_pro:
+            _changed = False
+            if self.cfg.get("backend") == "managed":
+                self.cfg["backend"] = "local"
+                _changed = True
+            if self.cfg.get("action_model") == actions.API_MANAGED_ID:
+                self.cfg["action_model"] = actions.RULE_BASED_ID
+                _changed = True
+            if _changed:
+                self.save_config()
         # Remember the signed-in email so the sign-in form can prefill it next time
         # (convenience only - the real session is restored from the encrypted
         # refresh token in the OS keyring, never from this).
@@ -2259,20 +2273,39 @@ class AppController(QObject):
             # Switch the overlay to "Thinking…" while the smart action runs.
             from ui.overlay import PROCESSING
             self.overlay.call_soon(self.overlay.set_state, PROCESSING)
+            # Pick the engine + inject the auth token for Pro managed actions.
+            action_model = actions.normalize_action_model(self.cfg.get("action_model", actions.RULE_BASED_ID))
+            action_config = self.cfg
+            if self.is_pro():
+                token = None
+                try:
+                    token = self.auth.get_access_token()
+                except Exception:
+                    token = None
+                if token:
+                    action_config = {**self.cfg, "_managed_token": token}
+                    # Default Pro Smart Actions to the managed cloud (our Mistral
+                    # key, no BYO key). Respect a deliberate local-LLM choice, or a
+                    # cloud engine the user configured with their OWN key.
+                    m_kind = actions.ACTION_MODELS.get(action_model, {}).get("kind")
+                    has_own_cloud_key = bool(
+                        ((self.cfg.get("action_api_key") or "") or (self.cfg.get("google_api_key") or "")).strip())
+                    if m_kind in ("rules", "managed") or (m_kind == "cloud" and not has_own_cloud_key):
+                        action_model = actions.API_MANAGED_ID
             try:
                 output_text = actions.process(
                     text,
                     action_mode,
                     source_lang=lang,
                     target_lang=self.cfg.get("translate_target", "en"),
-                    model=self.cfg.get("action_model", actions.RULE_BASED_ID),
-                    config=self.cfg,
+                    model=action_model,
+                    config=action_config,
                 )
                 telemetry.track(
                     "action_completed",
                     {
                         "action": action_mode,
-                        "model": self.cfg.get("action_model", actions.RULE_BASED_ID),
+                        "model": action_model,
                         "language": lang,
                         "output_length_bucket": _bucket_count(len(output_text)),
                     },
