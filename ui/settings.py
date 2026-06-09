@@ -505,7 +505,8 @@ class Settings(QDialog):
         self.btn_launch_meeting.setMinimumHeight(38)
         self.btn_launch_meeting.clicked.connect(self._launch_smart_meeting)
         dev_lay.addWidget(self.btn_launch_meeting)
-        
+
+        self._apply_pro_glow(dev_frame)
         layout.addWidget(dev_frame)
 
         # Fast cloud transcription (Pro) backend - off by default.
@@ -530,21 +531,44 @@ class Settings(QDialog):
         cloud_desc.setObjectName("subtitleLabel")
         cloud_desc.setWordWrap(True)
         cf_lay.addWidget(cloud_desc)
+        self._apply_pro_glow(cloud_frame)
         layout.addWidget(cloud_frame)
 
         layout.addStretch()
         return tab
 
+    def _apply_pro_glow(self, frame):
+        """Soft fading purple halo + light purple border so Pro features read as
+        premium at a glance. Kept for every tier - it marks the feature itself,
+        not the user's access (gating is handled separately)."""
+        from PySide6.QtWidgets import QGraphicsDropShadowEffect
+        from PySide6.QtGui import QColor
+        frame.setStyleSheet(
+            "QFrame#cardFrame { border: 1px solid rgba(168, 85, 247, 120); }")
+        glow = QGraphicsDropShadowEffect(frame)
+        glow.setBlurRadius(28)
+        glow.setOffset(0, 0)
+        glow.setColor(QColor(168, 85, 247, 95))
+        frame.setGraphicsEffect(glow)
+
     def _populate_audio_devices(self):
+        from ui.icons import meeting_mode_icon
         self.combo_device.clear()
-        self.combo_device.addItem("Smart Meeting Mode (record computer sound + microphone)", "smart_meeting")
-        self.combo_device.addItem("Standard Mode (record microphone only)", "default_mic")
-        
+        self.combo_device.addItem(
+            meeting_mode_icon("smart_meeting"),
+            "System sound + Microphone (best for meetings)", "smart_meeting")
+        self.combo_device.addItem(
+            meeting_mode_icon("default_mic"),
+            "Microphone only", "default_mic")
+        self.combo_device.addItem(
+            meeting_mode_icon("system_only"),
+            "System sound only (no microphone)", "system_only")
+
         # Set to current saved meeting capture mode
         current_dev = self.cfg_working.get("meeting_audio_mode", "smart_meeting")
-        if current_dev not in ("smart_meeting", "default_mic"):
+        if current_dev not in ("smart_meeting", "default_mic", "system_only"):
             current_dev = "smart_meeting"
-            
+
         idx = self.combo_device.findData(str(current_dev))
         if idx >= 0:
             self.combo_device.setCurrentIndex(idx)
@@ -1737,6 +1761,7 @@ class Settings(QDialog):
         _mbody.setStyleSheet("color: #475569;")
         lay_managed.addWidget(_mbody)
         lay_managed.addStretch(1)
+        self._apply_pro_glow(self.card_managed)
         self.engine_stack.addWidget(self.card_managed)
 
         engine_section_lay.addWidget(self.engine_stack)

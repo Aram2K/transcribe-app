@@ -812,6 +812,25 @@ class TestCaptureMode(unittest.TestCase):
         finally:
             rec.recording = False
 
+    @patch("threading.Thread")
+    def test_system_only_uses_loopback_without_mic(self, _mock_thread):
+        # "System sound only" records the computer's audio with NO mic stream.
+        import main
+        from main import AudioRecorder
+        rec = AudioRecorder()
+        rec.audio = MagicMock()
+        rec.audio.get_device_info_by_index.return_value = {
+            "defaultSampleRate": 48000, "maxInputChannels": 2}
+        rec._find_default_loopback_device = MagicMock(return_value=7)
+        try:
+            with patch.dict(main.cfg, {"sample_rate": 16000, "chunk_size": 1024}):
+                rec.start_recording(capture_mode="system_only")
+            rec._find_default_loopback_device.assert_called_once()
+            self.assertIsNone(rec.mic_stream)                 # no secondary mic
+            self.assertEqual(rec.audio.open.call_count, 1)    # loopback only
+        finally:
+            rec.recording = False
+
 
 class TestGoogleKeyTest(unittest.TestCase):
     # The key check now hits the Gemini (AI Studio) models endpoint with a GET,

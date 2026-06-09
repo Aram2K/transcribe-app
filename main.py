@@ -708,10 +708,11 @@ class AudioRecorder:
             "frames_per_buffer": cfg["chunk_size"],
         }
         # Resolve what to capture. `capture_mode` is passed explicitly by the
-        # caller: the meetings window passes "smart_meeting"/"default_mic"; plain
-        # hotkey dictation passes nothing and just uses the configured mic. This
-        # keeps loopback/system-audio capture scoped to meetings - it can never
-        # leak into ordinary dictation via a shared config key.
+        # caller: the meetings window passes "smart_meeting" (system + mic),
+        # "system_only" (system sound, no mic) or "default_mic"; plain hotkey
+        # dictation passes nothing and just uses the configured mic. This keeps
+        # loopback/system-audio capture scoped to meetings - it can never leak
+        # into ordinary dictation via a shared config key.
         self.mic_stream = None
         is_loopback = False
         self._loopback_rate = cfg["sample_rate"]
@@ -719,7 +720,7 @@ class AudioRecorder:
 
         actual_device_index = None
 
-        if capture_mode == "smart_meeting":
+        if capture_mode in ("smart_meeting", "system_only"):
             discovered = self._find_default_loopback_device()
             if discovered is not None:
                 actual_device_index = discovered
@@ -733,7 +734,7 @@ class AudioRecorder:
                     self._loopback_rate = 48000
                     self._loopback_channels = 2
             else:
-                logger.warning("Smart Meeting Mode selected but no loopback device discovered. Recording default microphone only.")
+                logger.warning("System-audio capture selected but no loopback device discovered. Recording default microphone only.")
         elif capture_mode in ("default_mic", "default"):
             actual_device_index = None
         else:
@@ -742,7 +743,7 @@ class AudioRecorder:
             # the default microphone so a stale config never makes plain
             # dictation start capturing system audio.
             device_index = cfg.get("input_device_index")
-            if device_index not in (None, "", "default", "default_mic", "smart_meeting"):
+            if device_index not in (None, "", "default", "default_mic", "smart_meeting", "system_only"):
                 try:
                     actual_device_index = int(device_index)
                 except (TypeError, ValueError):
@@ -758,9 +759,11 @@ class AudioRecorder:
             open_args["frames_per_buffer"] = int(cfg["chunk_size"] * (self._loopback_rate / cfg["sample_rate"]))
             
         self.stream = self.audio.open(**open_args)
-        
-        # If primary stream is a loopback, open a secondary stream for default microphone!
-        if is_loopback:
+
+        # If primary stream is a loopback, open a secondary stream for the default
+        # microphone - but only in smart_meeting mode. "system_only" deliberately
+        # records the computer's sound with NO mic.
+        if is_loopback and capture_mode == "smart_meeting":
             try:
                 mic_args = {
                     "format": pyaudio.paFloat32,
