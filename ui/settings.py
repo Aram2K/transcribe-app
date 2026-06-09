@@ -497,6 +497,9 @@ class Settings(QDialog):
         dev_head.addStretch()
         self._meeting_pro_badge = QLabel("PRO", dev_frame)
         self._meeting_pro_badge.setObjectName("proBadge")
+        # Own stylesheet: the glowed card makes child QLabels transparent, which
+        # would otherwise wash out the pill (closest-stylesheet-wins cascade).
+        self._meeting_pro_badge.setStyleSheet(self._PRO_BADGE_CSS)
         self._meeting_pro_badge.setVisible(True)  # shown for all tiers, incl. Pro
         dev_head.addWidget(self._meeting_pro_badge)
         dev_lay.addLayout(dev_head)
@@ -533,6 +536,7 @@ class Settings(QDialog):
         ch_row.addStretch()
         self._cloud_pro_badge = QLabel("PRO", cloud_frame)
         self._cloud_pro_badge.setObjectName("proBadge")
+        self._cloud_pro_badge.setStyleSheet(self._PRO_BADGE_CSS)
         ch_row.addWidget(self._cloud_pro_badge)
         cf_lay.addLayout(ch_row)
         cloud_desc = QLabel("Transcribe on our servers - no setup, no API key.", cloud_frame)
@@ -548,11 +552,17 @@ class Settings(QDialog):
     def _apply_pro_glow(self, frame):
         """Soft fading purple halo + light purple border so Pro features read as
         premium at a glance. Kept for every tier - it marks the feature itself,
-        not the user's access (gating is handled separately)."""
+        not the user's access (gating is handled separately).
+
+        Text children get an explicit transparent background: the glow shows
+        through the card's translucent fill, and labels/checkboxes otherwise
+        paint their own opaque boxes on top of it (ugly white rectangles)."""
         from PySide6.QtWidgets import QGraphicsDropShadowEffect
         from PySide6.QtGui import QColor
         frame.setStyleSheet(
-            "QFrame#cardFrame { border: 1px solid rgba(168, 85, 247, 120); }")
+            "QFrame#cardFrame { border: 1px solid rgba(168, 85, 247, 120); }"
+            "QFrame#cardFrame QLabel, QFrame#cardFrame QCheckBox,"
+            "QFrame#cardFrame QRadioButton { background: transparent; }")
         glow = QGraphicsDropShadowEffect(frame)
         glow.setBlurRadius(28)
         glow.setOffset(0, 0)
@@ -2364,7 +2374,7 @@ class Settings(QDialog):
         if hasattr(self, "_cloud_pro_badge"):
             self._cloud_pro_badge.setStyleSheet(
                 "background-color:#e2e8f0; color:#94a3b8; border-radius:6px; padding:1px 6px; font-weight:700;"
-                if is_private else ""
+                if is_private else self._PRO_BADGE_CSS
             )
 
         # Cloud STT cards render their own privacy-aware disabled look (pale card +
