@@ -87,6 +87,35 @@ def _draw_speaker(p, rect, color=_SLATE):
         p.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), -50 * 16, 100 * 16)
 
 
+def eye_icon(open_=True, size=22, color=_SLATE):
+    """Eye for password fields: open (click to reveal) or slashed (click to hide)."""
+    key = ("eye", open_, size)
+    if key in _ICON_CACHE:
+        return _ICON_CACHE[key]
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = _painter(pm)
+    w = float(size)
+    cy = w / 2
+    pen = QPen(color)
+    pen.setWidthF(max(1.4, w * 0.085))
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    # Eye outline (flattened ellipse) + filled pupil.
+    p.drawEllipse(QRectF(w * 0.08, cy - w * 0.22, w * 0.84, w * 0.44))
+    p.setPen(Qt.NoPen)
+    p.setBrush(color)
+    p.drawEllipse(QPointF(w / 2, cy), w * 0.11, w * 0.11)
+    if not open_:
+        p.setPen(pen)
+        p.drawLine(QPointF(w * 0.16, w * 0.86), QPointF(w * 0.84, w * 0.14))
+    p.end()
+    icon = QIcon(pm)
+    _ICON_CACHE[key] = icon
+    return icon
+
+
 def meeting_mode_icon(mode, size=32):
     """Icon for a meeting capture mode: 'smart_meeting' (mic + speaker),
     'default_mic' (mic only), 'system_only' (speaker only)."""

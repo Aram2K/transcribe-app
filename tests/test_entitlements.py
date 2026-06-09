@@ -94,6 +94,16 @@ class TestPerUserSmartTrial(unittest.TestCase):
         self.assertEqual(entitlements.smart_actions_used(None), 3)  # guest inherits legacy
         self.assertEqual(entitlements.smart_actions_used(FakeAuth(True, False, uid="A")), 0)
 
+    def test_guests_must_sign_up_for_smart_actions(self):
+        # Guests can't burn trials - creating an account is what grants the 5.
+        self.assertFalse(entitlements.can_use_smart_action(None, {}))
+        self.assertFalse(entitlements.can_use_smart_action(FakeAuth(False, False), {}))
+        # A fresh signed-in account immediately has its 5 trials.
+        self.assertTrue(entitlements.can_use_smart_action(FakeAuth(True, False, uid="N"), {}))
+        # An admin previewing the guest tier sees the same lock.
+        admin = FakeAuth(True, True, admin=True)
+        self.assertFalse(entitlements.can_use_smart_action(admin, {"admin_tier_override": "guest"}))
+
 
 class TestUserSecretIsolation(unittest.TestCase):
     """API keys must not leak between accounts on a shared computer."""

@@ -2291,11 +2291,18 @@ class AppController(QObject):
                 self.sig_auth_changed.emit()
             else:
                 action_mode = actions.ACTION_TRANSCRIBE_ONLY
-                self.overlay.call_soon(
-                    self.show_tray_hint,
-                    "Free Smart Actions used up",
-                    "Pasted your raw text. Upgrade to Transcribe Pro for unlimited Smart Actions.",
-                )
+                if entitlements.tier(self.auth, self.cfg) == entitlements.TIER_GUEST:
+                    self.overlay.call_soon(
+                        self.show_tray_hint,
+                        "Smart Actions (Pro)",
+                        "Pasted your raw text. Sign up free to get 5 Smart Action trials.",
+                    )
+                else:
+                    self.overlay.call_soon(
+                        self.show_tray_hint,
+                        "Free Smart Actions used up",
+                        "Pasted your raw text. Upgrade to Transcribe Pro for unlimited Smart Actions.",
+                    )
 
         if action_mode != actions.ACTION_TRANSCRIBE_ONLY:
             # Switch the overlay to "Thinking…" while the smart action runs.

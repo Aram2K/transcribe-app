@@ -362,6 +362,14 @@ class Settings(QDialog):
         )
         self._header_cta.clicked.connect(self._header_cta_clicked)
         self._header_cta.setVisible(False)
+        # A little glow on the edge so the Sign up / Upgrade CTA draws the eye.
+        from PySide6.QtWidgets import QGraphicsDropShadowEffect
+        from PySide6.QtGui import QColor as _QColor
+        _cta_glow = QGraphicsDropShadowEffect(self._header_cta)
+        _cta_glow.setBlurRadius(18)
+        _cta_glow.setOffset(0, 0)
+        _cta_glow.setColor(_QColor(168, 85, 247, 130))
+        self._header_cta.setGraphicsEffect(_cta_glow)
         header_row.addWidget(self._header_cta, 0, Qt.AlignVCenter)
         layout.addLayout(header_row)
 
@@ -841,10 +849,9 @@ class Settings(QDialog):
         self.lbl_status_mistral.setWordWrap(True)
         self.lbl_status_mistral.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.lbl_status_mistral.setStyleSheet("color: #64748b; font-size: 11px;")
-        _m_show, _m_copy, _m_save = self._make_key_tool_buttons(
+        _m_copy, _m_save = self._make_key_tool_buttons(
             self.keys_frame, self.mistral_key_input, self.lbl_status_mistral,
             lambda: self._save_single_key("mistral_api_key", self.mistral_key_input, self.lbl_status_mistral))
-        m_test_lay.addWidget(_m_show)
         m_test_lay.addWidget(_m_copy)
         m_test_lay.addWidget(self.btn_test_mistral)
         m_test_lay.addWidget(_m_save)
@@ -874,10 +881,9 @@ class Settings(QDialog):
         self.lbl_status_google.setWordWrap(True)
         self.lbl_status_google.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.lbl_status_google.setStyleSheet("color: #64748b; font-size: 11px;")
-        _g_show, _g_copy, _g_save = self._make_key_tool_buttons(
+        _g_copy, _g_save = self._make_key_tool_buttons(
             self.keys_frame, self.google_key_input, self.lbl_status_google,
             lambda: self._save_single_key("google_api_key", self.google_key_input, self.lbl_status_google))
-        g_test_lay.addWidget(_g_show)
         g_test_lay.addWidget(_g_copy)
         g_test_lay.addWidget(self.btn_test_google)
         g_test_lay.addWidget(_g_save)
@@ -970,6 +976,14 @@ class Settings(QDialog):
             self._update_mistral_card_ui(m_name)
         self._update_google_card_ui()
 
+    def _sync_managed_checkbox(self):
+        """Keep the 'Fast cloud transcription' checkbox mirroring the actual
+        backend - e.g. it unchecks itself when the user activates a local model."""
+        if hasattr(self, "chk_managed"):
+            self.chk_managed.blockSignals(True)
+            self.chk_managed.setChecked(self.cfg_working.get("backend") == "managed")
+            self.chk_managed.blockSignals(False)
+
     def _use_mistral(self, name):
         if not self.app:
             return
@@ -984,6 +998,7 @@ class Settings(QDialog):
                 return
             self.cfg_working["backend"] = "mistral"
             self.cfg_working["mistral_stt_model"] = name
+        self._sync_managed_checkbox()
         self._refresh_cloud_cards()
 
     def _apply_cloud_card_state(self, card, provider, byo_selected, is_verified):
@@ -1128,6 +1143,7 @@ class Settings(QDialog):
                 self._cloud_card_needs_key("Google Gemini")
                 return
             self.cfg_working["backend"] = "google"
+        self._sync_managed_checkbox()
         self._refresh_cloud_cards()
 
     def _update_google_card_ui(self):
@@ -1147,10 +1163,20 @@ class Settings(QDialog):
             label.setText(text)
             label.setStyleSheet(f"color: {color}; font-size: 11px;")
 
-    def _toggle_key_echo(self, line_edit, btn, checked):
+    def _add_eye_toggle(self, line_edit):
+        """An eye button INSIDE the field (trailing edge) that reveals/hides the
+        key - open eye while hidden ("click to see"), slashed once revealed."""
+        from ui.icons import eye_icon
         from PySide6.QtWidgets import QLineEdit as _QLE
-        line_edit.setEchoMode(_QLE.Normal if checked else _QLE.Password)
-        btn.setText("Hide" if checked else "Show")
+        act = line_edit.addAction(eye_icon(True), _QLE.TrailingPosition)
+        act.setToolTip("Show or hide the key")
+
+        def _toggle():
+            hidden = line_edit.echoMode() == _QLE.Password
+            line_edit.setEchoMode(_QLE.Normal if hidden else _QLE.Password)
+            act.setIcon(eye_icon(not hidden))
+        act.triggered.connect(_toggle)
+        return act
 
     def _copy_key(self, line_edit, status_label=None):
         from PySide6.QtWidgets import QApplication
@@ -1192,13 +1218,8 @@ class Settings(QDialog):
         self._set_key_status(getattr(self, "_cloud_key_status", None), "Saved", "#16a34a")
 
     def _make_key_tool_buttons(self, parent, line_edit, status_label, on_save):
-        """Return (show, copy, save) buttons wired to a key field."""
-        show = QPushButton("Show", parent)
-        show.setObjectName("secondaryButton")
-        show.setStyleSheet("padding: 4px 10px; font-size: 11px;")
-        show.setCheckable(True)
-        show.setToolTip("Show or hide the key")
-        show.toggled.connect(lambda checked, le=line_edit, b=show: self._toggle_key_echo(le, b, checked))
+        """Wire a key field: eye toggle inside the field + (copy, save) buttons."""
+        self._add_eye_toggle(line_edit)
         copy = QPushButton("Copy", parent)
         copy.setObjectName("secondaryButton")
         copy.setStyleSheet("padding: 4px 10px; font-size: 11px;")
@@ -1209,7 +1230,7 @@ class Settings(QDialog):
         save.setStyleSheet("padding: 4px 12px; font-size: 11px;")
         save.setToolTip("Save this key")
         save.clicked.connect(lambda _=False: on_save())
-        return show, copy, save
+        return copy, save
 
     def _test_action_cloud_key(self):
         """Validate the AI Actions cloud key for the selected provider."""
@@ -1557,7 +1578,14 @@ class Settings(QDialog):
         self.rb_smart = self.card_smart.radio
         self._smart_pro_badge = getattr(self.card_smart, "pro_badge", None)
         if self._smart_pro_badge is not None:
-            self._smart_pro_badge.setVisible(not self._is_pro())
+            self._smart_pro_badge.setVisible(True)
+        # Guest nudge: signing up is what grants the 5 free Smart Action trials.
+        self._smart_guest_hint = QLabel(
+            "Sign up free to get 5 Smart Action trials.", self.card_smart)
+        self._smart_guest_hint.setStyleSheet(
+            "color: #7c3aed; font-size: 12px; font-weight: 600; background: transparent;")
+        self._smart_guest_hint.setVisible(False)
+        self.card_smart.text_col.addWidget(self._smart_guest_hint)
         self.rb_smart.setToolTip(
             "When enabled, your dictation is run through a language model "
             "that detects whether you want a translation, email, todo "
@@ -1672,13 +1700,12 @@ class Settings(QDialog):
         self._cloud_key_status.setWordWrap(True)
         self._cloud_key_status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._cloud_key_status.setStyleSheet("color: #64748b; font-size: 11px;")
-        _c_show, _c_copy, _c_save = self._make_key_tool_buttons(
+        _c_copy, _c_save = self._make_key_tool_buttons(
             self.card_cloud, self.cloud_api_key, self._cloud_key_status, self._save_cloud_key)
         self.btn_test_cloud_key = QPushButton("Test", self.card_cloud)
         self.btn_test_cloud_key.setObjectName("secondaryButton")
         self.btn_test_cloud_key.setStyleSheet("padding: 4px 10px; font-size: 11px;")
         self.btn_test_cloud_key.clicked.connect(self._test_action_cloud_key)
-        ck_row.addWidget(_c_show)
         ck_row.addWidget(_c_copy)
         ck_row.addWidget(self.btn_test_cloud_key)
         ck_row.addWidget(_c_save)
@@ -1917,7 +1944,24 @@ class Settings(QDialog):
         outer.addStretch(1)
         card.radio = radio
         card.pro_badge = pro_badge
+        card.text_col = text_col
         return card
+
+    # Badges inside the mode cards get an explicit stylesheet: the cards have
+    # their own stylesheet (selected/unselected backgrounds), and in Qt the
+    # closest stylesheet wins - which washed out the app-level #proBadge rule
+    # (white text on the card background). Inline CSS makes them deterministic.
+    _PRO_BADGE_CSS = (
+        "QLabel { background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+        " stop:0 rgba(168, 85, 247, 235), stop:1 rgba(126, 34, 206, 235));"
+        " color: #ffffff; border: 1px solid rgba(255, 255, 255, 150);"
+        " border-radius: 9px; font-size: 11px; font-weight: bold; padding: 2px 10px; }"
+    )
+    _FREE_BADGE_CSS = (
+        "QLabel { background-color: rgba(34, 197, 94, 45); color: #15803d;"
+        " border: 1px solid rgba(34, 197, 94, 120);"
+        " border-radius: 9px; font-size: 11px; font-weight: bold; padding: 2px 10px; }"
+    )
 
     @staticmethod
     def _mode_card_style(selected):
@@ -3193,14 +3237,34 @@ class Settings(QDialog):
         # Smart Actions: Pro = unlimited (no badge); non-Pro shows a "N/5 FREE"
         # counter, and once exhausted the option locks (PRO badge + disabled).
         if getattr(self, "_smart_pro_badge", None) is not None:
-            auth = getattr(self.app, "auth", None) if self.app else None
+            guest_hint = getattr(self, "_smart_guest_hint", None)
+            if guest_hint is not None:
+                guest_hint.setVisible(False)
+
+            def _lock_smart_radio():
+                if hasattr(self, "rb_smart"):
+                    self.rb_smart.setEnabled(False)
+                    if self.rb_smart.isChecked():
+                        self.rb_smart.blockSignals(True)
+                        self.rb_transcribe.setChecked(True)
+                        self.rb_smart.setChecked(False)
+                        self.rb_smart.blockSignals(False)
+                        self.cfg_working["output_action"] = actions.ACTION_TRANSCRIBE_ONLY
+
             if is_pro:
                 # Pro keeps the PRO tag visible (so the premium feature stays
                 # recognizable) but the control is unlimited + enabled.
                 self._smart_pro_badge.setText("PRO")
-                self._smart_pro_badge.setObjectName("proBadge")
+                self._smart_pro_badge.setStyleSheet(self._PRO_BADGE_CSS)
                 if hasattr(self, "rb_smart"):
                     self.rb_smart.setEnabled(True)
+            elif t == entitlements.TIER_GUEST:
+                # Guests: locked behind sign-up - signing up grants the 5 trials.
+                self._smart_pro_badge.setText("PRO")
+                self._smart_pro_badge.setStyleSheet(self._PRO_BADGE_CSS)
+                if guest_hint is not None:
+                    guest_hint.setVisible(True)
+                _lock_smart_radio()
             else:
                 try:
                     rem = entitlements.smart_actions_remaining(auth, self.app.cfg if self.app else None)
@@ -3208,24 +3272,15 @@ class Settings(QDialog):
                     rem = entitlements.FREE_SMART_ACTION_TRIES
                 if rem > 0:
                     self._smart_pro_badge.setText(f"{rem}/5 FREE")
-                    self._smart_pro_badge.setObjectName("freeBadge")
+                    self._smart_pro_badge.setStyleSheet(self._FREE_BADGE_CSS)
                     if hasattr(self, "rb_smart"):
                         self.rb_smart.setEnabled(True)
                 else:
                     # Exhausted: show the count is spent AND that it's now Pro-only.
                     self._smart_pro_badge.setText("0/5 · PRO")
-                    self._smart_pro_badge.setObjectName("proBadge")
-                    if hasattr(self, "rb_smart"):
-                        self.rb_smart.setEnabled(False)
-                        if self.rb_smart.isChecked():
-                            self.rb_smart.blockSignals(True)
-                            self.rb_transcribe.setChecked(True)
-                            self.rb_smart.setChecked(False)
-                            self.rb_smart.blockSignals(False)
-                            self.cfg_working["output_action"] = actions.ACTION_TRANSCRIBE_ONLY
+                    self._smart_pro_badge.setStyleSheet(self._PRO_BADGE_CSS)
+                    _lock_smart_radio()
             self._smart_pro_badge.setVisible(True)
-            self._smart_pro_badge.style().unpolish(self._smart_pro_badge)
-            self._smart_pro_badge.style().polish(self._smart_pro_badge)
 
         # Meeting controls: locked but readable for non-Pro (clicking prompts upgrade).
         if hasattr(self, "btn_launch_meeting"):
@@ -3396,6 +3451,9 @@ class Settings(QDialog):
             if self.app:
                 self.cfg_working["backend"] = "local"
                 self.cfg_working["whisper_model"] = name
+            # Activating a local model means cloud is no longer the backend, so
+            # the "Fast cloud transcription" checkbox must uncheck itself.
+            self._sync_managed_checkbox()
             for m_name in list(self.whisper_cards.keys()):
                 self._update_whisper_card_ui(m_name)
             if hasattr(self, "mistral_cards"):

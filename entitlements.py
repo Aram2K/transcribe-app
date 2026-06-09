@@ -182,9 +182,13 @@ def smart_actions_remaining(auth=None, cfg=None):
 
 
 def can_use_smart_action(auth, cfg=None):
-    """Pro = unlimited; everyone else gets FREE_SMART_ACTION_TRIES total (per user)."""
+    """Pro = unlimited. Signed-in free users get FREE_SMART_ACTION_TRIES (per
+    user). Guests must sign up first - creating an account is what grants the
+    5 free trials (so the trial is always tied to a user, never a device)."""
     if has_pro_access(auth, cfg):
         return True
+    if tier(auth, cfg) == TIER_GUEST:
+        return False
     return smart_actions_used(auth) < FREE_SMART_ACTION_TRIES
 
 
