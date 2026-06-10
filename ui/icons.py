@@ -87,9 +87,9 @@ def _draw_speaker(p, rect, color=_SLATE):
         p.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), -50 * 16, 100 * 16)
 
 
-def pro_pill_icon(width=36, height=18):
-    """Small purple 'PRO' pill used to mark Pro-only choices in dropdowns."""
-    key = ("propill", width, height)
+def _text_pill_icon(text, bg, fg="#ffffff", width=36, height=18):
+    """Small colored pill with short uppercase text, for marking dropdown items."""
+    key = ("pill", text, bg, width, height)
     if key in _ICON_CACHE:
         return _ICON_CACHE[key]
     # Paint at 2x for crispness; QIcon scales down.
@@ -98,18 +98,28 @@ def pro_pill_icon(width=36, height=18):
     pm.fill(Qt.transparent)
     p = _painter(pm)
     p.setPen(Qt.NoPen)
-    p.setBrush(QColor(168, 85, 247))
+    p.setBrush(QColor(bg))
     p.drawRoundedRect(QRectF(0, 0, W, H), H / 2, H / 2)
     f = p.font()
     f.setBold(True)
-    f.setPixelSize(int(H * 0.58))
+    f.setPixelSize(int(H * 0.50))
     p.setFont(f)
-    p.setPen(QColor("#ffffff"))
-    p.drawText(QRectF(0, 0, W, H), Qt.AlignCenter, "PRO")
+    p.setPen(QColor(fg))
+    p.drawText(QRectF(0, 0, W, H), Qt.AlignCenter, text)
     p.end()
     icon = QIcon(pm)
     _ICON_CACHE[key] = icon
     return icon
+
+
+def pro_pill_icon(width=36, height=18):
+    """Purple 'PRO' pill - marks Pro-only choices."""
+    return _text_pill_icon("PRO", "#a855f7", width=width, height=height)
+
+
+def local_pill_icon(width=42, height=18):
+    """Green 'LOCAL' pill - marks fully on-device choices (privacy-friendly)."""
+    return _text_pill_icon("LOCAL", "#16a34a", width=width, height=height)
 
 
 def eye_icon(open_=True, size=22, color=_SLATE):

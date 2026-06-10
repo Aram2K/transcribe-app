@@ -301,16 +301,9 @@ class Settings(QDialog):
             self.combo_engine.setCurrentIndex(idx)
             self.combo_engine.blockSignals(False)
             
-        # 6. Local Model
-        model = self.cfg_working.get("action_model", local_llm.QWEN_TINY_ID)
-        if model not in local_llm.MODEL_CATALOG:
-            model = local_llm.QWEN_TINY_ID
-        idx = self.combo_local_model.findData(model)
-        if idx >= 0:
-            self.combo_local_model.blockSignals(True)
-            self.combo_local_model.setCurrentIndex(idx)
-            self.combo_local_model.blockSignals(False)
-            
+        # 6. Local model cards reflect the active model on their own
+        # (no selector dropdown - "Use Model" on a card is the selector).
+
         # 7. Stack layout based on engine (+ Pro-only availability of managed)
         self._set_backend_layout(provider)
         self._refresh_engine_availability()
@@ -520,7 +513,8 @@ class Settings(QDialog):
         self.btn_launch_meeting.clicked.connect(self._launch_smart_meeting)
         dev_lay.addWidget(self.btn_launch_meeting)
 
-        self._apply_pro_glow(dev_frame)
+        self._meeting_card = dev_frame
+        self._set_pro_glow(dev_frame, not self._is_pro())
         layout.addWidget(dev_frame)
 
         # Fast cloud transcription (Pro) backend - off by default.
@@ -546,11 +540,27 @@ class Settings(QDialog):
         cloud_desc.setObjectName("subtitleLabel")
         cloud_desc.setWordWrap(True)
         cf_lay.addWidget(cloud_desc)
-        self._apply_pro_glow(cloud_frame)
+        self._cloud_card = cloud_frame
+        self._set_pro_glow(cloud_frame, not self._is_pro())
         layout.addWidget(cloud_frame)
 
         layout.addStretch()
         return tab
+
+    def _set_pro_glow(self, frame, on):
+        """Glow marks features the user does NOT have yet. Pro users keep the
+        PRO pill but lose the purple halo/border (it would be noise)."""
+        if frame is None:
+            return
+        if on:
+            self._apply_pro_glow(frame)
+        else:
+            # Keep text children transparent (they paint opaque boxes on the
+            # frosted card otherwise) - just drop the purple border + halo.
+            frame.setStyleSheet(
+                "QFrame#cardFrame QLabel, QFrame#cardFrame QCheckBox,"
+                "QFrame#cardFrame QRadioButton { background: transparent; }")
+            frame.setGraphicsEffect(None)
 
     def _apply_pro_glow(self, frame):
         """Soft fading purple halo + light purple border so Pro features read as
@@ -1672,7 +1682,7 @@ class Settings(QDialog):
         self.combo_engine.currentIndexChanged.connect(self._on_engine_changed)
         self._configure_dropdown(self.combo_engine, min_width=320)
         from PySide6.QtCore import QSize
-        self.combo_engine.setIconSize(QSize(36, 18))  # room for the PRO pill
+        self.combo_engine.setIconSize(QSize(42, 18))  # room for the PRO/LOCAL pills
         self._refresh_engine_availability()
         engine_lay.addWidget(self.combo_engine)
         engine_section_lay.addWidget(engine_frame)
@@ -1744,36 +1754,14 @@ class Settings(QDialog):
 
         self.engine_stack.addWidget(self.card_cloud)
 
-        # Card 2: Local LLM Configuration (GGUFs)
+        # Card 2: Local LLM Configuration (GGUFs). No separate selector dropdown -
+        # the model cards below ARE the selector ("Use Model" activates one).
         self.card_local_llm = QWidget()
         lay_llm = QVBoxLayout(self.card_local_llm)
         lay_llm.setContentsMargins(0, 0, 0, 0)
-        
-        # Local LLM selection combo
-        llm_pick_frame = QFrame(self.card_local_llm)
-        llm_pick_frame.setObjectName("cardFrame")
-        llm_p_lay = QVBoxLayout(llm_pick_frame)
-        llm_p_lay.addWidget(QLabel("Select Local AI Model", llm_pick_frame))
-        
-        self.combo_local_model = QComboBox(llm_pick_frame)
-        for val, info in local_llm.MODEL_CATALOG.items():
-            self.combo_local_model.addItem(info["label"], val)
-            
-        if self.app:
-            model = self.app.cfg.get("action_model", local_llm.QWEN_TINY_ID)
-            # Default fallback if cloud was active previously
-            if model not in local_llm.MODEL_CATALOG:
-                model = local_llm.QWEN_TINY_ID
-            idx = self.combo_local_model.findData(model)
-            if idx >= 0:
-                self.combo_local_model.setCurrentIndex(idx)
-        self.combo_local_model.currentIndexChanged.connect(self._on_local_llm_model_changed)
-        self._configure_dropdown(self.combo_local_model, show_all_items=True)
-        llm_p_lay.addWidget(self.combo_local_model)
-        lay_llm.addWidget(llm_pick_frame)
 
         # GGUF model cards - scroll with the whole tab (no nested mini-scroll)
-        llm_cards_label = QLabel("Local model downloads", self.card_local_llm)
+        llm_cards_label = QLabel("Local AI models - download once, then Use Model to activate", self.card_local_llm)
         llm_cards_label.setObjectName("subtitleLabel")
         llm_cards_label.setStyleSheet("font-weight: 600; color: #475569; margin-top: 4px;")
         lay_llm.addWidget(llm_cards_label)
@@ -1786,14 +1774,22 @@ class Settings(QDialog):
 
         self.engine_stack.addWidget(self.card_local_llm)
 
-        # Card 3: Managed Pro cloud (no configuration, no key)
-        self.card_managed = QFrame()
+        # Card 3: Managed Pro cloud (no configuration, no key). The stack sizes
+        # itself to its TALLEST page (the cloud key form), so the card is hosted
+        # in a top-aligned container - the card itself stays compact instead of
+        # stretching into a huge empty purple box.
+        managed_page = QWidget()
+        managed_page_lay = QVBoxLayout(managed_page)
+        managed_page_lay.setContentsMargins(0, 0, 0, 0)
+        self.card_managed = QFrame(managed_page)
         self.card_managed.setObjectName("cardFrame")
+        self.card_managed.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         lay_managed = QVBoxLayout(self.card_managed)
-        lay_managed.setContentsMargins(14, 14, 14, 14)
+        lay_managed.setContentsMargins(16, 14, 16, 14)
         lay_managed.setSpacing(6)
         _mtitle = QLabel("Managed by Transcribe Pro", self.card_managed)
-        _mtitle.setStyleSheet("font-weight: 700; color: #6d28d9;")
+        _mtitle.setStyleSheet("font-weight: 700; font-size: 16px; color: #6d28d9;")
         lay_managed.addWidget(_mtitle)
         _mbody = QLabel(
             "Your Smart Actions run on our servers with a high-quality model - "
@@ -1801,11 +1797,12 @@ class Settings(QDialog):
             self.card_managed,
         )
         _mbody.setWordWrap(True)
-        _mbody.setStyleSheet("color: #475569;")
+        _mbody.setStyleSheet("color: #475569; font-size: 14px;")
         lay_managed.addWidget(_mbody)
-        lay_managed.addStretch(1)
         self._apply_pro_glow(self.card_managed)
-        self.engine_stack.addWidget(self.card_managed)
+        managed_page_lay.addWidget(self.card_managed, 0, Qt.AlignTop)
+        managed_page_lay.addStretch(1)
+        self.engine_stack.addWidget(managed_page)
 
         engine_section_lay.addWidget(self.engine_stack)
         layout.addWidget(self.engine_section)
@@ -2124,11 +2121,17 @@ class Settings(QDialog):
     def _refresh_engine_availability(self):
         """The managed cloud engine is Pro-only: for free/guest users the option
         is grayed out with a small PRO pill, and any stale managed selection is
-        switched back to the rule-based engine."""
+        switched back to the rule-based engine. Fully on-device engines always
+        carry a green LOCAL pill."""
         if not hasattr(self, "combo_engine"):
             return
         from PySide6.QtGui import QIcon
-        from ui.icons import pro_pill_icon
+        from ui.icons import pro_pill_icon, local_pill_icon
+        # LOCAL tags on the on-device engines (privacy-friendly choices).
+        for local_id in ("local_llm", actions.RULE_BASED_ID):
+            lidx = self.combo_engine.findData(local_id)
+            if lidx >= 0:
+                self.combo_engine.setItemIcon(lidx, local_pill_icon())
         pro = self._is_pro()
         idx = self.combo_engine.findData(actions.API_MANAGED_ID)
         if idx < 0:
@@ -2154,10 +2157,6 @@ class Settings(QDialog):
         self._set_backend_layout(provider)
         self._save_action_configs()
 
-    def _on_local_llm_model_changed(self, idx):
-        model_id = self.combo_local_model.itemData(idx)
-        if self.app:
-            self.cfg_working["action_model"] = model_id
 
     def _set_backend_layout(self, provider):
         if provider == actions.RULE_BASED_ID:
@@ -2176,7 +2175,9 @@ class Settings(QDialog):
             
             self.cloud_api_model.clear()
             
-            gemini_models = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-1.5-flash"]
+            # gemini-1.5-flash was removed by Google (404 on v1beta) - verified
+            # against the live API; keep this list to models that actually work.
+            gemini_models = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3.5-flash", "gemini-3.1-flash-lite"]
             anthropic_models = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest", "claude-3-5-opus-latest", "claude-3-haiku-20240307", "claude-3-opus-20240229"]
             openai_models = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"]
             
@@ -2186,10 +2187,9 @@ class Settings(QDialog):
                 models_info = [
                     ("gemini-2.5-flash (~$0.075 / 1M tokens)", "gemini-2.5-flash"),
                     ("gemini-2.5-flash-lite (~$0.0375 / 1M tokens)", "gemini-2.5-flash-lite"),
-                    ("gemini-2.5-pro (~$1.25 / 1M tokens)", "gemini-2.5-pro"),
+                    ("gemini-2.5-pro (~$1.25 / 1M tokens, needs paid tier)", "gemini-2.5-pro"),
                     ("gemini-3.5-flash (~$0.075 / 1M tokens)", "gemini-3.5-flash"),
                     ("gemini-3.1-flash-lite (~$0.0375 / 1M tokens)", "gemini-3.1-flash-lite"),
-                    ("gemini-1.5-flash (~$0.075 / 1M tokens)", "gemini-1.5-flash"),
                 ]
                 for label, model_id in models_info:
                     self.cloud_api_model.addItem(label, model_id)
@@ -2198,6 +2198,8 @@ class Settings(QDialog):
                 
                 saved_model = self.cfg_working.get("action_api_model", "") or "gemini-2.5-flash"
                 if saved_model in set(anthropic_models + openai_models):
+                    saved_model = "gemini-2.5-flash"
+                if saved_model == "gemini-1.5-flash":  # removed by Google (404)
                     saved_model = "gemini-2.5-flash"
                 
                 idx = self.cloud_api_model.findData(saved_model)
@@ -2450,7 +2452,12 @@ class Settings(QDialog):
         provider = self.combo_engine.currentData()
 
         if provider == "local_llm":
-            self.cfg_working["action_model"] = self.combo_local_model.currentData()
+            # The active local model is whatever card the user pressed "Use
+            # Model" on; keep it if valid, else fall back to the default.
+            import local_llm
+            current = self.cfg_working.get("action_model")
+            if current not in local_llm.MODEL_CATALOG:
+                self.cfg_working["action_model"] = local_llm.QWEN_TINY_ID
         elif provider == actions.RULE_BASED_ID:
             self.cfg_working["action_model"] = actions.RULE_BASED_ID
         elif provider == actions.API_MANAGED_ID:
@@ -3428,6 +3435,9 @@ class Settings(QDialog):
             # Keep the PRO tag visible for Pro users too, so the premium feature
             # stays recognizable (only the gating/enablement changes with tier).
             self._meeting_pro_badge.setVisible(True)
+        # The purple glow marks locked Pro features; Pro users keep only the pill.
+        for _f in (getattr(self, "_meeting_card", None), getattr(self, "_cloud_card", None)):
+            self._set_pro_glow(_f, not is_pro)
 
         # Privacy Mode (can be toggled from the tray) deactivates cloud options
         # with a clear reason so users know why they're disabled.
@@ -3631,14 +3641,9 @@ class Settings(QDialog):
 
     def _download_llm(self, name):
         if self._local_llm_states.get(name) == "downloaded":
+            # "Use Model": the card click IS the model selection.
             if self.app:
                 self.cfg_working["action_model"] = name
-            if hasattr(self, "combo_local_model"):
-                idx = self.combo_local_model.findData(name)
-                if idx >= 0:
-                    self.combo_local_model.blockSignals(True)
-                    self.combo_local_model.setCurrentIndex(idx)
-                    self.combo_local_model.blockSignals(False)
             for m_name in list(self.llm_cards.keys()):
                 self._update_llm_card_ui(m_name)
             return
@@ -3763,10 +3768,6 @@ class Settings(QDialog):
             if state == "downloaded":
                 if self.app:
                     self.cfg_working["action_model"] = name
-                # Select it in combo
-                idx = self.combo_local_model.findData(name)
-                if idx >= 0:
-                    self.combo_local_model.setCurrentIndex(idx)
                 QMessageBox.information(self, "Download Complete", f"{local_llm.MODEL_CATALOG[name]['label']} is ready for action modes!")
         else:
             self._model_states[model_name] = state
