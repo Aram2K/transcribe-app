@@ -2139,10 +2139,10 @@ class Settings(QDialog):
         card.btn_action.style().polish(card.btn_action)
 
     def _refresh_engine_availability(self):
-        """The managed cloud engine is Pro-only: it always shows a PRO pill
-        (right-aligned via _PillItemDelegate) and is grayed out for free/guest
-        users, with any stale managed selection switched back to rule-based.
-        Fully on-device engines always carry a green LOCAL pill."""
+        """Pills on the engine dropdown: PRO (purple, right-aligned) on the
+        managed cloud row - always active so a free user can tap it and get the
+        paywall (see _on_engine_changed) - and LOCAL (green) on the on-device
+        engines. A stale managed selection for a non-Pro user heals silently."""
         if not hasattr(self, "combo_engine"):
             return
         model = self.combo_engine.model()
@@ -2157,7 +2157,7 @@ class Settings(QDialog):
             return
         item = model.item(idx)
         if item is not None:
-            item.setEnabled(pro)
+            item.setEnabled(True)  # selectable for everyone; gating is the paywall
             item.setData("pro", _PillItemDelegate.PILL_ROLE)
         if not pro and self.combo_engine.currentData() == actions.API_MANAGED_ID:
             self.combo_engine.blockSignals(True)
@@ -2173,6 +2173,22 @@ class Settings(QDialog):
 
     def _on_engine_changed(self, idx):
         provider = self.combo_engine.itemData(idx)
+        # Managed engine is Pro-only: a free/guest user choosing it gets the
+        # paywall, and the selection reverts to their previous engine.
+        if provider == actions.API_MANAGED_ID and not self._is_pro():
+            prev = self.cfg_working.get("action_model", actions.RULE_BASED_ID)
+            if prev in local_llm.MODEL_CATALOG:
+                prev = "local_llm"
+            ridx = self.combo_engine.findData(prev)
+            if ridx < 0 or prev == actions.API_MANAGED_ID:
+                ridx = self.combo_engine.findData(actions.RULE_BASED_ID)
+            self.combo_engine.blockSignals(True)
+            self.combo_engine.setCurrentIndex(max(0, ridx))
+            self.combo_engine.blockSignals(False)
+            self._set_backend_layout(self.combo_engine.currentData())
+            if self.app and hasattr(self.app, "_pro_upsell"):
+                self.app._pro_upsell("Managed Smart Actions")
+            return
         self._set_backend_layout(provider)
         self._save_action_configs()
 
