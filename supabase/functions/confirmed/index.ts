@@ -27,10 +27,15 @@ const HTML = `<!doctype html>
 </body>
 </html>`;
 
+// no-store: an early version of this function served text/plain, and browsers
+// (notably iOS Safari / Gmail's viewer) kept showing the cached raw-source page
+// even after the fix. inline: never let a browser treat the page as a download.
 Deno.serve(() =>
   new Response(HTML, {
     headers: {
       "Content-Type": "text/html; charset=utf-8",
+      "Content-Disposition": "inline",
+      "Cache-Control": "no-store, must-revalidate",
       "X-Content-Type-Options": "nosniff",
     },
   })
