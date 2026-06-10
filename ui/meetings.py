@@ -20,6 +20,37 @@ import telemetry
 class MeetingProcessingSignal(QObject):
     finished = Signal(str, str) # notes, error_msg
 
+
+def ensure_recording_consent(parent, app):
+    """One-time notice before the first meeting recording: capturing other
+    people's voices may require their consent depending on jurisdiction. The
+    user must acknowledge once; we persist the acknowledgement. Returns True
+    when recording may proceed."""
+    cfg = getattr(app, "cfg", None)
+    if cfg is None or cfg.get("meeting_consent_ack"):
+        return True
+    box = QMessageBox(parent)
+    box.setWindowTitle("Before you record")
+    box.setIcon(QMessageBox.Information)
+    box.setText("You're about to record a meeting - including other people's voices.")
+    box.setInformativeText(
+        "Depending on your country or state, recording a conversation may "
+        "require the consent of all participants. By continuing you confirm "
+        "you have any consent required where you are.\n\n"
+        "This notice is shown only once."
+    )
+    ok = box.addButton("I understand - continue", QMessageBox.AcceptRole)
+    box.addButton("Cancel", QMessageBox.RejectRole)
+    box.exec()
+    if box.clickedButton() is ok:
+        cfg["meeting_consent_ack"] = True
+        try:
+            app.save_config()
+        except Exception:
+            pass
+        return True
+    return False
+
 class MeetingsWindow(QDialog):
     STATE_IDLE = "idle"
     STATE_RECORDING = "recording"
@@ -293,17 +324,37 @@ class MeetingsWindow(QDialog):
 
     # ── Audio Device Scan ──
     def _populate_audio_devices(self):
+        from ui.icons import meeting_mode_icon
+        # Only offer system-audio capture where loopback genuinely exists
+        # (Windows/WASAPI). Elsewhere - notably macOS - those modes would
+        # silently record the mic anyway, so they're hidden.
+        try:
+            import main as _m
+            has_loopback = bool(getattr(_m, "HAS_LOOPBACK", False))
+        except Exception:
+            has_loopback = False
         self.combo_device.clear()
-        self.combo_device.addItem("🔊 + 🎙️ Smart Meeting Mode (Record BOTH Computer Sound + My Microphone)", "smart_meeting")
-        self.combo_device.addItem("🎙️ Standard Mode (Record My Microphone Only)", "default_mic")
-        
-        # Get from active config
-        current_dev = "smart_meeting"
+        if has_loopback:
+            self.combo_device.addItem(
+                meeting_mode_icon("smart_meeting"),
+                "System sound + Microphone (best for meetings)", "smart_meeting")
+        self.combo_device.addItem(
+            meeting_mode_icon("default_mic"),
+            "Microphone only", "default_mic")
+        if has_loopback:
+            self.combo_device.addItem(
+                meeting_mode_icon("system_only"),
+                "System sound only (no microphone)", "system_only")
+
+        # Get from active config (heal modes this system can't capture)
+        valid = ("smart_meeting", "default_mic", "system_only") if has_loopback else ("default_mic",)
+        default_mode = "smart_meeting" if has_loopback else "default_mic"
+        current_dev = default_mode
         if self.app:
-            current_dev = self.app.cfg.get("meeting_audio_mode", "smart_meeting")
-            if current_dev not in ("smart_meeting", "default_mic"):
-                current_dev = "smart_meeting"
-                
+            current_dev = self.app.cfg.get("meeting_audio_mode", default_mode)
+            if current_dev not in valid:
+                current_dev = default_mode
+
         idx = self.combo_device.findData(str(current_dev))
         if idx >= 0:
             self.combo_device.setCurrentIndex(idx)
@@ -315,9 +366,14 @@ class MeetingsWindow(QDialog):
         if not self.app or not self.app.recorder:
             return
 
+        # One-time legal notice: recording other participants may require their
+        # consent. Must be acknowledged before the first recording ever starts.
+        if not ensure_recording_consent(self, self.app):
+            return
+
         # A plain Alt-R dictation shares this same AudioRecorder + audio device.
         # If one is running, stop it first (and tell the user) so the two don't
-        # fight over the device — which crashes — or leak dictation audio into
+        # fight over the device - which crashes - or leak dictation audio into
         # the meeting recording.
         dictation_was_running = False
         try:
@@ -348,7 +404,7 @@ class MeetingsWindow(QDialog):
             return
 
         # Save the recorder's existing (dictation/overlay) callbacks so they can
-        # be restored when the meeting ends — otherwise dictation's live level
+        # be restored when the meeting ends - otherwise dictation's live level
         # meter and partials stay broken after a meeting. While the meeting owns
         # the recorder, silence the overlay callbacks so the dictation overlay
         # never pops up mid-meeting.
@@ -370,7 +426,7 @@ class MeetingsWindow(QDialog):
         self.input_live_notes.clear()
         self._record_started_at = time.time()
 
-        # Start recording — guard against device-open failures (busy mic, no
+        # Start recording - guard against device-open failures (busy mic, no
         # loopback device, driver errors) so a failure never crashes the app or
         # leaves the window stuck in a fake "recording" state.
         try:
@@ -675,7 +731,7 @@ class MeetingsWindow(QDialog):
         if format_type == "email":
             clean_body = self._strip_markdown(summary)
             return (
-                f"Subject: {title} — Notes\n\n"
+                f"Subject: {title} - Notes\n\n"
                 "Hi,\n\n"
                 f"{clean_body}\n\n"
                 "Best,"
@@ -684,7 +740,7 @@ class MeetingsWindow(QDialog):
         if format_type == "slack":
             slack = re.sub(r"^#+\s+(.*)$", r"*\1*", summary, flags=re.MULTILINE)
             slack = slack.replace("**", "*")
-            return f"*{title} — Notes*\n\n{slack}"
+            return f"*{title} - Notes*\n\n{slack}"
             
         return summary
 

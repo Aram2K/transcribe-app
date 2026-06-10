@@ -17,6 +17,7 @@ RULE_BASED_ID = "rule_based"
 API_OPENAI_ID = "api_openai_compatible"
 API_GEMINI_ID = "api_gemini"
 API_ANTHROPIC_ID = "api_anthropic"
+API_MANAGED_ID = "managed"  # Pro: runs through the server (founder's Mistral key)
 
 ACTION_MODES = {
     ACTION_TRANSCRIBE_ONLY: {
@@ -38,6 +39,12 @@ ACTION_MODES = {
 }
 
 ACTION_MODELS = {
+    API_MANAGED_ID: {
+        "label": "Transcribe Pro (managed cloud)",
+        "description": "Pro: high-quality cloud AI with no API key or setup - we handle it.",
+        "available": True,
+        "kind": "managed",
+    },
     RULE_BASED_ID: {
         "label": "Rule-based formatter",
         "description": "Fast local formatting for email/todo. Simple rules, not an LLM.",
@@ -148,7 +155,7 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
     mode = normalize_action_mode(mode)
     model = normalize_action_model(model)
     if config and config.get("privacy_mode"):
-        if ACTION_MODELS.get(model, {}).get("kind") == "cloud":
+        if ACTION_MODELS.get(model, {}).get("kind") in ("cloud", "managed"):
             model = RULE_BASED_ID
     text = (text or "").strip()
     if not text:
@@ -160,8 +167,24 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
 
         kind = ACTION_MODELS[model].get("kind")
 
+        # Managed (Pro): run through the server's Mistral key - no BYO key. The
+        # auth token is injected into config by the caller (main._stop).
+        if kind == "managed":
+            token = (config or {}).get("_managed_token")
+            if not token:
+                # Not Pro / not signed in: degrade to rule-based rather than error.
+                routed = _run_smart_rule_based(text, source_lang, target_lang, config)
+                return routed if routed is not None else _clean_transcript(text)
+            try:
+                return action_api.run_managed_action(
+                    text, ACTION_SMART_AUTO, token,
+                    source_lang=source_lang, target_lang=target_lang,
+                )
+            except action_api.ActionAPIError as e:
+                raise ActionError(str(e)) from e
+
         # Cloud engine: let API errors surface clearly (missing key, bad key,
-        # network). We do NOT silently fall back to rule-based — the user
+        # network). We do NOT silently fall back to rule-based - the user
         # explicitly picked a cloud LLM, so a failure must be visible.
         if kind == "cloud":
             if not config:
@@ -201,7 +224,7 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
             except local_llm.LocalLLMError as e:
                 raise ActionError(str(e)) from e
 
-        # Rule-based engine was explicitly chosen — best-effort regex routing.
+        # Rule-based engine was explicitly chosen - best-effort regex routing.
         routed = _run_smart_rule_based(text, source_lang, target_lang, config)
         if routed is not None:
             return routed

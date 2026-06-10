@@ -177,7 +177,7 @@ class HistoryWindow(QDialog):
 
         # Telemetry must never be able to break the clear/refresh. (The previous
         # code referenced a non-existent ``self.app.version`` here, which raised
-        # AttributeError *after* clearing but *before* refreshing — so the list
+        # AttributeError *after* clearing but *before* refreshing - so the list
         # appeared to "not work" even though the data was already gone.)
         try:
             from main import APP_VERSION

@@ -6,7 +6,7 @@ import telemetry
 
 class TestTelemetry(unittest.TestCase):
     def test_privacy_mode_does_not_disable_analytics(self):
-        # Analytics is independent of Privacy Mode — the sanitizer already
+        # Analytics is independent of Privacy Mode - the sanitizer already
         # strips all sensitive props, so privacy-mode users can still
         # share usage events when they want to.
         config = {

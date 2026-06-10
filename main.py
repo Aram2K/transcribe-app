@@ -1,5 +1,6 @@
-# Transcribe App — PySide6 Entry Point and Logic Controller
+# Transcribe App - PySide6 Entry Point and Logic Controller
 
+import os
 import sys
 import threading
 import time
@@ -15,6 +16,7 @@ import logging
 import hashlib
 import datetime
 import shutil
+import base64
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -34,9 +36,23 @@ import actions
 import action_api
 import local_llm
 import telemetry
+import auth
+import entitlements
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.5.47"
+APP_VERSION = "1.5.48"
+
+# ── Managed cloud transcription (Pro moat) ────────────────────────────────────
+MANAGED_PROXY_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-proxy"
+FEEDBACK_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/submit-feedback"
+DELETE_ACCOUNT_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/delete-account"
+
+# ── Monetization links (Stripe) ───────────────────────────────────────────────
+PRO_MONTHLY_URL = "https://buy.stripe.com/3cI5kC30N1oeari7rh0Ba00"
+PRO_ANNUAL_URL  = "https://buy.stripe.com/fZuaEW0SF4Aq1UMh1R0Ba01"
+# Set this to your Stripe Customer Portal link (Billing → Customer portal) so Pro
+# users can self-manage their subscription. Left blank until configured.
+STRIPE_PORTAL_URL = ""
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
 RELEASES_API = "https://api.github.com/repos/Aram2K/transcribe-app/releases/latest"
@@ -68,6 +84,7 @@ DEFAULT = {
     "accent_color":  "#3b82f6",
     "backend":       "local",
     "google_api_key": "",
+    "mistral_api_key": "",
     "initial_prompt": "",
     "output_action": "transcribe_only",
     "action_model": "rule_based",
@@ -87,14 +104,60 @@ DEFAULT = {
     "analytics_consent_applied": False,
     "analytics_endpoint": "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-analytics",
     "onboarding_done": False,
+    "account_gate_seen": False,
+    "admin_tier_override": "auto",  # super-admin only: auto|guest|free|pro
     "dismissed_update_version": "",
     "pending_update_version": "",
     "pending_update_body": "",
     "previous_version": "",
     "tray_hint_shown": False,
+    "meeting_consent_ack": False,  # one-time recording-consent notice
+    "macos_perms_guide_shown": False,  # one-time macOS permission walkthrough
 }
 
 storage.migrate_legacy_file(LEGACY_CONFIG_PATH, CONFIG_PATH)
+
+# Mistral's /audio/transcriptions endpoint only accepts the Voxtral Mini
+# Transcribe model. "voxtral-small/large-latest" are NOT valid there (Small is a
+# chat model; there is no Large), which is why selecting them returned
+# "Invalid model". We normalize any stale/invalid choice to the working alias.
+# Defined above load_config() because load_config() calls it at import time.
+MISTRAL_STT_DEFAULT = "voxtral-mini-latest"
+MISTRAL_STT_MODELS = {"voxtral-mini-latest", "voxtral-mini-2602", "voxtral-mini-2507"}
+
+
+def normalize_mistral_model(model):
+    return model if model in MISTRAL_STT_MODELS else MISTRAL_STT_DEFAULT
+
+
+# BYO key fields that must never sit in plaintext config.json (they live in the
+# OS keyring; config keeps "" once migrated).
+_SECRET_CFG_KEYS = ("google_api_key", "action_api_key", "mistral_api_key")
+
+
+def _strip_user_secret_keys(store):
+    """Split cfg['user_secrets'] into (sanitized_store_for_disk, keys_blob).
+    The blob ({owner: {key_field: value}}) goes to the OS keyring; the on-disk
+    store keeps everything else (engine choices) with the key fields blanked."""
+    if not isinstance(store, dict):
+        return store, {}
+    sanitized, blob = {}, {}
+    for owner, snap in store.items():
+        if not isinstance(snap, dict):
+            sanitized[owner] = snap
+            continue
+        clean = dict(snap)
+        keys = {}
+        for k in _SECRET_CFG_KEYS:
+            v = clean.get(k)
+            if isinstance(v, str) and v.strip():
+                keys[k] = v
+            clean[k] = ""
+        sanitized[owner] = clean
+        if keys:
+            blob[owner] = keys
+    return sanitized, blob
+
 
 def load_config():
     data = storage.read_json(CONFIG_PATH, DEFAULT)
@@ -116,21 +179,17 @@ def load_config():
 
     if loaded.get("privacy_mode"):
         loaded["backend"] = "local"
-        loaded["save_history"] = False
+        # Privacy Mode only blocks the cloud; local history stays on the device
+        # under the user's own "Save local transcription history" setting.
         if actions.ACTION_MODELS.get(actions.normalize_action_model(loaded.get("action_model")), {}).get("kind") == "cloud":
             loaded["action_model"] = actions.RULE_BASED_ID
     loaded["action_model"] = actions.normalize_action_model(loaded.get("action_model"))
+    # Heal any stale/invalid Mistral STT choice (e.g. the removed voxtral-small).
+    if loaded.get("mistral_stt_model"):
+        loaded["mistral_stt_model"] = normalize_mistral_model(loaded["mistral_stt_model"])
 
-    # Users often pick a local/cloud action model in Settings but leave output
-    # mode on the default "transcribe_only", so dictation never runs actions.
-    if loaded.get("output_action") == actions.ACTION_TRANSCRIBE_ONLY:
-        model_kind = actions.ACTION_MODELS.get(loaded["action_model"], {}).get("kind")
-        if model_kind in ("local_llm", "cloud"):
-            loaded["output_action"] = actions.ACTION_SMART_AUTO
-            logger.info(
-                "Enabled Smart actions automatically (action model: %s)",
-                loaded["action_model"],
-            )
+    # Output mode stays on "transcribe_only" by default. Smart Actions are a
+    # Pro feature and must be turned on explicitly - we never auto-enable them.
 
     action_key = (loaded.get("action_api_key") or "").strip()
     if action_key:
@@ -143,6 +202,36 @@ def load_config():
                 logger.warning("Could not sanitize action API key in config: %s", e)
     else:
         loaded["action_api_key"] = storage.read_secret(storage.ACTION_API_KEY_SECRET)
+
+    mistral_key = (loaded.get("mistral_api_key") or "").strip()
+    if mistral_key:
+        # Migrate a plaintext Mistral key from config.json into the OS keyring.
+        if storage.write_secret(storage.MISTRAL_API_KEY_SECRET, mistral_key):
+            loaded["mistral_api_key"] = mistral_key
+            disk = {**loaded, "google_api_key": "", "action_api_key": "", "mistral_api_key": ""}
+            try:
+                storage.atomic_write_json(CONFIG_PATH, disk)
+            except OSError as e:
+                logger.warning("Could not sanitize Mistral API key in config: %s", e)
+    else:
+        loaded["mistral_api_key"] = storage.read_secret(storage.MISTRAL_API_KEY_SECRET)
+
+    # Per-user stashed keys (account switching) live in the keyring as one JSON
+    # blob; merge them back over the sanitized on-disk snapshots.
+    try:
+        blob_raw = storage.read_secret(storage.USER_SECRETS_SECRET)
+        if blob_raw:
+            blob = json.loads(blob_raw)
+            store = loaded.get("user_secrets")
+            if isinstance(blob, dict) and isinstance(store, dict):
+                for owner, keys in blob.items():
+                    snap = store.get(owner)
+                    if isinstance(snap, dict) and isinstance(keys, dict):
+                        for k, v in keys.items():
+                            if k in _SECRET_CFG_KEYS and v and not snap.get(k):
+                                snap[k] = v
+    except Exception:
+        logger.debug("Could not merge user secrets from keyring", exc_info=True)
 
     if ANALYTICS_CONSENT_PATH.exists() and not loaded.get("analytics_consent_applied"):
         if ANALYTICS_DECLINED_PATH.exists():
@@ -160,7 +249,7 @@ def save_config(c):
     disk = {**c}
     if disk.get("privacy_mode"):
         disk["backend"] = "local"
-        disk["save_history"] = False
+        # Local history is independent of Privacy Mode (it never leaves the device).
         if actions.ACTION_MODELS.get(actions.normalize_action_model(disk.get("action_model")), {}).get("kind") == "cloud":
             disk["action_model"] = actions.RULE_BASED_ID
     key = (disk.get("google_api_key") or "").strip()
@@ -169,6 +258,17 @@ def save_config(c):
     action_key = (disk.get("action_api_key") or "").strip()
     if storage.write_secret(storage.ACTION_API_KEY_SECRET, action_key):
         disk["action_api_key"] = ""
+    mistral_key = (disk.get("mistral_api_key") or "").strip()
+    if storage.write_secret(storage.MISTRAL_API_KEY_SECRET, mistral_key):
+        disk["mistral_api_key"] = ""
+    # Per-user stashed keys (account switching) go to the keyring too - the
+    # on-disk store keeps only the non-secret engine config per user.
+    sanitized_store, keys_blob = _strip_user_secret_keys(disk.get("user_secrets"))
+    try:
+        if storage.write_secret(storage.USER_SECRETS_SECRET, json.dumps(keys_blob)):
+            disk["user_secrets"] = sanitized_store
+    except Exception:
+        logger.debug("Could not stash user secrets in keyring", exc_info=True)
     storage.atomic_write_json(CONFIG_PATH, disk)
 
 cfg = load_config()
@@ -218,13 +318,17 @@ def start_ipc_server(server_sock, on_action):
 # ── System Info ───────────────────────────────────────────────────────────────
 RAM_GB = psutil.virtual_memory().total / (1024 ** 3)
 
+# speed_rank is a relative compute cost (1 = fastest). The UI turns it into a
+# plain-language estimate adjusted for the user's hardware (GPU vs CPU), instead
+# of a fixed "~Ns" that is meaningless across machines. min_ram is a realistic,
+# monotonic minimum-recommended system RAM for the int8 runtime.
 MODELS = {
-    "tiny":           {"min_ram": 2,  "speed": "~0.5s", "quality": "Good",        "size": "75 MB",   "armenian": None},
-    "base":           {"min_ram": 4,  "speed": "~1s",   "quality": "Better",      "size": "140 MB",  "armenian": None},
-    "small":          {"min_ram": 6,  "speed": "~3s",   "quality": "Great",       "size": "460 MB",  "armenian": None},
-    "medium":         {"min_ram": 10, "speed": "~8s",   "quality": "Excellent",   "size": "1.4 GB",  "armenian": None},
-    "large-v3-turbo": {"min_ram": 8,  "speed": "~5s",   "quality": "Best (fast)", "size": "1.6 GB",  "armenian": "Recommended for Armenian"},
-    "large-v3":       {"min_ram": 16, "speed": "~15s",  "quality": "Best",        "size": "3 GB",    "armenian": None},
+    "tiny":           {"min_ram": 2,  "speed_rank": 1, "quality": "Good",        "size": "75 MB",   "armenian": None},
+    "base":           {"min_ram": 2,  "speed_rank": 2, "quality": "Better",      "size": "140 MB",  "armenian": None},
+    "small":          {"min_ram": 4,  "speed_rank": 3, "quality": "Great",       "size": "460 MB",  "armenian": None},
+    "medium":         {"min_ram": 6,  "speed_rank": 5, "quality": "Excellent",   "size": "1.4 GB",  "armenian": None},
+    "large-v3-turbo": {"min_ram": 6,  "speed_rank": 4, "quality": "Best (fast)", "size": "1.6 GB",  "armenian": "Recommended for Armenian"},
+    "large-v3":       {"min_ram": 8,  "speed_rank": 6, "quality": "Best",        "size": "3 GB",    "armenian": None},
 }
 
 LANG_NAMES = {
@@ -238,6 +342,46 @@ LANG_NAMES = {
     "es":    "Spanish",
     "ar":    "Arabic",
 }
+
+# Languages Mistral Voxtral transcription accepts (ISO-639-1). Anything else -
+# including our "auto"/"multi" pseudo-codes - is omitted so we never send an
+# unsupported code, which Voxtral rejects with a 400 (this was the cause of cloud
+# transcription failing even when the API key tested fine).
+MISTRAL_LANGS = {"en", "es", "fr", "de", "it", "nl", "pt", "hi", "ar", "ru",
+                 "uk", "pl", "tr", "ja", "ko", "zh", "ro", "cs", "el"}
+
+
+def cloud_error_message(provider, status, body_text):
+    """Turn a cloud provider's HTTP error into one clear, user-facing sentence."""
+    msg = ""
+    try:
+        j = json.loads(body_text)
+        if isinstance(j, dict):
+            err = j.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message", "") or ""
+            elif isinstance(err, str):
+                msg = err
+            if not msg:
+                msg = j.get("message") or j.get("detail") or ""
+            if isinstance(msg, (dict, list)):
+                msg = str(msg)
+    except Exception:
+        msg = ""
+    msg = (msg or (body_text or "")).strip()
+    low = msg.lower()
+    if status in (401, 403) or "unauthorized" in low or "invalid api key" in low or "api key not valid" in low:
+        return f"{provider} API key is invalid or unauthorized. Check it in Settings."
+    if status == 402 or "insufficient" in low or "out of credit" in low or "no credit" in low or "billing" in low:
+        return f"Your {provider} account is out of credits. Add billing/credits to keep using it."
+    if status == 429 or "rate limit" in low or "quota" in low or "resource_exhausted" in low or "exhausted" in low:
+        return f"{provider} rate limit or quota reached. Wait a moment and try again."
+    if status == 400 and "language" in low:
+        return f"{provider} does not support the selected language. Pick another or use Auto-detect."
+    if status == 400:
+        return f"{provider} rejected the request: {msg[:90]}" if msg else f"{provider}: bad request."
+    return (f"{provider} error (HTTP {status}). {msg[:90]}").strip()
+
 
 def model_ok(name):
     return RAM_GB >= MODELS[name]["min_ram"]
@@ -415,6 +559,9 @@ class AudioRecorder:
         self.on_chunk_complete = lambda idx, text, lang: None
         self.on_lang_detected = lambda code, name: None
         self.on_partial       = lambda text: None
+        # Returns the signed-in user's Supabase access token (set by AppController);
+        # used by the managed cloud backend to authenticate to the proxy.
+        self.get_auth_token   = None
         
         self._chunk_frames    = []
         self._chunk_results   = {}
@@ -426,30 +573,112 @@ class AudioRecorder:
         self._chunk_errors    = []
         self._chunk_silence_before = {}
         self._record_error    = ""
+        self._cloud_capped    = False   # set when managed cloud hit its cap and we fell back to local
         # Rolling peak amplitude for adaptive bar normalization. Decays slowly
         # so bars stay calibrated to recent mic activity (handles mics with
-        # very different gain levels — laptop mic vs. headset vs. far-field).
+        # very different gain levels - laptop mic vs. headset vs. far-field).
         self._level_peak      = 0.05
+
+    @staticmethod
+    def _whisper_device():
+        """Prefer a CUDA GPU when one is usable (much faster); else CPU int8.
+        int8_float16 keeps GPU VRAM low so it fits on small cards too."""
+        try:
+            import ctranslate2
+            if ctranslate2.get_cuda_device_count() > 0:
+                return ("cuda", "int8_float16")
+        except Exception:
+            pass
+        return ("cpu", "int8")
+
+    @staticmethod
+    def _add_cuda_dll_dirs():
+        """Make CUDA libs (cuBLAS/cuDNN) from the `nvidia-*-cu12` pip packages
+        discoverable on Windows, so GPU works after a simple
+        `pip install nvidia-cublas-cu12 nvidia-cudnn-cu12` - no system CUDA needed.
+        No-op if the packages aren't installed."""
+        if sys.platform != "win32":
+            return
+        try:
+            import importlib.util
+            for pkg in ("nvidia.cublas", "nvidia.cudnn"):
+                spec = importlib.util.find_spec(pkg)
+                locs = getattr(spec, "submodule_search_locations", None) if spec else None
+                if not locs:
+                    continue
+                binp = os.path.join(list(locs)[0], "bin")
+                if not os.path.isdir(binp):
+                    continue
+                if hasattr(os, "add_dll_directory"):
+                    try:
+                        os.add_dll_directory(binp)
+                    except Exception:
+                        pass
+                # ctranslate2 loads cuBLAS/cuDNN lazily via the standard search
+                # order, so the bin dir must also be on PATH (add_dll_directory
+                # alone isn't honored for its delayed loads).
+                if binp not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = binp + os.pathsep + os.environ.get("PATH", "")
+        except Exception:
+            pass
 
     def load_model(self, name=None):
         name = name or cfg["whisper_model"]
         with self._model_lock:
             if self._model is None or self._model_name != name:
                 from faster_whisper import WhisperModel
-                # HF cache revalidation can race or fail under flaky network
-                # /proxy conditions, producing "Unable to open file 'model.bin'"
-                # errors even when the model is fully cached on disk. Try
-                # online first, then fall back to local_files_only=True so
-                # we never block the user on a network hiccup.
+                dev, ct = self._whisper_device()
+                # Try GPU first (if available), then CPU; and online first, then
+                # offline cache (HF revalidation can fail on flaky networks even
+                # when the model is fully cached). A GPU load can fail when the
+                # CUDA libraries are missing or VRAM is short - we fall back to CPU
+                # rather than erroring, so dictation always works.
+                # Use all physical CPU cores (ctranslate2 otherwise caps at a low
+                # default), so transcription runs as fast as the machine allows.
                 try:
-                    self._model = WhisperModel(name, device="cpu", compute_type="int8")
-                except Exception as e:
-                    logger.warning("Whisper online load failed (%s); trying offline cache", e)
-                    self._model = WhisperModel(
-                        name, device="cpu", compute_type="int8",
-                        local_files_only=True,
-                    )
-                self._model_name = name
+                    import psutil
+                    cpu_threads = psutil.cpu_count(logical=False) or 0
+                except Exception:
+                    cpu_threads = os.cpu_count() or 0
+                # Once we learn the CUDA libs are missing, don't keep retrying GPU
+                # on every model switch - go straight to CPU.
+                if getattr(self, "_cuda_usable", None) is False:
+                    dev = "cpu"
+                if dev == "cuda":
+                    self._add_cuda_dll_dirs()
+                attempts = []
+                if dev == "cuda":
+                    attempts += [("cuda", ct, False), ("cuda", ct, True)]
+                attempts += [("cpu", "int8", False), ("cpu", "int8", True)]
+                last_err = None
+                for d, c, local_only in attempts:
+                    try:
+                        m = WhisperModel(
+                            name, device=d, compute_type=c, local_files_only=local_only,
+                            cpu_threads=cpu_threads, num_workers=1)
+                        if d == "cuda":
+                            # A CUDA model constructs even when the CUDA runtime libs
+                            # (cuBLAS/cuDNN, e.g. cublas64_12.dll) are missing - it
+                            # only fails when it actually computes. The first time
+                            # only, force a tiny warm-up so we catch that here and
+                            # fall back to CPU instead of erroring on a real dictation.
+                            # After we know GPU works, skip the warm-up on later loads.
+                            if getattr(self, "_cuda_usable", None) is None:
+                                seg, _ = m.transcribe(np.zeros(16000, dtype=np.float32), beam_size=1)
+                                list(seg)
+                            self._cuda_usable = True
+                        self._model = m
+                        self._model_name = name
+                        logger.info("Whisper on %s (%s, cpu_threads=%s)", d, c, cpu_threads)
+                        return
+                    except Exception as e:
+                        last_err = e
+                        if d == "cuda":
+                            self._cuda_usable = False  # remember: skip GPU next time
+                        logger.warning("Whisper load failed on %s/%s (offline=%s): %s",
+                                       d, c, local_only, e)
+                if last_err:
+                    raise last_err
 
     def unload_model(self, name=None):
         with self._model_lock:
@@ -542,6 +771,7 @@ class AudioRecorder:
         self._session_lang  = None
         self._chunk_threads = []
         self._record_error  = ""
+        self._cloud_capped  = False
         self._level_peak    = 0.05
         
         open_args = {
@@ -552,10 +782,11 @@ class AudioRecorder:
             "frames_per_buffer": cfg["chunk_size"],
         }
         # Resolve what to capture. `capture_mode` is passed explicitly by the
-        # caller: the meetings window passes "smart_meeting"/"default_mic"; plain
-        # hotkey dictation passes nothing and just uses the configured mic. This
-        # keeps loopback/system-audio capture scoped to meetings — it can never
-        # leak into ordinary dictation via a shared config key.
+        # caller: the meetings window passes "smart_meeting" (system + mic),
+        # "system_only" (system sound, no mic) or "default_mic"; plain hotkey
+        # dictation passes nothing and just uses the configured mic. This keeps
+        # loopback/system-audio capture scoped to meetings - it can never leak
+        # into ordinary dictation via a shared config key.
         self.mic_stream = None
         is_loopback = False
         self._loopback_rate = cfg["sample_rate"]
@@ -563,7 +794,7 @@ class AudioRecorder:
 
         actual_device_index = None
 
-        if capture_mode == "smart_meeting":
+        if capture_mode in ("smart_meeting", "system_only"):
             discovered = self._find_default_loopback_device()
             if discovered is not None:
                 actual_device_index = discovered
@@ -577,7 +808,7 @@ class AudioRecorder:
                     self._loopback_rate = 48000
                     self._loopback_channels = 2
             else:
-                logger.warning("Smart Meeting Mode selected but no loopback device discovered. Recording default microphone only.")
+                logger.warning("System-audio capture selected but no loopback device discovered. Recording default microphone only.")
         elif capture_mode in ("default_mic", "default"):
             actual_device_index = None
         else:
@@ -586,7 +817,7 @@ class AudioRecorder:
             # the default microphone so a stale config never makes plain
             # dictation start capturing system audio.
             device_index = cfg.get("input_device_index")
-            if device_index not in (None, "", "default", "default_mic", "smart_meeting"):
+            if device_index not in (None, "", "default", "default_mic", "smart_meeting", "system_only"):
                 try:
                     actual_device_index = int(device_index)
                 except (TypeError, ValueError):
@@ -602,9 +833,11 @@ class AudioRecorder:
             open_args["frames_per_buffer"] = int(cfg["chunk_size"] * (self._loopback_rate / cfg["sample_rate"]))
             
         self.stream = self.audio.open(**open_args)
-        
-        # If primary stream is a loopback, open a secondary stream for default microphone!
-        if is_loopback:
+
+        # If primary stream is a loopback, open a secondary stream for the default
+        # microphone - but only in smart_meeting mode. "system_only" deliberately
+        # records the computer's sound with NO mic.
+        if is_loopback and capture_mode == "smart_meeting":
             try:
                 mic_args = {
                     "format": pyaudio.paFloat32,
@@ -709,7 +942,7 @@ class AudioRecorder:
                         self._level_peak = peak_now
                     else:
                         self._level_peak = max(0.01, self._level_peak * 0.995)
-                    # Use 0.7 * peak as the "full bar" reference — leaves
+                    # Use 0.7 * peak as the "full bar" reference - leaves
                     # headroom so transient loud sounds visibly spike past
                     # normal speech levels.
                     scale = max(0.01, self._level_peak * 0.7)
@@ -765,7 +998,9 @@ class AudioRecorder:
 
     def _transcribe_chunk(self, audio, idx):
         try:
-            if cfg["backend"] == "google" and cfg["google_api_key"]:
+            if cfg["backend"] == "managed":
+                text, lang = self._run_managed(audio)
+            elif cfg["backend"] == "google" and cfg["google_api_key"]:
                 text, lang = self._run_google(audio)
             elif cfg["backend"] == "mistral" and cfg.get("mistral_api_key"):
                 text, lang = self._run_mistral(audio)
@@ -866,24 +1101,26 @@ class AudioRecorder:
         remaining = np.frombuffer(b"".join(self._chunk_frames), dtype=np.float32).copy()
         last_text, detected = "", ""
 
-        is_cloud = (cfg["backend"] == "google" and cfg["google_api_key"]) or (cfg["backend"] == "mistral" and cfg.get("mistral_api_key"))
+        is_cloud = (cfg["backend"] in ("managed", "google", "mistral"))
         min_samples = cfg["sample_rate"] // 4 if is_cloud else cfg["sample_rate"] // 2
 
-        # Smart Audio Padding: Pad short final audio snippets with silence (zeros) 
+        # Smart Audio Padding: Pad short final audio snippets with silence (zeros)
         # to satisfy the backend's minimum length requirement rather than discarding them.
         if 0 < len(remaining) < min_samples:
             padding_len = min_samples - len(remaining)
             remaining = np.concatenate([remaining, np.zeros(padding_len, dtype=np.float32)])
 
         if len(remaining) >= min_samples:
-            if cfg["backend"] == "google" and cfg["google_api_key"]:
+            if cfg["backend"] == "managed":
+                last_text, detected = self._run_managed(remaining)
+            elif cfg["backend"] == "google" and cfg["google_api_key"]:
                 last_text, detected = self._run_google(remaining)
             elif cfg["backend"] == "mistral" and cfg.get("mistral_api_key"):
                 last_text, detected = self._run_mistral(remaining)
             else:
                 last_text, detected = self._run_local(remaining)
 
-        if detected and (detected.startswith("!google:") or detected.startswith("!mistral:")):
+        if detected and (detected.startswith("!google:") or detected.startswith("!mistral:") or detected.startswith("!managed:")):
             return "", detected
 
         with self._chunk_lock:
@@ -901,11 +1138,25 @@ class AudioRecorder:
         return full_text.strip(), detected or "en"
 
     def _run_local(self, audio):
-        self.load_model()
         sr = cfg["sample_rate"]
         if len(audio) < sr // 2:
             return "", "en"
+        try:
+            return self._run_local_once(audio)
+        except Exception as e:
+            # If we were running on the GPU and it failed mid-dictation (OOM,
+            # driver hiccup, a CUDA lib problem), drop to CPU and retry once so the
+            # transcription still succeeds instead of erroring.
+            if getattr(self, "_cuda_usable", None):
+                logger.warning("GPU transcription failed (%s); retrying on CPU.", e)
+                self._cuda_usable = False
+                self.unload_model()
+                return self._run_local_once(audio)
+            raise
 
+    def _run_local_once(self, audio):
+        self.load_model()
+        sr = cfg["sample_rate"]
         with self._model_lock:
             model = self._model
 
@@ -944,49 +1195,111 @@ class AudioRecorder:
         return text, lang_arg
 
     def _run_google(self, audio):
+        # Uses the Google AI Studio (Gemini) API, which accepts a plain API key.
+        # (Google Cloud Speech-to-Text rejects API keys and needs OAuth/service
+        # accounts, so the key people copy from AI Studio could never work there.)
         try:
             import requests
-            url = f"https://speech.googleapis.com/v1/speech:recognize?key={cfg['google_api_key']}"
-            
-            # Convert float32 back to linear16 bytes
-            wav_bytes = self._float_to_wav(audio)
-            
-            # Strip WAV header (44 bytes) to get raw PCM data
-            raw_pcm = wav_bytes[44:]
-            
-            b64_data = base64.b64encode(raw_pcm).decode("utf-8")
-            
-            lang_setting = cfg["language"]
-            main_lang = "hy-AM" if lang_setting == "hy" else ("ru-RU" if lang_setting == "ru" else "en-US")
-            
+            key = (cfg.get("google_api_key") or "").strip()
+            if not key:
+                return "", "!google:Add your Google AI Studio (Gemini) API key in Settings."
+
+            wav_bytes = self._float_to_wav(audio)  # full WAV; Gemini reads the header
+            b64_data = base64.b64encode(wav_bytes).decode("utf-8")
+
+            lang_setting = cfg.get("language", "auto")
+            lang_names = {"hy": "Armenian", "ru": "Russian", "en": "English",
+                          "fr": "French", "de": "German", "es": "Spanish", "ar": "Arabic"}
+            lang_hint = ""
+            if lang_setting in lang_names:
+                nm = lang_names[lang_setting]
+                # A strong, explicit instruction makes Gemini stay in the target
+                # language and native script (e.g. Armenian) instead of drifting
+                # to English or transliteration.
+                lang_hint = (f" The speaker is speaking {nm}. Transcribe in {nm} using its"
+                             f" native script and return only {nm} text.")
+
+            model_name = cfg.get("google_stt_model", "gemini-2.5-flash")
+            url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+                   f"{model_name}:generateContent?key={key}")
             payload = {
-                "config": {
-                    "encoding": "LINEAR16",
-                    "sampleRateHertz": cfg["sample_rate"],
-                    "languageCode": main_lang,
-                },
-                "audio": {
-                    "content": b64_data
-                }
+                "contents": [{
+                    "parts": [
+                        {"text": ("Transcribe this audio verbatim. Output only the exact "
+                                  "spoken words with correct punctuation and capitalization, "
+                                  "and nothing else." + lang_hint)},
+                        {"inline_data": {"mime_type": "audio/wav", "data": b64_data}},
+                    ]
+                }],
+                "generationConfig": {"temperature": 0},
             }
-            
-            if lang_setting == "auto":
-                payload["config"]["alternativeLanguageCodes"] = ["hy-AM", "en-US", "ru-RU", "fr-FR", "de-DE", "es-ES", "ar-EG"]
-                
-            resp = requests.post(url, json=payload, timeout=20)
+            resp = requests.post(url, json=payload, timeout=30)
             if resp.status_code != 200:
-                return "", f"!google:HTTP {resp.status_code}: {resp.text[:80]}"
-                
+                return "", "!google:" + cloud_error_message("Google", resp.status_code, resp.text)
+
             data = resp.json()
-            results = data.get("results", [])
-            if not results:
+            cands = data.get("candidates", [])
+            if not cands:
                 return "", "en"
-                
-            text = " ".join(r.get("alternatives", [{}])[0].get("transcript", "") for r in results)
-            lang = results[0].get("languageCode", "en-US").split("-")[0]
-            return text, lang
+            parts = cands[0].get("content", {}).get("parts", [])
+            text = "".join(p.get("text", "") for p in parts).strip()
+            return text, (lang_setting if lang_setting != "auto" else "en")
         except Exception as e:
             return "", f"!google:{e}"
+
+    def _run_managed(self, audio):
+        """Pro managed cloud transcription. Sends audio + the user's access token
+        to our server proxy, which holds the real STT key. The key never touches
+        the client, so this can't be used without a valid Pro/trial account."""
+        try:
+            import requests
+            token = None
+            try:
+                if callable(self.get_auth_token):
+                    token = self.get_auth_token()
+            except Exception:
+                token = None
+            if not token:
+                return "", "!managed:Sign in to use managed cloud transcription."
+
+            wav_bytes = self._float_to_wav(audio)  # full WAV; the proxy sends it to Gemini
+            b64_data = base64.b64encode(wav_bytes).decode("utf-8")
+
+            # Pro users pick which managed provider to use (server keys): Gemini
+            # (default) or Mistral. No BYO key is involved here.
+            provider = cfg.get("managed_provider", "gemini")
+            resp = requests.post(
+                MANAGED_PROXY_URL,
+                json={
+                    "audio": b64_data,
+                    "sample_rate": cfg["sample_rate"],
+                    "language": cfg["language"],
+                    "provider": provider,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30,
+            )
+            if resp.status_code == 403:
+                return "", "!managed:Pro required for managed cloud transcription."
+            if resp.status_code == 429:
+                # Monthly cloud allowance used up - transparently fall back to the
+                # local model so the user keeps working. Flag it so the UI can
+                # notify once.
+                self._cloud_capped = True
+                return self._run_local(audio)
+            if resp.status_code == 403:
+                # Not entitled to managed cloud - fall back to local.
+                return self._run_local(audio)
+            if resp.status_code == 401:
+                return "", "!managed:Session expired - sign in again."
+            if resp.status_code != 200:
+                # Any cloud error: don't fail the dictation, use local instead.
+                return self._run_local(audio)
+            data = resp.json()
+            return data.get("text", ""), data.get("lang", "en")
+        except Exception:
+            # Network/other failure - fall back to local rather than erroring.
+            return self._run_local(audio)
 
     def _run_mistral(self, audio):
         try:
@@ -995,35 +1308,32 @@ class AudioRecorder:
             
             api_key = cfg.get("mistral_api_key", "")
             if not api_key:
-                return "", "!mistral:API key not configured"
-                
-            model = cfg.get("mistral_stt_model", "voxtral-mini-latest")
+                return "", "!mistral:Add your Mistral API key in Settings."
+
+            model = normalize_mistral_model(cfg.get("mistral_stt_model", MISTRAL_STT_DEFAULT))
             lang_setting = cfg.get("language", "auto")
-            
+
             wav_bytes = self._float_to_wav(audio)
             wav_io = io.BytesIO(wav_bytes)
-            
+
             url = "https://api.mistral.ai/v1/audio/transcriptions"
-            headers = {
-                "Authorization": f"Bearer {api_key}"
-            }
-            files = {
-                "file": ("audio.wav", wav_io, "audio/wav")
-            }
-            data = {
-                "model": model
-            }
-            if lang_setting and lang_setting != "auto":
+            headers = {"Authorization": f"Bearer {api_key}"}
+            files = {"file": ("audio.wav", wav_io, "audio/wav")}
+            data = {"model": model}
+            # Only send a language Voxtral actually supports; "auto"/"multi" and
+            # unsupported codes (e.g. Armenian) are omitted so it auto-detects
+            # instead of 400-ing.
+            if lang_setting in MISTRAL_LANGS:
                 data["language"] = lang_setting
-                
+
             resp = requests.post(url, headers=headers, files=files, data=data, timeout=20)
             if resp.status_code != 200:
-                return "", f"!mistral:HTTP {resp.status_code}: {resp.text[:80]}"
-                
+                return "", "!mistral:" + cloud_error_message("Mistral", resp.status_code, resp.text)
+
             resp_data = resp.json()
             text = resp_data.get("text", "").strip()
-            detected_lang = resp_data.get("language", lang_setting if lang_setting != "auto" else "en")
-            
+            detected_lang = resp_data.get("language", lang_setting if lang_setting in MISTRAL_LANGS else "en")
+
             return text, detected_lang
         except Exception as e:
             return "", f"!mistral:{e}"
@@ -1094,7 +1404,7 @@ def make_qicon(color="#3b82f6"):
 
 # ── Main PySide6 Application Controller ───────────────────────────────────────
 class AppController(QObject):
-    # Cross-thread Signals — emitted from background hotkey-listener threads
+    # Cross-thread Signals - emitted from background hotkey-listener threads
     # (keyboard lib / pynput) and delivered on the Qt main thread via
     # QueuedConnection. Avoids QTimer.singleShot from non-Qt threads, which
     # silently no-ops because those threads have no Qt event loop.
@@ -1102,6 +1412,7 @@ class AppController(QObject):
     sig_enter = Signal()
     sig_escape = Signal()
     sig_update_available = Signal(str)  # tag of newer version
+    sig_auth_changed = Signal()         # auth/entitlement state changed (from worker threads)
 
     def __init__(self, qapp):
         super().__init__()
@@ -1113,7 +1424,12 @@ class AppController(QObject):
         # builds and autostart can launch from an arbitrary CWD).
         from ui.styles import STYLESHEET
         _check_svg = resource_path("assets", "check.svg").replace("\\", "/")
-        self.style_content = STYLESHEET.replace('url("assets/check.svg")', f'url("{_check_svg}")')
+        _chevron_svg = resource_path("assets", "chevron.svg").replace("\\", "/")
+        self.style_content = (
+            STYLESHEET
+            .replace('url("assets/check.svg")', f'url("{_check_svg}")')
+            .replace('url("assets/chevron.svg")', f'url("{_chevron_svg}")')
+        )
 
         # Setup pure business Audio Recorder
         self.recorder = AudioRecorder()
@@ -1123,11 +1439,19 @@ class AppController(QObject):
         from pynput.keyboard import Controller
         self.kbd = Controller()
         self.is_rec = False
+        self._rec_started_at = None  # wall-clock start of the current dictation
         self._mouse_listener = None
         self._kbd_listener = None
         self._registered_kbd_hotkey = None
         self._transient_kbd_handles = []
-        
+
+        # Auth + Pro entitlement (Supabase). All network calls run on worker
+        # threads; state changes are marshaled to the GUI thread via the
+        # sig_auth_changed signal so tray/UI updates stay thread-safe.
+        self.auth = auth.AuthManager(on_state_changed=self.sig_auth_changed.emit)
+        # Let the recorder fetch a fresh access token for managed cloud transcription.
+        self.recorder.get_auth_token = lambda: self.auth.get_access_token()
+
         # Initialize UI Dialog Windows (modularly split!)
         from ui.overlay import Overlay
         from ui.settings import Settings
@@ -1148,6 +1472,7 @@ class AppController(QObject):
         self.sig_enter.connect(self._on_enter, Qt.QueuedConnection)
         self.sig_escape.connect(self._on_escape, Qt.QueuedConnection)
         self.sig_update_available.connect(self._prompt_update, Qt.QueuedConnection)
+        self.sig_auth_changed.connect(self._on_auth_changed, Qt.QueuedConnection)
         self._update_prompt_open = False
 
         # Register the configured hotkey (keyboard combo or mouse button).
@@ -1155,7 +1480,10 @@ class AppController(QObject):
 
         # Setup System Tray
         self._setup_tray()
-        
+
+        # Restore any saved login + Pro entitlement in the background.
+        threading.Thread(target=self.auth.load_session, daemon=True).start()
+
         # Check updates in background
         threading.Thread(target=self._background_check_updates, daemon=True).start()
         
@@ -1170,12 +1498,21 @@ class AppController(QObject):
             APP_VERSION,
         )
 
-        # Onboarding wizard trigger on first launch
+        # Onboarding wizard trigger on first launch. Existing users (already
+        # onboarded before accounts existed) get a one-time account gate instead,
+        # so they aren't silently dropped to the 10-minute guest cap.
         if not self.cfg.get("onboarding_done", False):
             QTimer.singleShot(500, self.show_onboarding)
+        elif not self.cfg.get("account_gate_seen", False):
+            QTimer.singleShot(900, self.show_account_gate)
+
+        # macOS needs explicit permission grants (mic / Accessibility / Input
+        # Monitoring) or dictation looks silently broken. One-time guided setup.
+        if sys.platform == "darwin" and not self.cfg.get("macos_perms_guide_shown", False):
+            QTimer.singleShot(1200, self.show_macos_permissions_guide)
 
         # If a previous session already detected an update, prompt at startup
-        # immediately — don't wait for the network check to confirm. (The
+        # immediately - don't wait for the network check to confirm. (The
         # background check still runs and will clear the flag if no update.)
         cached_pending = self.cfg.get("pending_update_version", "")
         if cached_pending and self.cfg.get("onboarding_done", False):
@@ -1184,38 +1521,327 @@ class AppController(QObject):
     def _setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
         self.update_tray_icon()
-        
-        # Tray Right-Click Menu
+        self._build_tray_menu()
+        self.tray_icon.show()
+
+        # Single click tray icon wakes settings window
+        self.tray_icon.activated.connect(self._on_tray_activated)
+
+    def _build_tray_menu(self):
+        """(Re)build the tray context menu. Called again on auth changes so the
+        Pro badge + account section stay current."""
+        is_pro = self.is_pro()
         menu = QMenu()
-        
-        action_title = QAction(f"Transcribe  v{APP_VERSION}", self)
+
+        title_text = f"Transcribe  v{APP_VERSION}" + ("   ·  PRO" if is_pro else "")
+        action_title = QAction(title_text, self)
         action_title.setEnabled(False)
         menu.addAction(action_title)
+
+        # ── Account section ──
+        if self.auth.is_authenticated:
+            who = self.auth.user_email or "Account"
+            acct = QAction(f"{who}  ·  {'Pro' if is_pro else 'Free'}", self)
+            acct.setEnabled(False)
+            menu.addAction(acct)
+            if is_pro:
+                manage = QAction("Manage subscription…", self)
+                manage.triggered.connect(lambda: self.open_billing())
+                menu.addAction(manage)
+            else:
+                upgrade = QAction("Upgrade to Pro…", self)
+                upgrade.triggered.connect(lambda: self._pro_upsell())
+                menu.addAction(upgrade)
+            signout = QAction("Sign out", self)
+            signout.triggered.connect(lambda: self.sign_out())
+            menu.addAction(signout)
+        else:
+            mins = entitlements.guest_minutes_remaining()
+            guest_lbl = QAction(f"Guest · ~{mins} min free recording left", self)
+            guest_lbl.setEnabled(False)
+            menu.addAction(guest_lbl)
+            signin = QAction("Sign in / Sign up (free)…", self)
+            signin.triggered.connect(lambda: self.show_auth_gate())
+            menu.addAction(signin)
+
         menu.addSeparator()
 
-        action_rec_meet = QAction("Record Meeting...", self)
+        action_rec_meet = QAction("Record Meeting..." + ("" if is_pro else "   (Pro)"), self)
         action_rec_meet.triggered.connect(self.show_meeting)
         menu.addAction(action_rec_meet)
-        
+
         action_settings = QAction("Settings", self)
+        # Tier indicator dot - green = Free, purple = Pro, gray = Guest.
+        action_settings.setIcon(self._dot_icon(self._tier_color()))
         action_settings.triggered.connect(self.show_settings)
         menu.addAction(action_settings)
-        
+
         action_history = QAction("History Log", self)
         action_history.triggered.connect(self.show_history)
         menu.addAction(action_history)
-        
+
+        # Privacy Mode toggle - accessible from anywhere, not just Settings.
+        action_privacy = QAction("Privacy Mode (on-device only)", self)
+        action_privacy.setCheckable(True)
+        action_privacy.setChecked(bool(self.cfg.get("privacy_mode", False)))
+        action_privacy.triggered.connect(lambda: self.toggle_privacy_mode())
+        menu.addAction(action_privacy)
+
         menu.addSeparator()
-        
+
         action_quit = QAction("Quit", self)
         action_quit.triggered.connect(self.quit_app)
         menu.addAction(action_quit)
-        
+
+        self._tray_menu = menu  # keep a reference so Qt doesn't GC it
         self.tray_icon.setContextMenu(menu)
-        self.tray_icon.show()
-        
-        # Single click tray icon wakes settings window
-        self.tray_icon.activated.connect(self._on_tray_activated)
+
+        tip = "Transcribe - Pro" if is_pro else "Transcribe"
+        if self.auth.is_authenticated and self.auth.user_email:
+            tip += f"\n{self.auth.user_email}"
+        self.tray_icon.setToolTip(tip)
+
+    # ── Auth / Pro helpers ────────────────────────────────────────────────────
+    def is_pro(self):
+        # has_pro_access: a real Pro/trial entitlement is never downgraded by the
+        # admin force-tier preview, so a genuine Pro user is never blocked/upsold.
+        try:
+            return entitlements.has_pro_access(self.auth, self.cfg)
+        except Exception:
+            return bool(getattr(self, "auth", None) and self.auth.is_pro)
+
+    def current_tier(self):
+        try:
+            return entitlements.tier(self.auth, self.cfg)
+        except Exception:
+            return entitlements.TIER_GUEST
+
+    def _user_secret_id(self):
+        return entitlements.user_secret_id(getattr(self, "auth", None))
+
+    def _reconcile_user_secrets(self):
+        """Keep BYO API keys + cloud-engine config scoped per user. Returns True if
+        the active keys were swapped for a different user (so callers refresh UI)."""
+        current = self._user_secret_id()
+        if self.cfg.get("secrets_owner") == current:
+            return False  # same user (or same guest session) - nothing to do
+        switched = entitlements.reconcile_user_secrets(self.cfg, current)
+        self.save_config()
+        return switched
+
+    def _tier_color(self):
+        """Green = Free, Purple = Pro, Gray = Guest."""
+        return {
+            entitlements.TIER_PRO:   "#a855f7",
+            entitlements.TIER_FREE:  "#22c55e",
+            entitlements.TIER_GUEST: "#94a3b8",
+        }.get(self.current_tier(), "#94a3b8")
+
+    def _dot_icon(self, color_hex):
+        """A small filled circle QIcon used as the tier indicator."""
+        from PySide6.QtGui import QPixmap, QPainter, QColor, QBrush
+        pm = QPixmap(14, 14)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(QBrush(QColor(color_hex)))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(2, 2, 10, 10)
+        p.end()
+        return QIcon(pm)
+
+    def set_admin_tier_override(self, value):
+        """Super-admin only: force a tier locally (auto|guest|free|pro)."""
+        self.cfg["admin_tier_override"] = value
+        self.save_config()
+        self.sig_auth_changed.emit()
+
+    def _on_auth_changed(self):
+        # Runs on the GUI thread (QueuedConnection). Refresh tray + any open UI.
+        # First: swap in/out the per-user API keys if the signed-in user changed,
+        # so we never expose the previous account's keys on a shared computer.
+        switched = False
+        try:
+            switched = self._reconcile_user_secrets()
+        except Exception:
+            logger.debug("user secret reconcile failed", exc_info=True)
+        # Track the moment a user becomes Pro (trial or paid) for the funnel.
+        # Use the REAL server entitlement here (not is_pro(), which honors the
+        # admin force-tier preview) so toggling the preview never fires the
+        # activation funnel or wipes the managed-engine choice during a preview.
+        now_pro = bool(getattr(self.auth, "is_pro", False))
+        if now_pro and not getattr(self, "_was_pro", False):
+            try:
+                telemetry.track("pro_activated", {"plan": getattr(self.auth, "plan", "") or ""}, self.cfg, APP_VERSION)
+            except Exception:
+                pass
+        self._was_pro = now_pro
+        # If Pro lapsed while a keyless managed engine/backend was selected, fall
+        # back to local so the UI and behavior stay consistent (managed = Pro).
+        if not now_pro:
+            _changed = False
+            if self.cfg.get("backend") == "managed":
+                self.cfg["backend"] = "local"
+                _changed = True
+            if self.cfg.get("action_model") == actions.API_MANAGED_ID:
+                self.cfg["action_model"] = actions.RULE_BASED_ID
+                _changed = True
+            if _changed:
+                self.save_config()
+        # Remember the signed-in email so the sign-in form can prefill it next time
+        # (convenience only - the real session is restored from the encrypted
+        # refresh token in the OS keyring, never from this).
+        try:
+            em = (getattr(self.auth, "user_email", None) or "").strip()
+            if em and self.cfg.get("last_signin_email") != em:
+                self.cfg["last_signin_email"] = em
+                known = list(self.cfg.get("known_emails") or [])
+                if em not in known:
+                    known.insert(0, em)
+                self.cfg["known_emails"] = known[:5]
+                self.save_config()
+        except Exception:
+            logger.debug("could not remember email", exc_info=True)
+        try:
+            self._build_tray_menu()
+        except Exception:
+            logger.debug("tray rebuild failed", exc_info=True)
+        sw = getattr(self, "settings_win", None)
+        if sw is not None and hasattr(sw, "refresh_pro_state"):
+            try:
+                if switched and hasattr(sw, "reload_secret_fields"):
+                    sw.reload_secret_fields()  # pull the swapped-in user's keys
+                sw.refresh_pro_state()
+            except Exception:
+                pass
+
+    def start_google_login(self):
+        def _run():
+            try:
+                self.auth.sign_in_with_google()
+            except Exception:
+                logger.debug("google login failed", exc_info=True)
+        threading.Thread(target=_run, daemon=True).start()
+        self.show_tray_hint("Sign in", "Opening your browser to sign in with Google…")
+
+    def sign_out(self):
+        threading.Thread(target=self.auth.sign_out, daemon=True).start()
+
+    def open_billing(self):
+        if STRIPE_PORTAL_URL:
+            webbrowser.open(STRIPE_PORTAL_URL)
+        else:
+            self.show_tray_hint(
+                "Manage subscription",
+                "Use the 'Manage subscription' link in your Stripe receipt email "
+                "(Customer Portal not configured yet)."
+            )
+
+    def set_privacy_mode(self, on, notify=True):
+        """Apply Privacy Mode globally and immediately. Privacy forces everything
+        local: no cloud/managed backend, no history. Called from the tray and from
+        the in-app footer checkbox so the two stay in lockstep."""
+        on = bool(on)
+        if on == bool(self.cfg.get("privacy_mode", False)):
+            return  # no change
+        self.cfg["privacy_mode"] = on
+        if on:
+            self.cfg["backend"] = "local"   # privacy = on-device only
+        self.save_config()
+        if notify:
+            self.show_tray_hint(
+                "Privacy Mode ON" if on else "Privacy Mode OFF",
+                "Everything stays on your device - cloud features are disabled."
+                if on else "Cloud features are available again.",
+            )
+        # Refresh any open Settings window + rebuild the tray checkmark.
+        self.sig_auth_changed.emit()
+        try:
+            self._build_tray_menu()
+        except Exception:
+            pass
+
+    def toggle_privacy_mode(self):
+        """Flip Privacy Mode from the tray."""
+        self.set_privacy_mode(not self.cfg.get("privacy_mode", False))
+
+    def _pro_upsell(self, feature=None):
+        try:
+            telemetry.track("paywall_viewed", {"feature": feature or ""}, self.cfg, APP_VERSION)
+        except Exception:
+            pass
+        try:
+            from ui.pro_dialog import ProDialog
+            dlg = ProDialog(main_app=self, feature=feature)
+            dlg.exec()
+            return
+        except Exception as e:
+            logger.warning("Pro dialog failed, using fallback: %s", e)
+
+        # Fallback: simple prompt if the rich dialog can't be shown.
+        box = QMessageBox()
+        box.setWindowTitle("Transcribe Pro")
+        feat = f"{feature} is a Pro feature.\n\n" if feature else ""
+        box.setText(feat + "Upgrade to unlock Meetings, Smart Actions, and fast cloud transcription.")
+        if not self.auth.is_authenticated:
+            signin_btn = box.addButton("Create account", QMessageBox.AcceptRole)
+        else:
+            signin_btn = None
+        monthly_btn = box.addButton("€7.99/mo", QMessageBox.ActionRole)
+        annual_btn = box.addButton("€59/yr", QMessageBox.ActionRole)
+        box.addButton("Maybe later", QMessageBox.RejectRole)
+        if hasattr(self, "style_content"):
+            box.setStyleSheet(self.style_content)
+        box.exec()
+        clicked = box.clickedButton()
+        if signin_btn is not None and clicked == signin_btn:
+            self.show_auth_gate()
+        elif clicked == monthly_btn:
+            webbrowser.open(self._checkout_url(PRO_MONTHLY_URL))
+        elif clicked == annual_btn:
+            webbrowser.open(self._checkout_url(PRO_ANNUAL_URL))
+
+    def _checkout_url(self, base):
+        """Append the signed-in user's id (+ email) to a Stripe payment link so
+        the webhook can link the resulting subscription to the right account."""
+        try:
+            uid = getattr(self.auth, "user_id", None)
+            if not uid:
+                return base
+            from urllib.parse import urlencode
+            params = {"client_reference_id": uid}
+            email = getattr(self.auth, "user_email", None)
+            if email:
+                params["prefilled_email"] = email
+            sep = "&" if "?" in base else "?"
+            return f"{base}{sep}{urlencode(params)}"
+        except Exception:
+            return base
+
+    def _account_recording_time(self):
+        """Add the just-finished recording's duration to the guest meter. Only
+        guests are metered; free/pro have unlimited local dictation."""
+        started = self._rec_started_at
+        self._rec_started_at = None
+        if started is None:
+            return
+        elapsed = max(0.0, time.time() - started)
+        if entitlements.tier(self.auth, self.cfg) == entitlements.TIER_GUEST:
+            entitlements.add_guest_seconds(elapsed)
+            self.sig_auth_changed.emit()  # refresh tray remaining-time line
+
+    def _guest_limit_reached(self):
+        try:
+            telemetry.track("guest_trial_exhausted", {}, self.cfg, APP_VERSION)
+        except Exception:
+            pass
+        # Pressing the hotkey when out of free minutes opens the sign in / sign up
+        # screen directly, so the user knows the next step is to create an account.
+        self.show_tray_hint(
+            "Free minutes used up",
+            "Sign in (free) to keep dictating - unlimited local transcription, no charge.",
+        )
+        self.show_auth_gate()
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:
@@ -1240,7 +1866,7 @@ class AppController(QObject):
                 if tag and _parse_version(tag) > _parse_version(APP_VERSION):
                     self.cfg["pending_update_version"] = tag
                     self.save_config()
-                    # Emit signal — handled on main thread via QueuedConnection.
+                    # Emit signal - handled on main thread via QueuedConnection.
                     self.sig_update_available.emit(tag)
                 else:
                     if self.cfg.get("pending_update_version"):
@@ -1257,13 +1883,13 @@ class AppController(QObject):
             return
         if not tag:
             return
-        # Skip if user is mid-recording — don't interrupt them.
+        # Skip if user is mid-recording - don't interrupt them.
         if self.is_rec:
             return
         self._update_prompt_open = True
         try:
             reply = QMessageBox.question(
-                None, "Transcribe — Update Available",
+                None, "Transcribe - Update Available",
                 f"A new version ({tag}) is available.\n"
                 f"You are running v{APP_VERSION}.\n\n"
                 "Install update now?",
@@ -1314,6 +1940,10 @@ class AppController(QObject):
         self.history_win.activateWindow()
 
     def show_meeting(self):
+        # Meeting recording + AI notes are Pro-only.
+        if not self.is_pro():
+            self._pro_upsell("Meeting recording")
+            return
         self.meetings_win.show()
         self.meetings_win.raise_()
         self.meetings_win.activateWindow()
@@ -1322,6 +1952,98 @@ class AppController(QObject):
         self.onboarding_win.show()
         self.onboarding_win.raise_()
         self.onboarding_win.activateWindow()
+
+    def show_macos_permissions_guide(self):
+        """macOS only: a one-time walkthrough of the three permissions the app
+        needs (Microphone for dictation, Accessibility for auto-paste, Input
+        Monitoring for the global hotkey), with buttons that deep-link straight
+        into the right System Settings pane. Without these grants the app looks
+        silently broken on a Mac."""
+        if sys.platform != "darwin":
+            return
+        from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
+                                       QLabel, QPushButton)
+        import subprocess
+
+        dlg = QDialog()
+        dlg.setWindowTitle("Set up macOS permissions")
+        if hasattr(self, "style_content"):
+            dlg.setStyleSheet(self.style_content)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(10)
+        title = QLabel("Three quick permissions", dlg)
+        title.setStyleSheet("font-size: 17px; font-weight: 700; color: #0f172a;")
+        lay.addWidget(title)
+        sub = QLabel(
+            "macOS requires your explicit approval for each of these. "
+            "Grant them once and dictation just works.", dlg)
+        sub.setWordWrap(True)
+        sub.setStyleSheet("color: #475569;")
+        lay.addWidget(sub)
+
+        perms = (
+            ("Microphone", "Hear your voice for dictation.",
+             "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"),
+            ("Accessibility", "Paste the finished text into the app you're using.",
+             "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"),
+            ("Input Monitoring", "Detect the global dictation hotkey.",
+             "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"),
+        )
+        for name, why, url in perms:
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            txt = QLabel(f"<b>{name}</b><br><span style='color:#64748b'>{why}</span>", dlg)
+            txt.setWordWrap(True)
+            row.addWidget(txt, 1)
+            btn = QPushButton("Open Settings", dlg)
+            btn.setObjectName("secondaryButton")
+            btn.clicked.connect(lambda _=False, u=url: subprocess.Popen(["open", u]))
+            row.addWidget(btn, 0)
+            lay.addLayout(row)
+
+        done = QPushButton("Done - I've granted them", dlg)
+        done.setObjectName("primaryButton")
+        done.setMinimumHeight(38)
+        done.clicked.connect(dlg.accept)
+        lay.addWidget(done)
+
+        dlg.exec()
+        self.cfg["macos_perms_guide_shown"] = True
+        self.save_config()
+
+    def show_auth_gate(self):
+        """Open the email-first sign in / sign up dialog. Used by the Account tab,
+        tray, and upgrade prompts when the user wants to create or access an
+        account."""
+        if self.auth.is_authenticated:
+            self.show_settings()
+            return
+        # Reuse a single dialog instance so repeated clicks just bring it forward
+        # instead of stacking new windows.
+        gate = getattr(self, "_auth_gate", None)
+        if gate is None:
+            from ui.onboarding import Onboarding
+            gate = Onboarding(main_app=self, account_only=True)
+            self._auth_gate = gate
+        gate.show()
+        gate.raise_()
+        gate.activateWindow()
+
+    def show_account_gate(self):
+        """One-time sign-in / guest gate for users who onboarded before accounts
+        existed, so the accounts update doesn't silently cap them."""
+        if self.cfg.get("account_gate_seen", False):
+            return
+        if self.auth.is_authenticated:
+            self.cfg["account_gate_seen"] = True
+            self.save_config()
+            return
+        from ui.onboarding import Onboarding
+        self._account_gate = Onboarding(main_app=self, account_only=True)
+        self._account_gate.show()
+        self._account_gate.raise_()
+        self._account_gate.activateWindow()
 
     def save_config(self):
         save_config(self.cfg)
@@ -1384,7 +2106,7 @@ class AppController(QObject):
                 logger.info("Registered keyboard hotkey: %s", hotkey)
             else:
                 # macOS / Linux: pynput GlobalHotKeys (handles modifier tracking
-                # internally — more robust than a custom Listener).
+                # internally - more robust than a custom Listener).
                 from pynput import keyboard as pynput_keyboard
                 listener = pynput_keyboard.GlobalHotKeys({
                     self._to_pynput_hotkey(hotkey): lambda: self.sig_hotkey.emit(),
@@ -1454,10 +2176,19 @@ class AppController(QObject):
 
     def _on_hotkey(self):
         logger.info("[main] _on_hotkey fired (is_rec=%s)", self.is_rec)
+        # A previous dictation is still transcribing/processing - ignore the
+        # hotkey so we never re-enter the shared recorder mid-flight (crash).
+        if getattr(self, "_busy", False):
+            if not self.is_rec:
+                self.show_tray_hint(
+                    "One moment",
+                    "Finishing your previous dictation - try again in a second.",
+                )
+            return
         if not self.is_rec:
             # Dictation and the meeting recorder share one AudioRecorder + audio
             # device. Don't let the hotkey start a dictation on top of an active
-            # meeting — it would clobber the meeting's audio stream. Tell the
+            # meeting - it would clobber the meeting's audio stream. Tell the
             # user instead.
             if self._is_meeting_busy():
                 self.show_tray_hint(
@@ -1471,7 +2202,7 @@ class AppController(QObject):
             threading.Thread(target=self._stop, daemon=True).start()
 
     def _is_meeting_busy(self):
-        """True while the meeting window is actively recording or processing —
+        """True while the meeting window is actively recording or processing -
         i.e. while it owns the shared AudioRecorder."""
         win = getattr(self, "meetings_win", None)
         if win is None:
@@ -1498,7 +2229,7 @@ class AppController(QObject):
 
     def _on_enter(self):
         logger.info("[main] _on_enter fired (is_rec=%s)", self.is_rec)
-        if self.is_rec:
+        if self.is_rec and not getattr(self, "_busy", False):
             threading.Thread(target=self._stop, daemon=True).start()
 
     def _on_escape(self):
@@ -1506,11 +2237,34 @@ class AppController(QObject):
         if self.is_rec:
             threading.Thread(target=self._cancel, daemon=True).start()
 
+    def _cloud_preflight_warn(self):
+        """Immediate, friendly warning if a cloud backend is selected but clearly
+        misconfigured (no key). Recording still proceeds and transcription falls
+        back to the local model, so a dictation is never lost. Returns (title,
+        body) or None."""
+        b = self.cfg.get("backend", "local")
+        if b == "mistral" and not (self.cfg.get("mistral_api_key") or "").strip():
+            return ("Mistral key missing", "Add it in Settings - recording with the local model for now.")
+        if b == "google" and not (self.cfg.get("google_api_key") or "").strip():
+            return ("Google key missing", "Add your AI Studio key in Settings - recording with the local model for now.")
+        return None
+
     def _start(self):
         if self.is_rec:
             return
+        # Guests get a 10-minute free recording trial; block once it's spent.
+        if not entitlements.can_record(self.auth, self.cfg):
+            self._guest_limit_reached()
+            return
+        warn = self._cloud_preflight_warn()
+        if warn:
+            try:
+                self.show_tray_hint(*warn)
+            except Exception:
+                pass
         try:
             self.is_rec = True
+            self._rec_started_at = time.time()
             self.overlay.set_partial("")
             from ui.overlay import RECORDING
             self.overlay.show_overlay(RECORDING)
@@ -1544,12 +2298,13 @@ class AppController(QObject):
     def _cancel(self):
         self.recorder.stop_recording()
         self.is_rec = False
+        self._account_recording_time()
         self._unregister_transient_keys()
         self.overlay.call_soon(self.overlay.hide_overlay)
 
     def _register_transient_keys(self):
         # Enter (stop) and Esc (cancel) are only meaningful while recording.
-        # Use a pynput Listener — we confirmed in the logs that pynput reliably
+        # Use a pynput Listener - we confirmed in the logs that pynput reliably
         # receives plain Enter/Esc events on Windows, while the `keyboard`
         # library's on_press_key callback wasn't firing for those keys when
         # another hotkey was already registered with add_hotkey.
@@ -1587,6 +2342,16 @@ class AppController(QObject):
         self._transient_kbd_handles = []
 
     def _stop(self):
+        # _busy spans the whole transcribe→action→paste pipeline so a second
+        # hotkey press can't re-enter and clobber the shared recorder mid-flight
+        # (a real crash source). Cleared in finally on every exit path.
+        self._busy = True
+        try:
+            self._stop_impl()
+        finally:
+            self._busy = False
+
+    def _stop_impl(self):
         self.recorder.stop_recording()
         self._unregister_transient_keys()
         from ui.overlay import TRANSCRIBING
@@ -1605,6 +2370,17 @@ class AppController(QObject):
         t.join(timeout=TRANSCRIBE_TIMEOUT_SEC)
 
         self.is_rec = False
+        self._account_recording_time()
+
+        # If managed cloud hit its monthly cap, we transparently used the local
+        # model - tell the user once so the switch isn't a mystery.
+        if getattr(self.recorder, "_cloud_capped", False):
+            self.recorder._cloud_capped = False
+            self.overlay.call_soon(
+                self.show_tray_hint,
+                "Cloud limit reached",
+                "You've used this month's fast-cloud minutes - switched to the local model (still unlimited).",
+            )
 
         if t.is_alive():
             telemetry.track(
@@ -1614,7 +2390,7 @@ class AppController(QObject):
             )
             self.overlay.call_soon(
                 self.overlay.show_error,
-                f"Transcription timed out after {TRANSCRIBE_TIMEOUT_SEC}s — try a shorter clip or a smaller model.",
+                f"Transcription timed out after {TRANSCRIBE_TIMEOUT_SEC}s - try a shorter clip or a smaller model.",
             )
             return
             
@@ -1637,22 +2413,72 @@ class AppController(QObject):
 
         action_mode = actions.normalize_action_mode(self.cfg.get("output_action"))
         output_text = text
-        
+
+        # Smart Actions: Pro = unlimited; everyone else gets 5 free tries, then it
+        # falls back to pasting raw text (and we nudge them to upgrade).
+        if action_mode != actions.ACTION_TRANSCRIBE_ONLY and not self.is_pro():
+            if entitlements.can_use_smart_action(self.auth, self.cfg):
+                entitlements.add_smart_action_use(self.auth)
+                rem = entitlements.smart_actions_remaining(self.auth, self.cfg)
+                self.overlay.call_soon(
+                    self.show_tray_hint,
+                    "Smart Action (free trial)",
+                    f"{rem} free Smart Action(s) left. Upgrade to Pro for unlimited.",
+                )
+                # Reflect the new count in any open Settings window.
+                self.sig_auth_changed.emit()
+            else:
+                action_mode = actions.ACTION_TRANSCRIBE_ONLY
+                if entitlements.tier(self.auth, self.cfg) == entitlements.TIER_GUEST:
+                    self.overlay.call_soon(
+                        self.show_tray_hint,
+                        "Smart Actions (Pro)",
+                        "Pasted your raw text. Sign up free to get 5 Smart Action trials.",
+                    )
+                else:
+                    self.overlay.call_soon(
+                        self.show_tray_hint,
+                        "Free Smart Actions used up",
+                        "Pasted your raw text. Upgrade to Transcribe Pro for unlimited Smart Actions.",
+                    )
+
         if action_mode != actions.ACTION_TRANSCRIBE_ONLY:
+            # Switch the overlay to "Thinking…" while the smart action runs.
+            from ui.overlay import PROCESSING
+            self.overlay.call_soon(self.overlay.set_state, PROCESSING)
+            # Pick the engine + inject the auth token for Pro managed actions.
+            action_model = actions.normalize_action_model(self.cfg.get("action_model", actions.RULE_BASED_ID))
+            action_config = self.cfg
+            if self.is_pro():
+                token = None
+                try:
+                    token = self.auth.get_access_token()
+                except Exception:
+                    token = None
+                if token:
+                    action_config = {**self.cfg, "_managed_token": token}
+                    # Default Pro Smart Actions to the managed cloud (our Mistral
+                    # key, no BYO key). Respect a deliberate local-LLM choice, or a
+                    # cloud engine the user configured with their OWN key.
+                    m_kind = actions.ACTION_MODELS.get(action_model, {}).get("kind")
+                    has_own_cloud_key = bool(
+                        ((self.cfg.get("action_api_key") or "") or (self.cfg.get("google_api_key") or "")).strip())
+                    if m_kind in ("rules", "managed") or (m_kind == "cloud" and not has_own_cloud_key):
+                        action_model = actions.API_MANAGED_ID
             try:
                 output_text = actions.process(
                     text,
                     action_mode,
                     source_lang=lang,
                     target_lang=self.cfg.get("translate_target", "en"),
-                    model=self.cfg.get("action_model", actions.RULE_BASED_ID),
-                    config=self.cfg,
+                    model=action_model,
+                    config=action_config,
                 )
                 telemetry.track(
                     "action_completed",
                     {
                         "action": action_mode,
-                        "model": self.cfg.get("action_model", actions.RULE_BASED_ID),
+                        "model": action_model,
                         "language": lang,
                         "output_length_bucket": _bucket_count(len(output_text)),
                     },

@@ -17,7 +17,7 @@ pyinstaller `
     --name "TranscribeApp" `
     --add-data "config.example.json;." `
     --add-data "history.py;." `
-    --add-data "assets/google_logo.png;assets" `
+    --add-data "assets;assets" `
     --hidden-import "faster_whisper" `
     --hidden-import "faster_whisper.utils" `
     --hidden-import "tqdm" `

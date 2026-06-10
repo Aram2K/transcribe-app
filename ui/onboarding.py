@@ -1,19 +1,28 @@
 # Modern Onboarding Walkthrough Wizard in PySide6
 
-from PySide6.QtCore import Qt, QEvent
+import threading
+from PySide6.QtCore import Qt, QEvent, Signal, QSize
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, 
-    QComboBox, QCheckBox, QStackedWidget, QWidget, QLineEdit, QMessageBox, QFrame
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QComboBox, QCheckBox, QStackedWidget, QWidget, QLineEdit, QMessageBox, QFrame,
+    QApplication, QCompleter
 )
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtGui import QFont, QColor, QIcon
 import local_llm
 
 class Onboarding(QDialog):
-    def __init__(self, main_app=None):
+    # Emitted from the email-auth worker thread → handled on the GUI thread.
+    auth_result = Signal(str, str)  # (status, message)
+
+    def __init__(self, main_app=None, account_only=False):
         super().__init__()
         self.app = main_app
-        
-        self.setWindowTitle("Welcome to Transcribe")
+        # account_only: a one-time gate shown to EXISTING users on the update that
+        # introduces accounts. Shows just the sign-in / guest choice (no setup
+        # steps, since they're already configured).
+        self.account_only = account_only
+
+        self.setWindowTitle("Sign in to Transcribe" if account_only else "Welcome to Transcribe")
         self.setFixedSize(520, 680)
         
         # Apply style sheet
@@ -22,6 +31,10 @@ class Onboarding(QDialog):
             
         self.current_page = 0
         self.capturing = False
+        self.guest_mode = True  # default to guest until they choose to sign in
+        self._auth_mode = "signin"
+        self._pending_verify_email = None
+        self.auth_result.connect(self._on_auth_result)
         
         # Onboarding State Config
         self.hotkey_val = self.app.cfg.get("hotkey", "alt+r") if self.app else "alt+r"
@@ -33,8 +46,27 @@ class Onboarding(QDialog):
         self.analytics_val = bool(self.app.cfg.get("analytics_enabled", True)) if self.app else True
         
         self._build_ui()
+        # No button anywhere in this window should be "auto-default": pressing
+        # Enter must never trigger a button by accident. This caused a
+        # password-reset email on every email sign-in (Enter was also firing
+        # "Forgot password?"). The intended submit is handled by returnPressed.
+        for _b in self.findChildren(QPushButton):
+            _b.setAutoDefault(False)
+            _b.setDefault(False)
         self.btn_hotkey.installEventFilter(self)
         self.installEventFilter(self)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Center on the active screen every time it opens (avoids the window
+        # appearing cut off at the top-left on first launch).
+        scr = self.screen() or QApplication.primaryScreen()
+        if scr:
+            geo = scr.availableGeometry()
+            self.move(
+                geo.x() + (geo.width() - self.width()) // 2,
+                geo.y() + (geo.height() - self.height()) // 2,
+            )
 
     def _build_ui(self):
         self.main_layout = QVBoxLayout(self)
@@ -66,11 +98,317 @@ class Onboarding(QDialog):
         action_layout.addWidget(self.btn_back)
         action_layout.addStretch()
         action_layout.addWidget(self.btn_next)
-        
+
         self.main_layout.addLayout(action_layout)
+        self._update_nav()
+
+    def _create_account_page(self):
+        """First-run gate: a polished sign in / sign up screen (email + password
+        and Google), plus a low-friction guest path. Guest keeps activation high
+        while the account capture drives the funnel."""
+        self.page_account = QWidget()
+        lay = QVBoxLayout(self.page_account)
+        lay.setContentsMargins(4, 0, 4, 0)
+        lay.setSpacing(10)
+
+        title = QLabel("Welcome to Transcribe", self.page_account)
+        title.setObjectName("titleLabel")
+        title.setAlignment(Qt.AlignCenter)
+        lay.addWidget(title)
+
+        sub = QLabel("Private, instant voice-to-text anywhere you type.", self.page_account)
+        sub.setObjectName("subtitleLabel")
+        sub.setAlignment(Qt.AlignCenter)
+        sub.setWordWrap(True)
+        lay.addWidget(sub)
+
+        card = QFrame(self.page_account)
+        card.setObjectName("glassCard")
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(22, 20, 22, 20)
+        cl.setSpacing(11)
+
+        # Segmented toggle - Sign in | Sign up
+        seg = QHBoxLayout()
+        seg.setSpacing(6)
+        self._tab_signin = QPushButton("Sign in", card)
+        self._tab_signin.setMinimumHeight(34)
+        self._tab_signin.clicked.connect(lambda: self._set_auth_mode("signin"))
+        self._tab_signup = QPushButton("Sign up", card)
+        self._tab_signup.setMinimumHeight(34)
+        self._tab_signup.clicked.connect(lambda: self._set_auth_mode("signup"))
+        seg.addWidget(self._tab_signin)
+        seg.addWidget(self._tab_signup)
+        cl.addLayout(seg)
+
+        # Name (sign up only)
+        self._name_input = QLineEdit(card)
+        self._name_input.setPlaceholderText("Your name")
+        self._name_input.setMinimumHeight(38)
+        self._name_input.setVisible(False)
+        cl.addWidget(self._name_input)
+
+        # Email - prefilled with the last email used, with autocomplete from any
+        # previously used emails so returning users don't retype.
+        self._email_input = QLineEdit(card)
+        self._email_input.setPlaceholderText("you@email.com")
+        self._email_input.setMinimumHeight(38)
+        cl.addWidget(self._email_input)
+        known_emails = (self.app.cfg.get("known_emails") if self.app else None) or []
+        last_email = (self.app.cfg.get("last_signin_email") if self.app else "") or ""
+        if last_email:
+            self._email_input.setText(last_email)
+        if known_emails:
+            comp = QCompleter(known_emails, self._email_input)
+            comp.setCaseSensitivity(Qt.CaseInsensitive)
+            comp.setFilterMode(Qt.MatchContains)
+            self._email_input.setCompleter(comp)
+
+        # Password + show/hide toggle
+        pw_row = QHBoxLayout()
+        pw_row.setSpacing(6)
+        self._password_input = QLineEdit(card)
+        self._password_input.setPlaceholderText("Password")
+        self._password_input.setEchoMode(QLineEdit.Password)
+        self._password_input.setMinimumHeight(38)
+        self._password_input.returnPressed.connect(self._submit_email_auth)
+        pw_row.addWidget(self._password_input)
+        self._show_pw_btn = QPushButton(card)
+        self._show_pw_btn.setFixedSize(40, 38)
+        self._show_pw_btn.setIcon(QIcon(self._asset("eye.svg")))
+        self._show_pw_btn.setToolTip("Show password")
+        self._show_pw_btn.setCursor(Qt.PointingHandCursor)
+        self._show_pw_btn.setStyleSheet(
+            "border: 1px solid #cbd5e1; border-radius: 8px; background: #ffffff;"
+        )
+        self._show_pw_btn.clicked.connect(self._toggle_password_visibility)
+        pw_row.addWidget(self._show_pw_btn)
+        cl.addLayout(pw_row)
+
+        # Inline message (errors / success)
+        self._msg_label = QLabel("", card)
+        self._msg_label.setWordWrap(True)
+        self._msg_label.setVisible(False)
+        cl.addWidget(self._msg_label)
+
+        # Primary submit
+        self._primary_btn = QPushButton("Sign in", card)
+        self._primary_btn.setObjectName("primaryButton")
+        self._primary_btn.setMinimumHeight(42)
+        self._primary_btn.clicked.connect(self._submit_email_auth)
+        cl.addWidget(self._primary_btn)
+
+        # Resend verification (hidden until a sign-up needs confirmation)
+        self._resend_btn = QPushButton("Resend verification email", card)
+        self._resend_btn.setFlat(True)
+        self._resend_btn.setStyleSheet("color: #3b82f6; border: none; font-weight: 600;")
+        self._resend_btn.setVisible(False)
+        self._resend_btn.clicked.connect(self._resend_verification)
+        cl.addWidget(self._resend_btn, alignment=Qt.AlignCenter)
+
+        # Forgot password (sign-in only)
+        self._forgot_btn = QPushButton("Forgot password?", card)
+        self._forgot_btn.setFlat(True)
+        self._forgot_btn.setStyleSheet("color: #3b82f6; border: none;")
+        self._forgot_btn.clicked.connect(self._forgot_password)
+        cl.addWidget(self._forgot_btn, alignment=Qt.AlignCenter)
+
+        # Divider + optional Google social login
+        div = QHBoxLayout(); div.setSpacing(8)
+        ll = QFrame(card); ll.setFrameShape(QFrame.HLine); ll.setStyleSheet("color:#cbd5e1; max-height:1px;")
+        lr = QFrame(card); lr.setFrameShape(QFrame.HLine); lr.setStyleSheet("color:#cbd5e1; max-height:1px;")
+        orl = QLabel("or", card); orl.setObjectName("subtitleLabel")
+        div.addWidget(ll, 1); div.addWidget(orl); div.addWidget(lr, 1)
+        cl.addLayout(div)
+        self.btn_google = QPushButton("   Sign in with Google", card)
+        self.btn_google.setIcon(QIcon(self._asset("google_g.svg")))
+        self.btn_google.setIconSize(QSize(20, 20))
+        self.btn_google.setMinimumHeight(44)
+        self.btn_google.setCursor(Qt.PointingHandCursor)
+        self.btn_google.setStyleSheet(
+            "QPushButton { background: #ffffff; color: #3c4043; border: 1px solid #dadce0;"
+            " border-radius: 8px; font-size: 14px; font-weight: 600; padding: 0 12px; }"
+            "QPushButton:hover { background: #f7faff; border-color: #d2e3fc; }"
+        )
+        self.btn_google.clicked.connect(self._choose_google)
+        cl.addWidget(self.btn_google)
+
+        # Clickwrap consent: agreeing at account creation is the legally binding
+        # moment (much stronger than an installer EULA click-through).
+        self._legal_label = QLabel(
+            'By continuing you agree to our '
+            '<a href="https://aibuben.xyz/terms">Terms of Service</a> and '
+            '<a href="https://aibuben.xyz/privacy">Privacy Policy</a>.', card)
+        self._legal_label.setObjectName("subtitleLabel")
+        self._legal_label.setWordWrap(True)
+        self._legal_label.setAlignment(Qt.AlignCenter)
+        self._legal_label.setOpenExternalLinks(True)
+        self._legal_label.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        cl.addWidget(self._legal_label)
+
+        # Pressing Enter to sign in must NOT also fire another button. Qt makes
+        # buttons "auto-default" inside dialogs, so Enter was triggering "Forgot
+        # password?" on every email sign-in (a reset email each time). The
+        # password field's returnPressed already submits, so turn auto-default
+        # off everywhere.
+        for _b in card.findChildren(QPushButton):
+            _b.setAutoDefault(False)
+            _b.setDefault(False)
+
+        lay.addWidget(card)
+
+        # Guest
+        self.btn_guest = QPushButton("Continue as guest  →", self.page_account)
+        self.btn_guest.setFlat(True)
+        self.btn_guest.setStyleSheet("color: #475569; border: none; font-weight: 600;")
+        self.btn_guest.clicked.connect(self._choose_guest)
+        self.btn_guest.setAutoDefault(False)
+        self.btn_guest.setDefault(False)
+        lay.addWidget(self.btn_guest, alignment=Qt.AlignCenter)
+
+        guest_note = QLabel(
+            "Guest mode: 10 minutes of free recording, all models - no account needed.",
+            self.page_account,
+        )
+        guest_note.setObjectName("subtitleLabel")
+        guest_note.setAlignment(Qt.AlignCenter)
+        guest_note.setWordWrap(True)
+        guest_note.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        lay.addWidget(guest_note)
+
+        lay.addStretch()
+        self._set_auth_mode("signin")
+        self.stack.addWidget(self.page_account)
+
+    # ── Auth form behaviour ──────────────────────────────────────────────────
+    def _set_auth_mode(self, mode):
+        self._auth_mode = mode
+        is_signup = (mode == "signup")
+        self._name_input.setVisible(is_signup)
+        if hasattr(self, "_forgot_btn"):
+            self._forgot_btn.setVisible(not is_signup)
+        self._primary_btn.setText("Create account" if is_signup else "Sign in")
+        if hasattr(self, "btn_google"):
+            self.btn_google.setText("   Sign up with Google" if is_signup else "   Continue with Google")
+        self._tab_signin.setObjectName("primaryButton" if not is_signup else "")
+        self._tab_signup.setObjectName("primaryButton" if is_signup else "")
+        for b in (self._tab_signin, self._tab_signup):
+            b.style().unpolish(b); b.style().polish(b)
+        self._msg_label.setVisible(False)
+        self._resend_btn.setVisible(False)
+
+    @staticmethod
+    def _asset(name):
+        try:
+            from main import resource_path
+            return resource_path("assets", name)
+        except Exception:
+            import os
+            return os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", name
+            )
+
+    def _toggle_password_visibility(self):
+        if self._password_input.echoMode() == QLineEdit.Password:
+            self._password_input.setEchoMode(QLineEdit.Normal)
+            self._show_pw_btn.setIcon(QIcon(self._asset("eye-off.svg")))
+            self._show_pw_btn.setToolTip("Hide password")
+        else:
+            self._password_input.setEchoMode(QLineEdit.Password)
+            self._show_pw_btn.setIcon(QIcon(self._asset("eye.svg")))
+            self._show_pw_btn.setToolTip("Show password")
+
+    def _show_msg(self, text, error=False):
+        self._msg_label.setText(text)
+        self._msg_label.setStyleSheet(
+            f"font-size: 12px; font-weight: 600; color: {'#dc2626' if error else '#16a34a'};"
+        )
+        self._msg_label.setVisible(True)
+
+    def _set_form_busy(self, busy):
+        widgets = [self._name_input, self._email_input, self._password_input,
+                   self._primary_btn, self._tab_signin, self._tab_signup, self._show_pw_btn]
+        if hasattr(self, "btn_google"):
+            widgets.append(self.btn_google)
+        for w in widgets:
+            w.setEnabled(not busy)
+        if busy:
+            self._primary_btn.setText("Please wait…")
+        else:
+            self._primary_btn.setText("Create account" if self._auth_mode == "signup" else "Sign in")
+
+    def _submit_email_auth(self):
+        email = self._email_input.text().strip()
+        pw = self._password_input.text()
+        if "@" not in email or "." not in email.split("@")[-1]:
+            self._show_msg("Please enter a valid email address.", error=True)
+            return
+        if len(pw) < 6:
+            self._show_msg("Password must be at least 6 characters.", error=True)
+            return
+        name = self._name_input.text().strip()
+        self._msg_label.setVisible(False)
+        self._resend_btn.setVisible(False)
+        self._set_form_busy(True)
+        mode = self._auth_mode
+        auth = getattr(self.app, "auth", None)
+
+        def _run():
+            if not auth:
+                self.auth_result.emit("error", "Sign-in is unavailable right now.")
+                return
+            if mode == "signup":
+                status, msg = auth.sign_up_email(email, pw, name or None)
+            else:
+                status, msg = auth.sign_in_email(email, pw)
+            self.auth_result.emit(status, msg)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_auth_result(self, status, message):
+        self._set_form_busy(False)
+        if status == "ok":
+            self.guest_mode = False
+            self._proceed_after_auth()
+        elif status == "verify":
+            self._pending_verify_email = message
+            self._set_auth_mode("signin")
+            self._show_msg(
+                f"We emailed a verification link to {message}. Confirm it, then sign in.",
+                error=False,
+            )
+            self._resend_btn.setVisible(True)
+        else:
+            self._show_msg(message or "Something went wrong. Please try again.", error=True)
+
+    def _resend_verification(self):
+        email = self._pending_verify_email or self._email_input.text().strip()
+        auth = getattr(self.app, "auth", None)
+        if email and auth:
+            threading.Thread(target=lambda: auth.resend_verification(email), daemon=True).start()
+            self._show_msg("Verification email resent - check your inbox.", error=False)
+
+    def _forgot_password(self):
+        email = self._email_input.text().strip()
+        if "@" not in email or "." not in email.split("@")[-1]:
+            self._show_msg("Enter your email above first, then tap Forgot password.", error=True)
+            return
+        auth = getattr(self.app, "auth", None)
+        if auth and hasattr(auth, "send_password_reset"):
+            threading.Thread(target=lambda: auth.send_password_reset(email), daemon=True).start()
+            self._show_msg(f"If an account exists for {email}, a reset link is on its way.", error=False)
+
+    def _proceed_after_auth(self):
+        if self.account_only:
+            self._finish_account_only()
+        else:
+            self._go_to(1)
 
     def _create_pages(self):
-        # Page 0: Welcome & Hotkey setup
+        # Page 0: Account gate (sign in / continue as guest)
+        self._create_account_page()
+
+        # Page 1: Welcome & Hotkey setup
         self.page_welcome = QWidget()
         layout_wel = QVBoxLayout(self.page_welcome)
         layout_wel.setContentsMargins(0, 0, 0, 0)
@@ -378,14 +716,14 @@ class Onboarding(QDialog):
         else:
             return # ignore weird keys
 
-        # Modifier-less binding is only safe for Function keys (F1–F12); a bare
+        # Modifier-less binding is only safe for Function keys (F1-F12); a bare
         # typing/navigation key would fire during normal use.
         is_function_key = len(key_str) >= 2 and key_str[0] == "f" and key_str[1:].isdigit()
         if not mods and not is_function_key:
             QMessageBox.warning(
                 self, "Modifier Required",
                 "Use at least one modifier (Ctrl, Alt, Shift, or Win), a Function "
-                "key (F1–F12), or a mouse button.\n\nA single typing key can't be a "
+                "key (F1-F12), or a mouse button.\n\nA single typing key can't be a "
                 "hotkey because it would trigger while you type."
             )
             return
@@ -414,25 +752,55 @@ class Onboarding(QDialog):
             card.style().unpolish(card)
             card.style().polish(card)
 
+    def _go_to(self, page):
+        self.current_page = page
+        self.stack.setCurrentIndex(page)
+        self._update_nav()
+
+    def _update_nav(self):
+        # Page 0 is the account gate (its own buttons drive the flow); pages
+        # 1-3 are the 3-step setup wizard with the Back/Next bar.
+        p = self.current_page
+        if p == 0:
+            self.step_label.setText("WELCOME")
+            self.btn_back.setVisible(False)
+            self.btn_next.setVisible(False)
+        else:
+            self.step_label.setText(f"STEP {p} OF 3")
+            self.btn_back.setVisible(True)
+            self.btn_next.setVisible(True)
+            self.btn_back.setEnabled(p > 1)
+            self.btn_next.setText("Get Started" if p == 3 else "Next")
+
+    def _choose_google(self):
+        self.guest_mode = False
+        if self.app and hasattr(self.app, "start_google_login"):
+            self.app.start_google_login()
+        if self.account_only:
+            self._finish_account_only()
+        else:
+            self._go_to(1)
+
+    def _choose_guest(self):
+        self.guest_mode = True
+        if self.account_only:
+            self._finish_account_only()
+        else:
+            self._go_to(1)
+
+    def _finish_account_only(self):
+        if self.app:
+            self.app.cfg["account_gate_seen"] = True
+            self.app.save_config()
+        self.accept()
+
     def _back(self):
-        if self.current_page > 0:
-            self.current_page -= 1
-            self.stack.setCurrentIndex(self.current_page)
-            self.step_label.setText(f"STEP {self.current_page + 1} OF 3")
-            self.btn_next.setText("Next")
-            
-            if self.current_page == 0:
-                self.btn_back.setEnabled(False)
+        if self.current_page > 1:
+            self._go_to(self.current_page - 1)
 
     def _next(self):
-        if self.current_page < 2:
-            self.current_page += 1
-            self.stack.setCurrentIndex(self.current_page)
-            self.step_label.setText(f"STEP {self.current_page + 1} OF 3")
-            self.btn_back.setEnabled(True)
-            
-            if self.current_page == 2:
-                self.btn_next.setText("Get Started")
+        if self.current_page < 3:
+            self._go_to(self.current_page + 1)
         else:
             self._save_onboarding()
 
@@ -479,7 +847,8 @@ class Onboarding(QDialog):
             self.app.cfg["mistral_stt_model"] = "voxtral-mini-latest"
             self.app.cfg["analytics_enabled"] = self.analytics_val
             self.app.cfg["onboarding_done"] = True
-            
+            self.app.cfg["account_gate_seen"] = True
+
             self.app.save_config()
             self.app.apply_tray_bindings()
             

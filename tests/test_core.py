@@ -87,7 +87,7 @@ _pyside6 = _stub("PySide6")
 _pyside6.QtCore = _core
 _pyside6.QtGui = _gui
 _pyside6.QtWidgets = _widgets
-# ctypes is NOT stubbed — it is stdlib and works cross-platform.
+# ctypes is NOT stubbed - it is stdlib and works cross-platform.
 # ctypes.windll only appears inside apply_glass() which is never called by tests.
 # Replacing ctypes in sys.modules breaks ctypes._layout imports on Python 3.11.
 
@@ -177,6 +177,39 @@ class TestConfig(unittest.TestCase):
         finally:
             m.CONFIG_PATH = orig
 
+    def test_save_config_keeps_secrets_out_of_disk_when_keyring_available(self):
+        # All BYO keys (incl. Mistral) and the per-user stashed keys must go to
+        # the OS keyring - plaintext config.json only ever stores "".
+        import json as _json
+        import main as m
+        written = {}
+
+        def fake_write(name, value):
+            written[name] = value
+            return True
+
+        with patch.object(m.storage, "write_secret", side_effect=fake_write), \
+             patch.object(m.storage, "atomic_write_json") as aw:
+            cfg = {**m.DEFAULT,
+                   "google_api_key": "G-key", "action_api_key": "A-key",
+                   "mistral_api_key": "M-key",
+                   "user_secrets": {"user:A": {"google_api_key": "UG-key",
+                                               "backend": "local"}}}
+            m.save_config(cfg)
+
+        disk = aw.call_args[0][1]
+        self.assertEqual(disk["google_api_key"], "")
+        self.assertEqual(disk["action_api_key"], "")
+        self.assertEqual(disk["mistral_api_key"], "")
+        self.assertEqual(disk["user_secrets"]["user:A"]["google_api_key"], "")
+        self.assertEqual(disk["user_secrets"]["user:A"]["backend"], "local")
+        # Keyring received the real values.
+        self.assertEqual(written[m.storage.MISTRAL_API_KEY_SECRET], "M-key")
+        blob = _json.loads(written[m.storage.USER_SECRETS_SECRET])
+        self.assertEqual(blob["user:A"]["google_api_key"], "UG-key")
+        # The in-memory config the app keeps using is untouched.
+        self.assertEqual(cfg["user_secrets"]["user:A"]["google_api_key"], "UG-key")
+
     def test_partial_config_merged_with_defaults(self):
         import main as m
         orig = m.CONFIG_PATH
@@ -223,7 +256,10 @@ class TestConfig(unittest.TestCase):
         finally:
             m.CONFIG_PATH = orig
 
-    def test_local_action_model_enables_smart_output_mode(self):
+    def test_action_model_does_not_auto_enable_smart_output_mode(self):
+        # Smart Actions are Pro-only and must be opted into explicitly. Selecting
+        # an action model must NOT flip the default output mode away from
+        # transcribe_only.
         import main as m
         import local_llm
         orig = m.CONFIG_PATH
@@ -235,14 +271,14 @@ class TestConfig(unittest.TestCase):
                 "action_model": local_llm.QWEN_7B_ID,
             })
             c = load_config()
-            self.assertEqual(c["output_action"], "smart_auto")
+            self.assertEqual(c["output_action"], "transcribe_only")
         finally:
             m.CONFIG_PATH = orig
 
-    def test_privacy_mode_forces_local_no_history_keeps_analytics(self):
-        # Privacy Mode forces backend=local and disables history, but it
-        # intentionally leaves analytics_enabled untouched — the user
-        # controls that independently via the Settings checkbox.
+    def test_privacy_mode_forces_local_keeps_history_and_analytics(self):
+        # Privacy Mode forces backend=local and resets cloud action models, but it
+        # leaves local history AND analytics to the user's own settings (local
+        # history never leaves the device, so Privacy Mode does not touch it).
         import main as m
         import actions
         orig = m.CONFIG_PATH
@@ -258,7 +294,7 @@ class TestConfig(unittest.TestCase):
             })
             c = load_config()
             self.assertEqual(c["backend"], "local")
-            self.assertFalse(c["save_history"])
+            self.assertTrue(c["save_history"])  # local history is independent of Privacy Mode
             self.assertTrue(c["analytics_enabled"])  # NOT forced off anymore
             self.assertEqual(c["action_model"], actions.RULE_BASED_ID)
         finally:
@@ -395,7 +431,7 @@ class TestUpdaterHelpers(unittest.TestCase):
 
 class TestModelOk(unittest.TestCase):
     def test_tiny_always_ok(self):
-        # tiny needs 2 GB — should pass on any machine with RAM stubs returning 16 GB
+        # tiny needs 2 GB - should pass on any machine with RAM stubs returning 16 GB
         self.assertTrue(model_ok("tiny"))
 
     def test_unknown_model_raises(self):
@@ -404,10 +440,10 @@ class TestModelOk(unittest.TestCase):
 
     def test_models_dict_complete(self):
         for name in MODELS:
-            self.assertIn("min_ram", MODELS[name])
-            self.assertIn("speed",   MODELS[name])
-            self.assertIn("quality", MODELS[name])
-            self.assertIn("size",    MODELS[name])
+            self.assertIn("min_ram",    MODELS[name])
+            self.assertIn("speed_rank", MODELS[name])
+            self.assertIn("quality",    MODELS[name])
+            self.assertIn("size",       MODELS[name])
 
 
 class TestLangNames(unittest.TestCase):
@@ -455,7 +491,7 @@ class TestFmtHotkey(unittest.TestCase):
 
 
 class TestMeetingsWindowHelpers(unittest.TestCase):
-    """Tests for the pure-data helpers on MeetingsWindow — transcript
+    """Tests for the pure-data helpers on MeetingsWindow - transcript
     stitching, prompt context building, and share-format conversion.
 
     These don't exercise the Tk widgets; we bypass __init__ and set the
@@ -475,9 +511,9 @@ class TestMeetingsWindowHelpers(unittest.TestCase):
         mw = self._make_mw()
         chunks = [
             {"text": "Hello everyone.", "silence_before": 0.0},
-            {"text": "Thanks for joining.", "silence_before": 0.3},   # short — no marker
-            {"text": "I'll draft the spec.", "silence_before": 1.8},  # long — marker
-            {"text": "Sounds good.", "silence_before": 2.0},          # long — marker
+            {"text": "Thanks for joining.", "silence_before": 0.3},   # short - no marker
+            {"text": "I'll draft the spec.", "silence_before": 1.8},  # long - marker
+            {"text": "Sounds good.", "silence_before": 2.0},          # long - marker
         ]
         out = mw._build_transcript_with_markers(chunks)
         self.assertIn("Hello everyone.", out)
@@ -525,7 +561,7 @@ class TestMeetingsWindowHelpers(unittest.TestCase):
             summary="## Summary\nGreat call.\n\n## Action items\n- [ ] follow up",
         )
         out = mw._format_share("email")
-        self.assertIn("Subject: Sync with Sara — Notes", out)
+        self.assertIn("Subject: Sync with Sara - Notes", out)
         self.assertIn("Hi,", out)
         self.assertIn("Best,", out)
         # Markdown sigils should be stripped in the email body
@@ -538,7 +574,7 @@ class TestMeetingsWindowHelpers(unittest.TestCase):
             summary="## Summary\n**Aram** will ship by Friday.",
         )
         out = mw._format_share("slack")
-        self.assertIn("*Standup — Notes*", out)
+        self.assertIn("*Standup - Notes*", out)
         # ## Summary becomes *Summary*; **Aram** becomes *Aram*
         self.assertIn("*Summary*", out)
         self.assertIn("*Aram*", out)
@@ -648,11 +684,15 @@ class TestSettingsValidation(unittest.TestCase):
         dialog.accept = MagicMock()
         dialog.app = MagicMock()
         dialog.app.cfg = {}
-        
+
         Settings._on_save_clicked(dialog)
-        
+
+        # Save persists config and confirms with a toast - but does NOT close the
+        # window (Save no longer dismisses Settings).
         dialog._sync_action_settings_from_widgets.assert_called_once()
-        dialog.accept.assert_called_once()
+        dialog.app.save_config.assert_called_once()
+        dialog._show_saved_toast.assert_called_once()
+        dialog.accept.assert_not_called()
         dialog.tabs.setCurrentIndex.assert_not_called()
 
     def test_save_clicked_invalid_mistral_key(self):
@@ -717,30 +757,33 @@ class TestSettingsValidation(unittest.TestCase):
 
     def test_mistral_test_key_success(self):
         from ui.settings import Settings
-        
+
         dialog = MagicMock()
         dialog.mistral_key_input = MagicMock()
         dialog.mistral_key_input.text.return_value = "valid-key"
+        dialog.cfg_working = {"mistral_stt_model": "voxtral-mini-latest"}
         dialog.lbl_status_mistral = MagicMock()
         dialog.btn_test_mistral = MagicMock()
         dialog.mistral_test_finished = MagicMock()
-        
-        with patch("requests.get") as mock_get:
+
+        with patch("requests.post") as mock_post:
             mock_resp = MagicMock()
             mock_resp.status_code = 200
-            mock_get.return_value = mock_resp
-            
+            mock_post.return_value = mock_resp
+
             with patch("threading.Thread") as mock_thread:
                 Settings._test_mistral_key(dialog)
-                
+
                 worker_func = mock_thread.call_args[1]["target"]
                 worker_func()
-                
-                mock_get.assert_called_once_with(
-                    "https://api.mistral.ai/v1/models",
-                    headers={"Authorization": "Bearer valid-key"},
-                    timeout=10
-                )
+
+                # The test now does a real transcription call (validates the key,
+                # model access AND credits), not just a key-only models check.
+                self.assertEqual(mock_post.call_count, 1)
+                args, kwargs = mock_post.call_args
+                self.assertEqual(args[0], "https://api.mistral.ai/v1/audio/transcriptions")
+                self.assertEqual(kwargs["headers"], {"Authorization": "Bearer valid-key"})
+                self.assertEqual(kwargs["data"], {"model": "voxtral-mini-latest"})
                 dialog.mistral_test_finished.emit.assert_called_once_with(True, "Working!")
 
 
@@ -802,39 +845,59 @@ class TestCaptureMode(unittest.TestCase):
         finally:
             rec.recording = False
 
+    @patch("threading.Thread")
+    def test_system_only_uses_loopback_without_mic(self, _mock_thread):
+        # "System sound only" records the computer's audio with NO mic stream.
+        import main
+        from main import AudioRecorder
+        rec = AudioRecorder()
+        rec.audio = MagicMock()
+        rec.audio.get_device_info_by_index.return_value = {
+            "defaultSampleRate": 48000, "maxInputChannels": 2}
+        rec._find_default_loopback_device = MagicMock(return_value=7)
+        try:
+            with patch.dict(main.cfg, {"sample_rate": 16000, "chunk_size": 1024}):
+                rec.start_recording(capture_mode="system_only")
+            rec._find_default_loopback_device.assert_called_once()
+            self.assertIsNone(rec.mic_stream)                 # no secondary mic
+            self.assertEqual(rec.audio.open.call_count, 1)    # loopback only
+        finally:
+            rec.recording = False
+
 
 class TestGoogleKeyTest(unittest.TestCase):
+    # The key check now hits the Gemini (AI Studio) models endpoint with a GET,
+    # because Google Cloud Speech rejects API keys. 200 = valid; 400 = invalid key.
     def _run_worker(self, status_code, json_data):
         from ui.settings import Settings
         dialog = MagicMock()
         dialog.google_key_input.text.return_value = "some-key"
-        with patch("requests.post") as mock_post:
+        with patch("requests.get") as mock_get:
             mock_resp = MagicMock()
             mock_resp.status_code = status_code
             mock_resp.json.return_value = json_data
-            mock_post.return_value = mock_resp
+            mock_get.return_value = mock_resp
             with patch("threading.Thread") as mock_thread:
                 Settings._test_google_key(dialog)
                 worker = mock_thread.call_args[1]["target"]
                 worker()
         return dialog.google_test_finished.emit
 
-    def test_dummy_audio_400_reports_working(self):
-        # Valid key + intentional dummy audio → auth passed, key works.
-        emit = self._run_worker(400, {"error": {
-            "status": "INVALID_ARGUMENT", "message": "Invalid recognition audio"}})
+    def test_valid_key_reports_working(self):
+        # 200 from the models endpoint means the AI Studio key is valid.
+        emit = self._run_worker(200, {"models": []})
         emit.assert_called_once_with(True, "Working!")
 
     def test_invalid_key_reports_invalid(self):
         emit = self._run_worker(400, {"error": {
             "status": "INVALID_ARGUMENT",
             "message": "API key not valid. Please pass a valid API key."}})
-        emit.assert_called_once_with(False, "Invalid API Key")
+        emit.assert_called_once_with(False, "Invalid API key")
 
     def test_permission_denied_not_reported_as_working(self):
         emit = self._run_worker(403, {"error": {
             "status": "PERMISSION_DENIED",
-            "message": "Cloud Speech-to-Text API has not been used in project X or it is disabled"}})
+            "message": "Permission denied on this API"}})
         self.assertFalse(emit.call_args[0][0])
 
     def test_server_error_not_reported_as_working(self):

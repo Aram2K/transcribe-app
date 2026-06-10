@@ -256,16 +256,16 @@ def _messages_for(mode, text, source_lang, target_lang):
     elif mode == "summarize":
         instruction = (
             "Summarize the user's text in 3-5 sentences. "
-            "Capture the main points only. Output the summary directly — no preamble."
+            "Capture the main points only. Output the summary directly - no preamble."
         )
     elif mode == "meeting_notes":
-        # Tighter version of the cloud prompt — smaller local models follow
+        # Tighter version of the cloud prompt - smaller local models follow
         # short, direct instructions better than long bullet-point checklists.
         instruction = (
             "Summarise this meeting transcript into Markdown with EXACTLY these sections:\n"
             "## Summary  (2-4 sentences, third person, no 'I will')\n"
             "## Key decisions  (bullets; skip if none)\n"
-            "## Action items  (- [ ] task (Owner: name) — derive owner from "
+            "## Action items  (- [ ] task (Owner: name) - derive owner from "
             "'I'll'/'name should'/etc.)\n"
             "## Open questions  (bullets; skip if none)\n\n"
             "Preserve names exactly (incl. Armenian/Russian). Don't invent facts. "

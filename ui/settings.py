@@ -7,22 +7,95 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QCheckBox, QTabWidget, QWidget, QLineEdit, QTextEdit, QFrame, QScrollArea,
     QMessageBox, QGridLayout, QProgressBar, QStackedWidget, QRadioButton,
-    QButtonGroup, QSizePolicy,
+    QButtonGroup, QSizePolicy, QStyledItemDelegate, QStyle,
 )
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtGui import QFont, QColor, QIcon
 import local_llm
 import history as hist
 import telemetry
 import action_api
 import actions
+import entitlements
+
+
+class _PillItemDelegate(QStyledItemDelegate):
+    """Paints a small LOCAL/PRO pill RIGHT-aligned in dropdown rows (item icons
+    in Qt are hard-left, so the pills are drawn by hand instead)."""
+    PILL_ROLE = Qt.UserRole + 77
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        kind = index.data(self.PILL_ROLE)
+        if not kind:
+            return
+        from ui.icons import pro_pill_icon, local_pill_icon
+        icon, w = (pro_pill_icon(), 36) if kind == "pro" else (local_pill_icon(), 42)
+        h = 18
+        r = option.rect
+        mode = QIcon.Normal if (option.state & QStyle.State_Enabled) else QIcon.Disabled
+        icon.paint(painter, r.right() - w - 12, r.top() + (r.height() - h) // 2,
+                   w, h, Qt.AlignCenter, mode)
+
 
 class DownloadProgressSignal(QObject):
     progress = Signal(str, int, int, int) # model_name, percent, downloaded, total
     finished = Signal(str, str)          # model_name, state ("downloaded" / "failed")
 
+
+class FeedbackTextEdit(QTextEdit):
+    """A chat-style input: type text and paste or drop PNG/JPG images with Ctrl+V.
+    Pasted images are handed to `on_image(QImage)` instead of being inserted as
+    rich text, so they show up as a thumbnail and get sent with the feedback."""
+
+    def __init__(self, on_image, parent=None):
+        super().__init__(parent)
+        self._on_image = on_image
+        self.setAcceptDrops(True)
+
+    def _extract_image(self, source):
+        from PySide6.QtGui import QImage, QPixmap
+        if source.hasImage():
+            raw = source.imageData()
+            if isinstance(raw, QImage):
+                return raw if not raw.isNull() else None
+            if isinstance(raw, QPixmap):
+                img = raw.toImage()
+                return img if not img.isNull() else None
+        if source.hasUrls():
+            for url in source.urls():
+                p = url.toLocalFile()
+                if p and p.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")):
+                    img = QImage(p)
+                    if not img.isNull():
+                        return img
+        return None
+
+    def canInsertFromMimeData(self, source):
+        if source.hasImage() or source.hasUrls():
+            return True
+        return super().canInsertFromMimeData(source)
+
+    def insertFromMimeData(self, source):
+        img = self._extract_image(source)
+        if img is not None:
+            try:
+                self._on_image(img)
+            except Exception:
+                pass
+            return
+        if source.hasText():
+            self.insertPlainText(source.text())
+        else:
+            super().insertFromMimeData(source)
+
+
 class Settings(QDialog):
     mistral_test_finished = Signal(bool, str)
     google_test_finished = Signal(bool, str)
+    action_key_test_finished = Signal(bool, str)  # AI Actions cloud key test
+    feedback_finished = Signal(bool, str)
+    account_delete_finished = Signal(bool, str)
+    specs_ready = Signal(str)  # GPU name detected on a worker thread
 
     def __init__(self, parent=None, main_app=None):
         super().__init__(parent)
@@ -32,8 +105,10 @@ class Settings(QDialog):
         self.cfg_working = copy.deepcopy(self.app.cfg if self.app else {})
         
         self.setWindowTitle("Settings")
-        self.setMinimumSize(580, 680)
-        self.resize(600, 760)
+        # Wider so the cloud model cards (badge + state + buttons) are not clipped
+        # on the right.
+        self.setMinimumSize(660, 680)
+        self.resize(720, 780)
         
         # Apply global stylesheet
         if self.app and hasattr(self.app, "style_content"):
@@ -58,6 +133,10 @@ class Settings(QDialog):
         # Connect test signals
         self.mistral_test_finished.connect(self._on_mistral_test_finished)
         self.google_test_finished.connect(self._on_google_test_finished)
+        self.action_key_test_finished.connect(self._on_action_key_test_finished)
+        self.feedback_finished.connect(self._on_feedback_finished)
+        self.account_delete_finished.connect(self._on_account_delete_finished)
+        self.specs_ready.connect(self._on_specs_ready)
         
         # Whisper model card controls references
         self.whisper_cards = {}
@@ -69,7 +148,10 @@ class Settings(QDialog):
         self._build_ui()
         self.btn_hotkey.installEventFilter(self)
         self.installEventFilter(self)
-        self._set_backend_layout(self.cfg_working.get("action_api_provider", "api_openai_compatible") if self.app else "api_openai_compatible")
+        # Match the config stack to the engine actually selected in the dropdown
+        # (so managed/local/rule show their own panel, not a stale cloud form).
+        _init_engine = self.combo_engine.currentData() if hasattr(self, "combo_engine") else None
+        self._set_backend_layout(_init_engine or (self.cfg_working.get("action_api_provider", "api_openai_compatible") if self.app else "api_openai_compatible"))
         self._load_values_into_widgets()
 
     def showEvent(self, event):
@@ -88,6 +170,7 @@ class Settings(QDialog):
         for name in list(self.llm_cards.keys()):
             self._update_llm_card_ui(name)
         self._update_privacy_ui_state()
+        self._populate_history_list()
 
     def _on_save_clicked(self):
         self._sync_action_settings_from_widgets()
@@ -134,7 +217,7 @@ class Settings(QDialog):
                 QMessageBox.warning(
                     self,
                     "API Key Required",
-                    "Google Cloud Speech STT requires a valid Google Speech API Key. Please enter it below before saving."
+                    "Google Gemini Speech requires a valid Google AI Studio (Gemini) API key. Please enter it below before saving."
                 )
                 return
             if getattr(self, "_google_key_verified", False) is False:
@@ -146,7 +229,7 @@ class Settings(QDialog):
                 QMessageBox.warning(
                     self,
                     "Invalid API Key",
-                    "The provided Google Speech API Key failed connection tests. Please test a valid API key before saving."
+                    "The provided Google AI Studio (Gemini) API key failed connection tests. Please test a valid key before saving."
                 )
                 return
 
@@ -154,7 +237,13 @@ class Settings(QDialog):
             self.app.cfg.update(self.cfg_working)
             self.app.save_config()
             self.app.apply_tray_bindings()
-        self.accept()
+        # Save no longer closes the window - just confirm with a small toast.
+        self._show_saved_toast()
+
+    def _show_saved_toast(self, text="✓  Settings saved"):
+        self._saved_toast.setText(text)
+        self._saved_toast.setVisible(True)
+        QTimer.singleShot(2000, lambda: self._saved_toast.setVisible(False))
 
     def _sync_action_settings_from_widgets(self):
         """Persist output mode + engine from widgets (not only on toggle signals)."""
@@ -189,16 +278,18 @@ class Settings(QDialog):
         # 1b. Output mode (Transcribe only vs Smart actions)
         if hasattr(self, "rb_smart"):
             current_mode = self.cfg_working.get("output_action", "transcribe_only")
+            is_smart = (current_mode == actions.ACTION_SMART_AUTO)
             self.rb_smart.blockSignals(True)
             self.rb_transcribe.blockSignals(True)
-            if current_mode == actions.ACTION_SMART_AUTO:
-                self.rb_smart.setChecked(True)
-            else:
-                self.rb_transcribe.setChecked(True)
+            # Set BOTH explicitly: with signals blocked the QButtonGroup can't
+            # auto-uncheck the other, so checking just one would leave both lit.
+            self.rb_smart.setChecked(is_smart)
+            self.rb_transcribe.setChecked(not is_smart)
             self.rb_smart.blockSignals(False)
             self.rb_transcribe.blockSignals(False)
+            self._refresh_mode_card_styles()
             if hasattr(self, "engine_section"):
-                self.engine_section.setEnabled(self.rb_smart.isChecked())
+                self.engine_section.setEnabled(True)  # always selectable, even in transcribe-only
         
         # 2. Spoken Language
         idx = self.combo_lang.findData(self.cfg_working.get("language", "auto"))
@@ -217,8 +308,10 @@ class Settings(QDialog):
         self.chk_privacy.setChecked(bool(self.cfg_working.get("privacy_mode", False)))
         self.chk_privacy.blockSignals(False)
         
-        # 5. Engine Provider
-        provider = self.cfg_working.get("action_model", "rule_based")
+        # 5. Engine Provider - Pro defaults to the managed cloud (matches the
+        # actual routing in main._stop), everyone else to rule-based.
+        _pro = entitlements.has_pro_access(self.app.auth if self.app else None, self.cfg_working)
+        provider = self.cfg_working.get("action_model", actions.API_MANAGED_ID if _pro else "rule_based")
         import local_llm
         if provider in (local_llm.QWEN_TINY_ID, local_llm.QWEN_3B_ID, local_llm.QWEN_7B_ID, local_llm.GEMMA_2B_ID):
             provider = "local_llm"
@@ -228,18 +321,12 @@ class Settings(QDialog):
             self.combo_engine.setCurrentIndex(idx)
             self.combo_engine.blockSignals(False)
             
-        # 6. Local Model
-        model = self.cfg_working.get("action_model", local_llm.QWEN_TINY_ID)
-        if model not in local_llm.MODEL_CATALOG:
-            model = local_llm.QWEN_TINY_ID
-        idx = self.combo_local_model.findData(model)
-        if idx >= 0:
-            self.combo_local_model.blockSignals(True)
-            self.combo_local_model.setCurrentIndex(idx)
-            self.combo_local_model.blockSignals(False)
-            
-        # 7. Stack layout based on engine
+        # 6. Local model cards reflect the active model on their own
+        # (no selector dropdown - "Use Model" on a card is the selector).
+
+        # 7. Stack layout based on engine (+ Pro-only availability of managed)
         self._set_backend_layout(provider)
+        self._refresh_engine_availability()
         
         # 8. Telemetry
         self.chk_telemetry.blockSignals(True)
@@ -272,10 +359,35 @@ class Settings(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(12)
 
-        # Title Header
-        title_label = QLabel("Settings", self)
-        title_label.setObjectName("titleLabel")
-        layout.addWidget(title_label)
+        # Header: "Welcome, {name}" + a tier badge (purple Pro / green Free / gray Guest)
+        header_row = QHBoxLayout()
+        header_row.setSpacing(10)
+        self._welcome_label = QLabel("Welcome", self)
+        self._welcome_label.setObjectName("titleLabel")
+        header_row.addWidget(self._welcome_label)
+        self._header_badge = QLabel("GUEST", self)
+        self._header_badge.setObjectName("guestBadge")
+        header_row.addWidget(self._header_badge, 0, Qt.AlignVCenter)
+        header_row.addStretch()
+        # Top-right CTA: upgrade (free/trial) or sign-up (guest).
+        self._header_cta = QPushButton("", self)
+        self._header_cta.setCursor(Qt.PointingHandCursor)
+        self._header_cta.setStyleSheet(
+            "background-color: #a855f7; border: 1px solid #9333ea; color: white;"
+            "font-weight: 700; border-radius: 8px; padding: 6px 14px;"
+        )
+        self._header_cta.clicked.connect(self._header_cta_clicked)
+        self._header_cta.setVisible(False)
+        # A little glow on the edge so the Sign up / Upgrade CTA draws the eye.
+        from PySide6.QtWidgets import QGraphicsDropShadowEffect
+        from PySide6.QtGui import QColor as _QColor
+        _cta_glow = QGraphicsDropShadowEffect(self._header_cta)
+        _cta_glow.setBlurRadius(18)
+        _cta_glow.setOffset(0, 0)
+        _cta_glow.setColor(_QColor(168, 85, 247, 130))
+        self._header_cta.setGraphicsEffect(_cta_glow)
+        header_row.addWidget(self._header_cta, 0, Qt.AlignVCenter)
+        layout.addLayout(header_row)
 
         # Tabs Container
         self.tabs = QTabWidget(self)
@@ -289,21 +401,40 @@ class Settings(QDialog):
             about_title = f"About (Update v{self.cfg_working.get('pending_update_version').replace('v', '')}!)"
             
         self.tabs.addTab(self._create_about_tab(), about_title)
+        self.tabs.addTab(self._create_account_tab(), "Account")
+        # Keep the Pro-state UI (Smart Actions counter, badges, locks) fresh
+        # whenever the user switches tabs.
+        self.tabs.currentChanged.connect(lambda _i: self.refresh_pro_state())
         layout.addWidget(self.tabs)
 
-        # Bottom Close Row
+        # Bottom row - Save stays open + shows a small toast; Close dismisses.
+        # Privacy Mode lives here (not in a tab) so it's reachable from anywhere.
         bottom_layout = QHBoxLayout()
+        self.chk_privacy = QCheckBox("Privacy Mode", self)
+        self.chk_privacy.setToolTip(
+            "Keep everything on your device: turns off cloud transcription and "
+            "cloud AI. Your local history is independent - control it on the "
+            "History tab."
+        )
+        self.chk_privacy.setChecked(bool(self.cfg_working.get("privacy_mode", False)))
+        self.chk_privacy.stateChanged.connect(self._on_privacy_toggled)
+        bottom_layout.addWidget(self.chk_privacy)
         bottom_layout.addStretch()
-        
-        btn_cancel = QPushButton("Cancel", self)
-        btn_cancel.clicked.connect(self.reject)
-        bottom_layout.addWidget(btn_cancel)
-        
+
+        self._saved_toast = QLabel("", self)
+        self._saved_toast.setStyleSheet("color: #16a34a; font-weight: 700;")
+        self._saved_toast.setVisible(False)
+        bottom_layout.addWidget(self._saved_toast)
+
+        btn_close = QPushButton("Close", self)
+        btn_close.clicked.connect(self.reject)
+        bottom_layout.addWidget(btn_close)
+
         btn_save = QPushButton("Save", self)
         btn_save.setObjectName("primaryButton")
         btn_save.clicked.connect(self._on_save_clicked)
         bottom_layout.addWidget(btn_save)
-        
+
         layout.addLayout(bottom_layout)
 
     # ── TAB 1: General Settings ──────────────────────────────────────────────
@@ -313,6 +444,20 @@ class Settings(QDialog):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(14)
+
+        # Your device - so people know their specs and which models fit.
+        specs_frame = QFrame(tab)
+        specs_frame.setObjectName("cardFrame")
+        sp_lay = QVBoxLayout(specs_frame)
+        sp_head = QLabel("Your Device", specs_frame)
+        sp_head.setStyleSheet("font-weight: 600;")
+        sp_lay.addWidget(sp_head)
+        self._specs_label = QLabel(self._quick_specs(), specs_frame)
+        self._specs_label.setObjectName("subtitleLabel")
+        self._specs_label.setWordWrap(True)
+        sp_lay.addWidget(self._specs_label)
+        layout.addWidget(specs_frame)
+        self._detect_gpu_async()
 
         # Hotkey Configuration
         hotkey_frame = QFrame(tab)
@@ -359,13 +504,21 @@ class Settings(QDialog):
         vocab_lay.addWidget(self.vocab_input)
         layout.addWidget(vocab_frame)
 
-
-
         # Meeting Audio Device
         dev_frame = QFrame(tab)
         dev_frame.setObjectName("cardFrame")
         dev_lay = QVBoxLayout(dev_frame)
-        dev_lay.addWidget(QLabel("Default Meeting Audio Device", dev_frame))
+        dev_head = QHBoxLayout()
+        dev_head.addWidget(QLabel("Default Meeting Audio Device", dev_frame))
+        dev_head.addStretch()
+        self._meeting_pro_badge = QLabel("PRO", dev_frame)
+        self._meeting_pro_badge.setObjectName("proBadge")
+        # Own stylesheet: the glowed card makes child QLabels transparent, which
+        # would otherwise wash out the pill (closest-stylesheet-wins cascade).
+        self._meeting_pro_badge.setStyleSheet(self._PRO_BADGE_CSS)
+        self._meeting_pro_badge.setVisible(True)  # shown for all tiers, incl. Pro
+        dev_head.addWidget(self._meeting_pro_badge)
+        dev_lay.addLayout(dev_head)
         
         self.combo_device = QComboBox(dev_frame)
         self._populate_audio_devices()
@@ -374,41 +527,145 @@ class Settings(QDialog):
         dev_lay.addWidget(self.combo_device)
         
         # Start meeting launch button
-        self.btn_launch_meeting = QPushButton("🚀 Start Smart Meeting Transcription", dev_frame)
+        self.btn_launch_meeting = QPushButton("Start Smart Meeting Transcription", dev_frame)
         self.btn_launch_meeting.setObjectName("primaryButton")
         self.btn_launch_meeting.setMinimumHeight(38)
         self.btn_launch_meeting.clicked.connect(self._launch_smart_meeting)
         dev_lay.addWidget(self.btn_launch_meeting)
-        
+
+        self._meeting_card = dev_frame
+        self._set_pro_glow(dev_frame, not self._is_pro())
         layout.addWidget(dev_frame)
 
-        # Privacy mode checkbox
-        self.chk_privacy = QCheckBox("Privacy Mode (Disable local history, force offline local models)", tab)
-        if self.app:
-            self.chk_privacy.setChecked(bool(self.cfg_working.get("privacy_mode", False)))
-        self.chk_privacy.stateChanged.connect(self._save_general_configs)
-        layout.addWidget(self.chk_privacy)
+        # Fast cloud transcription (Pro) backend - off by default.
+        cloud_frame = QFrame(tab)
+        cloud_frame.setObjectName("cardFrame")
+        cf_lay = QVBoxLayout(cloud_frame)
+        cf_lay.setContentsMargins(18, 12, 18, 12)
+        cf_lay.setSpacing(4)
+        ch_row = QHBoxLayout()
+        self.chk_managed = QCheckBox("Fast cloud transcription", cloud_frame)
+        self.chk_managed.setChecked(self.cfg_working.get("backend") == "managed")
+        self.chk_managed.stateChanged.connect(self._on_managed_toggled)
+        ch_row.addWidget(self.chk_managed)
+        # Right-align the PRO badge so it sits on the same level as the meeting
+        # card's PRO badge (label/control - stretch - PRO).
+        ch_row.addStretch()
+        self._cloud_pro_badge = QLabel("PRO", cloud_frame)
+        self._cloud_pro_badge.setObjectName("proBadge")
+        self._cloud_pro_badge.setStyleSheet(self._PRO_BADGE_CSS)
+        ch_row.addWidget(self._cloud_pro_badge)
+        cf_lay.addLayout(ch_row)
+        cloud_desc = QLabel("Transcribe on our servers - no setup, no API key.", cloud_frame)
+        cloud_desc.setObjectName("subtitleLabel")
+        cloud_desc.setWordWrap(True)
+        cf_lay.addWidget(cloud_desc)
+        self._cloud_card = cloud_frame
+        self._set_pro_glow(cloud_frame, not self._is_pro())
+        layout.addWidget(cloud_frame)
 
         layout.addStretch()
         return tab
 
+    def _set_pro_glow(self, frame, on):
+        """Glow marks features the user does NOT have yet. Pro users keep the
+        PRO pill but lose the purple halo/border (it would be noise)."""
+        if frame is None:
+            return
+        if on:
+            self._apply_pro_glow(frame)
+        else:
+            # Keep text children transparent (they paint opaque boxes on the
+            # frosted card otherwise) - just drop the purple border + halo.
+            frame.setStyleSheet(
+                "QFrame#cardFrame QLabel, QFrame#cardFrame QCheckBox,"
+                "QFrame#cardFrame QRadioButton { background: transparent; }")
+            frame.setGraphicsEffect(None)
+
+    def _apply_pro_glow(self, frame):
+        """Soft fading purple halo + light purple border so Pro features read as
+        premium at a glance. Kept for every tier - it marks the feature itself,
+        not the user's access (gating is handled separately).
+
+        Text children get an explicit transparent background: the glow shows
+        through the card's translucent fill, and labels/checkboxes otherwise
+        paint their own opaque boxes on top of it (ugly white rectangles)."""
+        from PySide6.QtWidgets import QGraphicsDropShadowEffect
+        from PySide6.QtGui import QColor
+        frame.setStyleSheet(
+            "QFrame#cardFrame { border: 1px solid rgba(168, 85, 247, 120); }"
+            "QFrame#cardFrame QLabel, QFrame#cardFrame QCheckBox,"
+            "QFrame#cardFrame QRadioButton { background: transparent; }")
+        glow = QGraphicsDropShadowEffect(frame)
+        glow.setBlurRadius(28)
+        glow.setOffset(0, 0)
+        glow.setColor(QColor(168, 85, 247, 95))
+        frame.setGraphicsEffect(glow)
+
     def _populate_audio_devices(self):
+        from ui.icons import meeting_mode_icon
+        # System-audio capture rides on WASAPI loopback (Windows). On macOS /
+        # systems without it, offering those modes would silently record the
+        # mic anyway - so only show what genuinely works here.
+        try:
+            import main as _m
+            has_loopback = bool(getattr(_m, "HAS_LOOPBACK", False))
+        except Exception:
+            has_loopback = False
         self.combo_device.clear()
-        self.combo_device.addItem("🔊 + 🎙️ Smart Meeting Mode (Record BOTH Computer Sound + My Microphone)", "smart_meeting")
-        self.combo_device.addItem("🎙️ Standard Mode (Record My Microphone Only)", "default_mic")
-        
-        # Set to current saved meeting capture mode
-        current_dev = self.cfg_working.get("meeting_audio_mode", "smart_meeting")
-        if current_dev not in ("smart_meeting", "default_mic"):
-            current_dev = "smart_meeting"
-            
+        if has_loopback:
+            self.combo_device.addItem(
+                meeting_mode_icon("smart_meeting"),
+                "System sound + Microphone (best for meetings)", "smart_meeting")
+        self.combo_device.addItem(
+            meeting_mode_icon("default_mic"),
+            "Microphone only", "default_mic")
+        if has_loopback:
+            self.combo_device.addItem(
+                meeting_mode_icon("system_only"),
+                "System sound only (no microphone)", "system_only")
+
+        # Set to current saved meeting capture mode (heal modes that this
+        # system can't capture).
+        valid = ("smart_meeting", "default_mic", "system_only") if has_loopback else ("default_mic",)
+        default_mode = "smart_meeting" if has_loopback else "default_mic"
+        current_dev = self.cfg_working.get("meeting_audio_mode", default_mode)
+        if current_dev not in valid:
+            current_dev = default_mode
+
         idx = self.combo_device.findData(str(current_dev))
         if idx >= 0:
             self.combo_device.setCurrentIndex(idx)
         else:
             self.combo_device.setCurrentIndex(0)
 
+    def _on_managed_toggled(self, _state):
+        # Managed cloud is Pro-only. Non-Pro toggling on → revert + upsell.
+        if self.chk_managed.isChecked():
+            if not self._is_pro():
+                self.chk_managed.blockSignals(True)
+                self.chk_managed.setChecked(False)
+                self.chk_managed.blockSignals(False)
+                if self.app and hasattr(self.app, "_pro_upsell"):
+                    self.app._pro_upsell("Managed cloud transcription")
+                return
+            self.cfg_working["backend"] = "managed"
+            # Cloud and Privacy Mode are mutually exclusive (cloud sends audio off
+            # the device; Privacy forces everything local).
+            if hasattr(self, "chk_privacy") and self.chk_privacy.isChecked():
+                self.chk_privacy.blockSignals(True)
+                self.chk_privacy.setChecked(False)
+                self.chk_privacy.blockSignals(False)
+                self.cfg_working["privacy_mode"] = False
+        elif self.cfg_working.get("backend") == "managed":
+            self.cfg_working["backend"] = "local"
+
     def _launch_smart_meeting(self):
+        # Meeting recording is Pro-only - prompt to upgrade instead of launching.
+        if not self._is_pro():
+            if self.app and hasattr(self.app, "_pro_upsell"):
+                self.app._pro_upsell("Meeting recording")
+            return
         self._save_general_configs()
         if self.app:
             self.app.cfg.update(self.cfg_working)
@@ -416,6 +673,124 @@ class Settings(QDialog):
             self.app.apply_tray_bindings()
             self.accept()
             self.app.show_meeting()
+
+    # ── System specs ─────────────────────────────────────────────────────────
+    def _quick_specs(self, gpu=None):
+        """A clean, plain-language one-liner: friendly CPU name + cores, RAM, and
+        (only if a real GPU is present) the GPU. No threads, no CUDA noise."""
+        try:
+            import psutil
+            physical = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True) or 0
+            ram = psutil.virtual_memory().total / (1024 ** 3)
+            cpu = self._cpu_name() or "Processor"
+            if physical:
+                cpu = f"{cpu} · {physical} cores"
+            lbl = lambda t: f"<b style='color:#475569'>{t}</b>&nbsp;&nbsp;"
+            gap = "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+            parts = [f"{lbl('CPU')}{cpu}", f"{lbl('RAM')}{ram:.0f} GB"]
+            if gpu:
+                parts.append(f"{lbl('GPU')}{gpu}")
+            return gap.join(parts)
+        except Exception:
+            return "System information unavailable."
+
+    def _on_specs_ready(self, gpu):
+        if hasattr(self, "_specs_label"):
+            # Empty string → no discrete GPU → omit the GPU part entirely.
+            self._specs_label.setText(self._quick_specs(gpu or None))
+
+    def _speed_phrase(self, rank):
+        """Plain-language speed estimate adjusted for this machine's hardware
+        (whether a CUDA GPU is usable), instead of a meaningless fixed '~Ns'."""
+        if getattr(self, "_cuda", None) is None:
+            try:
+                import ctranslate2
+                self._cuda = ctranslate2.get_cuda_device_count() > 0
+            except Exception:
+                self._cuda = False
+        try:
+            rank = int(rank)
+        except (TypeError, ValueError):
+            rank = 3
+        if self._cuda:
+            words = {1: "Instant", 2: "Instant", 3: "Very fast", 4: "Very fast", 5: "Fast", 6: "Fast"}
+            return f"{words.get(rank, 'Fast')} on your GPU"
+        words = {1: "Very fast", 2: "Fast", 3: "Fast", 4: "Moderate", 5: "Slow", 6: "Slower"}
+        return f"{words.get(rank, 'Moderate')} on your CPU"
+
+    def _detect_gpu_async(self):
+        threading.Thread(target=lambda: self.specs_ready.emit(self._detect_gpu()), daemon=True).start()
+
+    @staticmethod
+    def _cpu_name():
+        """Friendly processor name, e.g. 'Intel Core i7-14700' or 'AMD Ryzen 7'."""
+        import sys, re
+        name = None
+        try:
+            if sys.platform == "win32":
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+                    name = winreg.QueryValueEx(k, "ProcessorNameString")[0]
+            elif sys.platform == "darwin":
+                import subprocess
+                name = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                                      capture_output=True, text=True, timeout=4).stdout.strip()
+            else:
+                with open("/proc/cpuinfo", encoding="utf-8") as f:
+                    for line in f:
+                        if "model name" in line:
+                            name = line.split(":", 1)[1].strip()
+                            break
+        except Exception:
+            name = None
+        if not name:
+            return None
+        # Strip marketing noise: (R)/(TM), "CPU"/"Processor", "@ 2.10GHz", "16-Core".
+        name = re.sub(r"\(R\)|\(TM\)|\(tm\)", "", name)
+        name = re.sub(r"\bCPU\b|\bProcessor\b|\d+-Core", "", name, flags=re.I)
+        name = re.sub(r"@.*$", "", name)
+        name = re.sub(r"\s+", " ", name).strip()
+        return name or None
+
+    @staticmethod
+    def _detect_gpu():
+        """The primary discrete GPU's name, cleaned. Empty string when the machine
+        has only integrated graphics (so the caller omits the GPU line)."""
+        import sys, subprocess, re
+        names = []
+        try:
+            if sys.platform == "win32":
+                out = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "(Get-CimInstance Win32_VideoController).Name -join '|'"],
+                    capture_output=True, text=True, timeout=6,
+                )
+                names = [n.strip() for n in (out.stdout or "").split("|") if n.strip()]
+            elif sys.platform == "darwin":
+                out = subprocess.run(["system_profiler", "SPDisplaysDataType"],
+                                     capture_output=True, text=True, timeout=6)
+                for line in (out.stdout or "").splitlines():
+                    if "Chipset Model" in line:
+                        names.append(line.split(":", 1)[1].strip())
+        except Exception:
+            names = []
+
+        def clean(n):
+            n = re.sub(r"\(R\)|\(TM\)|\(tm\)", "", n)
+            return re.sub(r"\s+", " ", n).strip()
+
+        # Apple Silicon / Intel Macs: the chipset model is the GPU worth showing.
+        if sys.platform == "darwin":
+            return clean(names[0]) if names else ""
+
+        # Windows/Linux: show the discrete GPU; skip integrated/basic adapters.
+        discrete = ("nvidia", "geforce", "rtx", "gtx", "quadro", "tesla",
+                    "radeon", "arc", "instinct")
+        for n in names:
+            if any(k in n.lower() for k in discrete):
+                return clean(n)
+        return ""
 
     # ── TAB 2: Models Configurator ──────────────────────────────────────────
     def _create_models_tab(self):
@@ -453,37 +828,30 @@ class Settings(QDialog):
             self._update_whisper_card_ui(name)
             
         # Section 2: Mistral AI Cloud STT Models
-        section_mistral = QLabel("Mistral AI Voxtral STT Models")
+        section_mistral = QLabel("Mistral Voxtral STT (Cloud)")
         section_mistral.setFont(QFont("Segoe UI", 12, QFont.Bold))
         section_mistral.setStyleSheet("color: #3b82f6; margin-top: 14px; margin-bottom: 2px;")
         scroll_lay.addWidget(section_mistral)
-        
-        mistral_notice = QLabel("Mistral's state-of-the-art Voxtral models run via the cloud (API Key Required).")
+
+        mistral_notice = QLabel(
+            "Cloud transcription. Pro: no key needed. Free: add your Mistral key below.  "
+            "Best for English and major European languages; for Armenian, use local "
+            "Whisper (Recommended) or Gemini.")
+        mistral_notice.setWordWrap(True)
         mistral_notice.setObjectName("subtitleLabel")
         mistral_notice.setStyleSheet("margin-bottom: 8px;")
         scroll_lay.addWidget(mistral_notice)
-        
-        # Define Mistral STT catalog
+
+        # Define Mistral STT catalog. The /audio/transcriptions endpoint only
+        # supports Voxtral Mini Transcribe; "small"/"large" are not valid there.
         self.mistral_cards = {}
         self.mistral_model_catalog = {
             "voxtral-mini-latest": {
-                "name": "Voxtral Mini",
+                "name": "Voxtral Mini Transcribe",
                 "badge": "Fast / Low Cost",
-                "specs": "Speed: Ultra Fast (~0.2s response)  ·  Smart dictation & audio understanding",
-                "description": "Optimized for basic edge and standard transcription tasks."
+                "specs": "Fast, accurate cloud transcription  ·  ~$0.003 / min",
+                "description": "Mistral's dedicated transcription model, optimized for speed and cost."
             },
-            "voxtral-small-latest": {
-                "name": "Voxtral Small",
-                "badge": "Balanced",
-                "specs": "Speed: Fast (~0.5s response)  ·  High accuracy & multi-language translation",
-                "description": "Production-scale high-capability model for balanced performance."
-            },
-            "voxtral-large-latest": {
-                "name": "Voxtral Large",
-                "badge": "Highest Quality",
-                "specs": "Speed: Moderate (~1.0s response)  ·  SOTA transcription & complex understanding",
-                "description": "Mistral's flagship, largest, and most capable voice understanding model."
-            }
         }
         
         for name, info in self.mistral_model_catalog.items():
@@ -493,16 +861,16 @@ class Settings(QDialog):
             self._update_mistral_card_ui(name)
             
         # Section 3: Google Cloud STT
-        section_google = QLabel("Google Cloud Speech STT")
+        section_google = QLabel("Google Gemini Speech (AI Studio)")
         section_google.setFont(QFont("Segoe UI", 12, QFont.Bold))
         section_google.setStyleSheet("color: #3b82f6; margin-top: 14px; margin-bottom: 2px;")
         scroll_lay.addWidget(section_google)
         
         google_info = {
-            "name": "Google Cloud Speech-to-Text API",
-            "badge": "Enterprise Cloud",
-            "specs": "Speed: Fast (~0.4s response)  ·  Robust, enterprise-grade cloud recognition",
-            "description": "Google's production speech recognition API with support for over 120 languages."
+            "name": "Google Gemini Speech",
+            "badge": "AI Studio key",
+            "specs": "Fast cloud transcription  ·  120+ languages",
+            "description": "Uses your free Google AI Studio (Gemini) API key. Paste it in Cloud API Credentials below."
         }
         self.google_card = self._build_google_card(google_info)
         scroll_lay.addWidget(self.google_card)
@@ -529,7 +897,7 @@ class Settings(QDialog):
         kf_lay.addWidget(self.mistral_key_input)
         
         m_test_lay = QHBoxLayout()
-        self.btn_test_mistral = QPushButton("Test API Key", self.keys_frame)
+        self.btn_test_mistral = QPushButton("Test", self.keys_frame)
         self.btn_test_mistral.setObjectName("secondaryButton")
         self.btn_test_mistral.setStyleSheet("padding: 4px 10px; font-size: 11px;")
         self.btn_test_mistral.clicked.connect(self._test_mistral_key)
@@ -537,11 +905,22 @@ class Settings(QDialog):
         self.lbl_status_mistral.setWordWrap(True)
         self.lbl_status_mistral.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.lbl_status_mistral.setStyleSheet("color: #64748b; font-size: 11px;")
+        _m_copy, _m_save = self._make_key_tool_buttons(
+            self.keys_frame, self.mistral_key_input, self.lbl_status_mistral,
+            lambda: self._save_single_key("mistral_api_key", self.mistral_key_input, self.lbl_status_mistral))
+        m_test_lay.addWidget(_m_copy)
         m_test_lay.addWidget(self.btn_test_mistral)
+        m_test_lay.addWidget(_m_save)
         m_test_lay.addWidget(self.lbl_status_mistral)
         kf_lay.addLayout(m_test_lay)
         
-        kf_lay.addWidget(QLabel("Google Speech API Key", self.keys_frame))
+        kf_lay.addWidget(QLabel("Google AI Studio (Gemini) API Key", self.keys_frame))
+        google_hint = QLabel(
+            "Get a free key at aistudio.google.com/apikey (this is a Gemini key, "
+            "not a Google Cloud Speech key).", self.keys_frame)
+        google_hint.setObjectName("subtitleLabel")
+        google_hint.setWordWrap(True)
+        kf_lay.addWidget(google_hint)
         self.google_key_input = QLineEdit(self.keys_frame)
         self.google_key_input.setPlaceholderText("AIzaSy...")
         self.google_key_input.setEchoMode(QLineEdit.Password)
@@ -550,7 +929,7 @@ class Settings(QDialog):
         kf_lay.addWidget(self.google_key_input)
 
         g_test_lay = QHBoxLayout()
-        self.btn_test_google = QPushButton("Test API Key", self.keys_frame)
+        self.btn_test_google = QPushButton("Test", self.keys_frame)
         self.btn_test_google.setObjectName("secondaryButton")
         self.btn_test_google.setStyleSheet("padding: 4px 10px; font-size: 11px;")
         self.btn_test_google.clicked.connect(self._test_google_key)
@@ -558,7 +937,12 @@ class Settings(QDialog):
         self.lbl_status_google.setWordWrap(True)
         self.lbl_status_google.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.lbl_status_google.setStyleSheet("color: #64748b; font-size: 11px;")
+        _g_copy, _g_save = self._make_key_tool_buttons(
+            self.keys_frame, self.google_key_input, self.lbl_status_google,
+            lambda: self._save_single_key("google_api_key", self.google_key_input, self.lbl_status_google))
+        g_test_lay.addWidget(_g_copy)
         g_test_lay.addWidget(self.btn_test_google)
+        g_test_lay.addWidget(_g_save)
         g_test_lay.addWidget(self.lbl_status_google)
         kf_lay.addLayout(g_test_lay)
         
@@ -618,31 +1002,73 @@ class Settings(QDialog):
         card_lay.addLayout(btn_lay)
         return card
 
+    def _cloud_card_needs_key(self, provider_name):
+        """Free users must add their own key (or upgrade to Pro for keyless cloud)."""
+        from PySide6.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setWindowTitle("Cloud transcription")
+        box.setText(
+            f"To use {provider_name} cloud transcription, add your API key below in "
+            f"Cloud API Credentials.\n\nOr upgrade to Pro to use it with no key - we "
+            f"handle the cloud for you.")
+        up = box.addButton("Upgrade to Pro", QMessageBox.AcceptRole)
+        addk = box.addButton("Add my key", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == up and self.app and hasattr(self.app, "_pro_upsell"):
+            self.app._pro_upsell("Keyless cloud transcription")
+        elif clicked == addk:
+            # Jump straight to the relevant key field so they can paste it.
+            fld = (self.mistral_key_input if "Mistral" in provider_name
+                   else getattr(self, "google_key_input", None))
+            if fld is not None:
+                fld.setFocus()
+                fld.setStyleSheet("border: 2px solid #3b82f6; background-color: #eff6ff;")
+
+    def _refresh_cloud_cards(self):
+        for m_name in list(self.whisper_cards.keys()):
+            self._update_whisper_card_ui(m_name)
+        for m_name in list(getattr(self, "mistral_cards", {}).keys()):
+            self._update_mistral_card_ui(m_name)
+        self._update_google_card_ui()
+
+    def _sync_managed_checkbox(self):
+        """Keep the 'Fast cloud transcription' checkbox mirroring the actual
+        backend - e.g. it unchecks itself when the user activates a local model."""
+        if hasattr(self, "chk_managed"):
+            self.chk_managed.blockSignals(True)
+            self.chk_managed.setChecked(self.cfg_working.get("backend") == "managed")
+            self.chk_managed.blockSignals(False)
+
     def _use_mistral(self, name):
-        if self.app:
+        if not self.app:
+            return
+        if self._is_pro():
+            # Pro: managed cloud (server key) - no BYO key needed.
+            self.cfg_working["backend"] = "managed"
+            self.cfg_working["managed_provider"] = "mistral"
+            self.cfg_working["mistral_stt_model"] = name
+        else:
+            if not (self.cfg_working.get("mistral_api_key") or "").strip():
+                self._cloud_card_needs_key("Mistral Voxtral")
+                return
             self.cfg_working["backend"] = "mistral"
             self.cfg_working["mistral_stt_model"] = name
-            
-            # Repopulate UIs
-            for m_name in list(self.whisper_cards.keys()):
-                self._update_whisper_card_ui(m_name)
-            for m_name in list(self.mistral_cards.keys()):
-                self._update_mistral_card_ui(m_name)
-            self._update_google_card_ui()
+        self._sync_managed_checkbox()
+        self._refresh_cloud_cards()
 
-    def _update_mistral_card_ui(self, name):
-        card = self.mistral_cards.get(name)
-        if not card:
-            return
-            
-        is_selected = (
-            self.cfg_working.get("backend") == "mistral" and 
-            self.cfg_working.get("mistral_stt_model") == name
-        )
-        
-        is_verified = getattr(self, "_mistral_key_verified", False)
-        is_active = is_selected and is_verified
-        
+    def _apply_cloud_card_state(self, card, provider, byo_selected, is_verified):
+        """Render a cloud STT card. Pro users get a keyless, Pro-styled button that
+        routes through the managed cloud; free users use their own key."""
+        pro = self._is_pro()
+        cw = self.cfg_working
+        managed_here = (cw.get("backend") == "managed" and cw.get("managed_provider") == provider)
+        is_active = (pro and managed_here) or (byo_selected and is_verified)
+
+        card.setStyleSheet("")
+        card.btn_action.setStyleSheet("")
+        card.btn_action.setEnabled(True)
+
         if is_active:
             card.setObjectName("activeCardFrame")
             card.lbl_state.setText("Active")
@@ -652,20 +1078,65 @@ class Settings(QDialog):
             card.btn_action.setObjectName("")
         else:
             card.setObjectName("cardFrame")
-            if is_selected:
-                card.lbl_state.setText("Selected (Needs Working Key)")
+            if pro:
+                card.lbl_state.setText("Pro · no key needed")
+                card.lbl_state.setStyleSheet("color: #a855f7; font-weight: bold;")
+                card.btn_action.setText("Use with Pro")
+                card.btn_action.setObjectName("")
+                card.btn_action.setStyleSheet(
+                    "background-color:#a855f7; border:1px solid #9333ea; color:white;"
+                    " font-weight:700; border-radius:6px; padding:6px 14px;")
+            elif byo_selected:
+                card.lbl_state.setText("Selected · needs key")
                 card.lbl_state.setStyleSheet("color: #f97316; font-weight: bold;")
+                card.btn_action.setText("Use Model")
+                card.btn_action.setObjectName("primaryButton")
             else:
                 card.lbl_state.setText("Cloud Model")
                 card.lbl_state.setStyleSheet("color: #64748b;")
-            card.btn_action.setText("Use Model")
-            card.btn_action.setEnabled(True)
-            card.btn_action.setObjectName("primaryButton")
-            
-        card.style().unpolish(card)
-        card.style().polish(card)
+                card.btn_action.setText("Use Model")
+                card.btn_action.setObjectName("primaryButton")
+
+        card.style().unpolish(card); card.style().polish(card)
         card.btn_action.style().unpolish(card.btn_action)
         card.btn_action.style().polish(card.btn_action)
+
+    def _privacy_on(self):
+        return bool(getattr(self, "chk_privacy", None) and self.chk_privacy.isChecked())
+
+    def _apply_disabled_cloud_card(self, card, state_text="Off in Privacy Mode"):
+        """Clean, readable 'deactivated' look for a cloud STT card: pale card, muted
+        state, and a clearly disabled (non-clickable) button - no dashed borders."""
+        card.setObjectName("cardFrame")
+        card.setEnabled(True)  # keep the text readable; only the button is disabled
+        card.setStyleSheet("QFrame#cardFrame { background-color: #f8fafc; border: 1px solid #e9eef5; }")
+        if hasattr(card, "lbl_state"):
+            card.lbl_state.setText(state_text)
+            card.lbl_state.setStyleSheet("color: #94a3b8; font-weight: 600;")
+        if hasattr(card, "btn_action"):
+            card.btn_action.setText("Use Model")
+            card.btn_action.setEnabled(False)
+            card.btn_action.setObjectName("")
+            card.btn_action.setStyleSheet(
+                "color:#94a3b8; background-color:#eef2f7; border:1px solid #e2e8f0; border-radius:6px;")
+        card.style().unpolish(card); card.style().polish(card)
+        if hasattr(card, "btn_action"):
+            card.btn_action.style().unpolish(card.btn_action)
+            card.btn_action.style().polish(card.btn_action)
+
+    def _update_mistral_card_ui(self, name):
+        card = self.mistral_cards.get(name)
+        if not card:
+            return
+        if self._privacy_on():
+            self._apply_disabled_cloud_card(card)
+            return
+        byo_selected = (
+            self.cfg_working.get("backend") == "mistral" and
+            self.cfg_working.get("mistral_stt_model") == name
+        )
+        self._apply_cloud_card_state(
+            card, "mistral", byo_selected, getattr(self, "_mistral_key_verified", False))
 
     def _build_google_card(self, info):
         card = QFrame()
@@ -718,51 +1189,160 @@ class Settings(QDialog):
         return card
 
     def _use_google(self):
-        if self.app:
+        if not self.app:
+            return
+        if self._is_pro():
+            self.cfg_working["backend"] = "managed"
+            self.cfg_working["managed_provider"] = "gemini"
+        else:
+            if not (self.cfg_working.get("google_api_key") or "").strip():
+                self._cloud_card_needs_key("Google Gemini")
+                return
             self.cfg_working["backend"] = "google"
-            
-            # Repopulate UIs
-            for m_name in list(self.whisper_cards.keys()):
-                self._update_whisper_card_ui(m_name)
-            if hasattr(self, "mistral_cards"):
-                for m_name in list(self.mistral_cards.keys()):
-                    self._update_mistral_card_ui(m_name)
-            self._update_google_card_ui()
+        self._sync_managed_checkbox()
+        self._refresh_cloud_cards()
 
     def _update_google_card_ui(self):
         card = getattr(self, "google_card", None)
         if not card:
             return
-            
-        is_selected = (self.cfg_working.get("backend") == "google")
-        is_verified = getattr(self, "_google_key_verified", False)
-        is_active = is_selected and is_verified
-        
-        if is_active:
-            card.setObjectName("activeCardFrame")
-            card.lbl_state.setText("Active")
-            card.lbl_state.setStyleSheet("color: #22c55e; font-weight: bold;")
-            card.btn_action.setText("Currently Active")
-            card.btn_action.setEnabled(False)
-            card.btn_action.setObjectName("")
-        else:
-            card.setObjectName("cardFrame")
-            if is_selected:
-                card.lbl_state.setText("Selected (Needs Working Key)")
-                card.lbl_state.setStyleSheet("color: #f97316; font-weight: bold;")
-            else:
-                card.lbl_state.setText("Cloud Model")
-                card.lbl_state.setStyleSheet("color: #64748b;")
-            card.btn_action.setText("Use Model")
-            card.btn_action.setEnabled(True)
-            card.btn_action.setObjectName("primaryButton")
-            
-        if card:
-            card.style().unpolish(card)
-            card.style().polish(card)
-            if hasattr(card, "btn_action"):
-                card.btn_action.style().unpolish(card.btn_action)
-                card.btn_action.style().polish(card.btn_action)
+        if self._privacy_on():
+            self._apply_disabled_cloud_card(card)
+            return
+        byo_selected = (self.cfg_working.get("backend") == "google")
+        self._apply_cloud_card_state(
+            card, "gemini", byo_selected, getattr(self, "_google_key_verified", False))
+
+    # ── Reusable API-key field controls: Show/Hide · Copy · Save ─────────────
+    def _set_key_status(self, label, text, color="#64748b"):
+        if label is not None:
+            label.setText(text)
+            label.setStyleSheet(f"color: {color}; font-size: 11px;")
+
+    def _add_eye_toggle(self, line_edit):
+        """An eye button INSIDE the field (trailing edge) that reveals/hides the
+        key - open eye while hidden ("click to see"), slashed once revealed."""
+        from ui.icons import eye_icon
+        from PySide6.QtWidgets import QLineEdit as _QLE
+        act = line_edit.addAction(eye_icon(True), _QLE.TrailingPosition)
+        act.setToolTip("Show or hide the key")
+
+        def _toggle():
+            hidden = line_edit.echoMode() == _QLE.Password
+            line_edit.setEchoMode(_QLE.Normal if hidden else _QLE.Password)
+            act.setIcon(eye_icon(not hidden))
+        act.triggered.connect(_toggle)
+        return act
+
+    def _copy_key(self, line_edit, status_label=None):
+        from PySide6.QtWidgets import QApplication
+        txt = (line_edit.text() or "").strip()
+        if not txt:
+            self._set_key_status(status_label, "Nothing to copy")
+            return
+        QApplication.clipboard().setText(txt)
+        self._set_key_status(status_label, "Copied to clipboard", "#16a34a")
+
+    def _mark_secrets_owner(self):
+        """Tag the saved keys as belonging to the current user so they survive an
+        account switch (and aren't shown to a different user)."""
+        if self.app is not None and hasattr(self.app, "_user_secret_id"):
+            try:
+                self.app.cfg["secrets_owner"] = self.app._user_secret_id()
+            except Exception:
+                pass
+
+    def _save_single_key(self, cfg_key, line_edit, status_label=None):
+        """Persist one key field (Mistral / Google) immediately + confirm."""
+        val = (line_edit.text() or "").strip()
+        self.cfg_working[cfg_key] = val
+        line_edit.setStyleSheet("")
+        if self.app:
+            self.app.cfg[cfg_key] = val
+            self._mark_secrets_owner()
+            self.app.save_config()
+        self._set_key_status(status_label, "Saved" if val else "Cleared", "#16a34a")
+
+    def _save_cloud_key(self):
+        """Persist the AI Actions cloud engine key (mapped to the right cfg field
+        by provider) immediately + confirm."""
+        self._save_action_configs()
+        if self.app:
+            self.app.cfg.update(self.cfg_working)
+            self._mark_secrets_owner()
+            self.app.save_config()
+        self._set_key_status(getattr(self, "_cloud_key_status", None), "Saved", "#16a34a")
+
+    def _make_key_tool_buttons(self, parent, line_edit, status_label, on_save):
+        """Wire a key field: eye toggle inside the field + (copy, save) buttons."""
+        self._add_eye_toggle(line_edit)
+        copy = QPushButton("Copy", parent)
+        copy.setObjectName("secondaryButton")
+        copy.setStyleSheet("padding: 4px 10px; font-size: 11px;")
+        copy.setToolTip("Copy the key to the clipboard")
+        copy.clicked.connect(lambda _=False, le=line_edit, sl=status_label: self._copy_key(le, sl))
+        save = QPushButton("Save", parent)
+        save.setObjectName("primaryButton")
+        save.setStyleSheet("padding: 4px 12px; font-size: 11px;")
+        save.setToolTip("Save this key")
+        save.clicked.connect(lambda _=False: on_save())
+        return copy, save
+
+    def _test_action_cloud_key(self):
+        """Validate the AI Actions cloud key for the selected provider."""
+        provider = self.combo_engine.currentData() if hasattr(self, "combo_engine") else None
+        key = self.cloud_api_key.text().strip()
+        if not key:
+            self._set_key_status(self._cloud_key_status, "✗ Key is empty", "#ef4444")
+            return
+        base = self.cloud_api_url.text().strip() if hasattr(self, "cloud_api_url") else ""
+        model = ""
+        if hasattr(self, "cloud_api_model"):
+            model = self.cloud_api_model.currentData() or self.cloud_api_model.currentText().strip()
+        self._set_key_status(self._cloud_key_status, "Testing…", "#3b82f6")
+        self.btn_test_cloud_key.setEnabled(False)
+
+        def worker():
+            ok, msg = self._validate_action_key(provider, key, base, model)
+            self.action_key_test_finished.emit(ok, msg)
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _validate_action_key(self, provider, key, base, model):
+        import requests
+        try:
+            if provider == actions.API_GEMINI_ID:
+                b = (base or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+                m = model or "gemini-2.5-flash"
+                r = requests.post(
+                    f"{b}/models/{m}:generateContent",
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    json={"contents": [{"parts": [{"text": "ping"}]}],
+                          "generationConfig": {"maxOutputTokens": 1}}, timeout=20)
+            elif provider == actions.API_ANTHROPIC_ID:
+                b = (base or "https://api.anthropic.com/v1").rstrip("/")
+                m = model or "claude-3-5-haiku-latest"
+                r = requests.post(
+                    f"{b}/messages",
+                    headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                             "Content-Type": "application/json"},
+                    json={"model": m, "max_tokens": 1,
+                          "messages": [{"role": "user", "content": "ping"}]}, timeout=20)
+            else:  # OpenAI-compatible
+                b = (base or "https://api.openai.com/v1").rstrip("/")
+                r = requests.get(f"{b}/models", headers={"Authorization": f"Bearer {key}"}, timeout=20)
+            if 200 <= r.status_code < 300:
+                return True, "✓ Working"
+            if r.status_code in (401, 403):
+                return False, "✗ Invalid API key"
+            return False, f"✗ HTTP {r.status_code}"
+        except requests.RequestException as e:
+            return False, f"✗ Connection error: {str(e)[:40]}"
+
+    def _on_action_key_test_finished(self, ok, message):
+        if hasattr(self, "btn_test_cloud_key"):
+            self.btn_test_cloud_key.setEnabled(True)
+        self._set_key_status(self._cloud_key_status, message, "#16a34a" if ok else "#ef4444")
 
     def _test_mistral_key(self):
         key = self.mistral_key_input.text().strip()
@@ -775,28 +1355,38 @@ class Settings(QDialog):
         self.lbl_status_mistral.setStyleSheet("color: #3b82f6; font-size: 11px; font-weight: bold;")
         self.btn_test_mistral.setEnabled(False)
         
+        import main as _m
+        model = _m.normalize_mistral_model(self.cfg_working.get("mistral_stt_model", "voxtral-mini-latest"))
+
         def worker():
-            import requests
+            import requests, io, wave, math, struct
+            import main as m
             try:
+                # Real end-to-end check: transcribe ~1s of a quiet tone with the
+                # selected Voxtral model. This validates the key AND model access
+                # AND credits - a plain key check would pass even when transcription
+                # later fails.
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as wf:
+                    wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
+                    frames = bytearray()
+                    for i in range(16000):
+                        frames += struct.pack("<h", int(800 * math.sin(2 * math.pi * 220 * i / 16000)))
+                    wf.writeframes(bytes(frames))
                 headers = {"Authorization": f"Bearer {key}"}
-                resp = requests.get("https://api.mistral.ai/v1/models", headers=headers, timeout=10)
+                files = {"file": ("test.wav", io.BytesIO(buf.getvalue()), "audio/wav")}
+                resp = requests.post(
+                    "https://api.mistral.ai/v1/audio/transcriptions",
+                    headers=headers, files=files, data={"model": model}, timeout=20,
+                )
                 if resp.status_code == 200:
                     self.mistral_test_finished.emit(True, "Working!")
                 else:
-                    err_msg = f"HTTP {resp.status_code}"
-                    try:
-                        err_json = resp.json()
-                        if "message" in err_json:
-                            err_msg = err_json["message"]
-                        elif "detail" in err_json:
-                            err_msg = str(err_json["detail"])
-                    except:
-                        if resp.text:
-                            err_msg = resp.text[:50]
-                    self.mistral_test_finished.emit(False, f"Invalid: {err_msg}")
+                    self.mistral_test_finished.emit(
+                        False, m.cloud_error_message("Mistral", resp.status_code, resp.text))
             except Exception as e:
                 self.mistral_test_finished.emit(False, f"Connection error: {str(e)[:50]}")
-                
+
         import threading
         threading.Thread(target=worker, daemon=True).start()
 
@@ -814,43 +1404,26 @@ class Settings(QDialog):
         def worker():
             import requests
             try:
-                url = f"https://speech.googleapis.com/v1/speech:recognize?key={key}"
-                payload = {
-                    "config": {
-                        "encoding": "LINEAR16",
-                        "sampleRateHertz": 16000,
-                        "languageCode": "en-US"
-                    },
-                    "audio": {
-                        "content": "AAAA"
-                    }
-                }
-                resp = requests.post(url, json=payload, timeout=10)
+                # Google AI Studio (Gemini) keys are validated against the models
+                # endpoint, which accepts a plain API key (unlike Cloud Speech).
+                url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
+                resp = requests.get(url, timeout=10)
                 if resp.status_code == 200:
                     self.google_test_finished.emit(True, "Working!")
                 else:
-                    err_msg, status = "", ""
+                    err_msg = ""
                     try:
-                        err_obj = resp.json().get("error", {})
-                        err_msg = err_obj.get("message", "")
-                        status = err_obj.get("status", "")
+                        err_msg = resp.json().get("error", {}).get("message", "")
                     except Exception:
                         err_msg = (resp.text or "")[:80]
-
                     low = err_msg.lower()
-                    if "api key not valid" in low or "api_key_invalid" in low:
-                        self.google_test_finished.emit(False, "Invalid API Key")
-                    elif status == "PERMISSION_DENIED" or "disabled" in low or "has not been used" in low:
-                        self.google_test_finished.emit(False, f"API key valid, but: {err_msg[:60]}")
-                    elif resp.status_code == 400:
-                        # Auth succeeded; the request was rejected only because of
-                        # the dummy test audio — the key itself works.
-                        self.google_test_finished.emit(True, "Working!")
+                    if "api key not valid" in low or "api_key_invalid" in low or resp.status_code == 400:
+                        self.google_test_finished.emit(False, "Invalid API key")
                     else:
                         self.google_test_finished.emit(False, f"HTTP {resp.status_code}: {err_msg[:50]}")
             except Exception as e:
                 self.google_test_finished.emit(False, f"Connection error: {str(e)[:50]}")
-                
+
         import threading
         threading.Thread(target=worker, daemon=True).start()
 
@@ -909,7 +1482,7 @@ class Settings(QDialog):
         card_lay.addLayout(title_row)
 
         # Specs row
-        specs = f"RAM: min {info.get('min_ram')} GB  ·  Speed: {info.get('speed')}"
+        specs = f"Needs ~{info.get('min_ram')} GB RAM  ·  {self._speed_phrase(info.get('speed_rank', 3))}"
         if info.get("armenian"):
             specs += f"  ·  {info.get('armenian')}"
         lbl_specs = QLabel(specs, card)
@@ -1053,16 +1626,26 @@ class Settings(QDialog):
         self.card_smart = self._build_mode_card(
             self.mode_section,
             "Smart actions",
-            "Detect intent from voice — e.g. say \"translate to russian: …\", "
+            "Detect intent from voice - e.g. say \"translate to russian: …\", "
             "\"write email to John\", or \"make a todo list\". The AI produces "
             "only the result.",
             checked=False,
         )
         self.rb_smart = self.card_smart.radio
+        self._smart_pro_badge = getattr(self.card_smart, "pro_badge", None)
+        if self._smart_pro_badge is not None:
+            self._smart_pro_badge.setVisible(True)
+        # Guest nudge: signing up is what grants the 5 free Smart Action trials.
+        self._smart_guest_hint = QLabel(
+            "Sign up free to get 5 Smart Action trials.", self.card_smart)
+        self._smart_guest_hint.setStyleSheet(
+            "color: #7c3aed; font-size: 12px; font-weight: 600; background: transparent;")
+        self._smart_guest_hint.setVisible(False)
+        self.card_smart.text_col.addWidget(self._smart_guest_hint)
         self.rb_smart.setToolTip(
             "When enabled, your dictation is run through a language model "
             "that detects whether you want a translation, email, todo "
-            "list, summary, or rewrite — and produces only that output. "
+            "list, summary, or rewrite - and produces only that output. "
             "If you don't ask for anything specific, your words are pasted "
             "as-is."
         )
@@ -1082,6 +1665,11 @@ class Settings(QDialog):
         # Make clicking anywhere on the card select that option.
         self.card_transcribe.mousePressEvent = lambda _e: self.rb_transcribe.setChecked(True)
         self.card_smart.mousePressEvent = lambda _e: self.rb_smart.setChecked(True)
+        # Apply the selected-card highlight to the initial state (the toggle
+        # handler isn't connected until after the initial setChecked above).
+        for _card, _sel in ((self.card_transcribe, self.rb_transcribe.isChecked()),
+                            (self.card_smart, self.rb_smart.isChecked())):
+            _card.setStyleSheet(self._mode_card_style(_sel))
 
         # Engine picker + config (only meaningful when Smart actions is on)
         self.engine_section = QWidget(content)
@@ -1106,14 +1694,18 @@ class Settings(QDialog):
         engine_lay.addWidget(QLabel("Primary Action Engine", engine_frame))
         
         self.combo_engine = QComboBox(engine_frame)
+        self.combo_engine.addItem("Transcribe Pro - managed cloud (no key needed)", actions.API_MANAGED_ID)
         self.combo_engine.addItem("Local Offline LLM Engine (Qwen / Gemma)", "local_llm")
         self.combo_engine.addItem("Rule-based Formatter (Fast, Local, Offline)", actions.RULE_BASED_ID)
         self.combo_engine.addItem("Google Gemini API (Cloud Engine)", actions.API_GEMINI_ID)
         self.combo_engine.addItem("OpenAI-compatible API (Cloud Engine)", actions.API_OPENAI_ID)
         self.combo_engine.addItem("Anthropic Claude API (Cloud Engine)", actions.API_ANTHROPIC_ID)
-        
+
         if self.app:
-            provider = self.cfg_working.get("action_model", "local_llm")
+            # Pro users default to the managed cloud (our key, zero setup);
+            # everyone else defaults to the local LLM.
+            _pro = entitlements.has_pro_access(self.app.auth, self.cfg_working)
+            provider = self.cfg_working.get("action_model", actions.API_MANAGED_ID if _pro else "local_llm")
             # Convert legacy values if present
             if provider in (local_llm.QWEN_TINY_ID, local_llm.QWEN_3B_ID, local_llm.QWEN_7B_ID, local_llm.GEMMA_2B_ID):
                 provider = "local_llm"
@@ -1122,6 +1714,9 @@ class Settings(QDialog):
                 self.combo_engine.setCurrentIndex(idx)
         self.combo_engine.currentIndexChanged.connect(self._on_engine_changed)
         self._configure_dropdown(self.combo_engine, min_width=320)
+        # Right-aligned LOCAL/PRO pills in the popup rows.
+        self.combo_engine.view().setItemDelegate(_PillItemDelegate(self.combo_engine.view()))
+        self._refresh_engine_availability()
         engine_lay.addWidget(self.combo_engine)
         engine_section_lay.addWidget(engine_frame)
 
@@ -1157,6 +1752,25 @@ class Settings(QDialog):
         self.cloud_api_key.textChanged.connect(self._save_action_configs)
         self.lay_cloud.addWidget(self.cloud_api_key)
 
+        # Show/Hide · Copy · Test · Save controls for the cloud action key.
+        ck_row = QHBoxLayout()
+        ck_row.setSpacing(6)
+        self._cloud_key_status = QLabel("", self.card_cloud)
+        self._cloud_key_status.setWordWrap(True)
+        self._cloud_key_status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._cloud_key_status.setStyleSheet("color: #64748b; font-size: 11px;")
+        _c_copy, _c_save = self._make_key_tool_buttons(
+            self.card_cloud, self.cloud_api_key, self._cloud_key_status, self._save_cloud_key)
+        self.btn_test_cloud_key = QPushButton("Test", self.card_cloud)
+        self.btn_test_cloud_key.setObjectName("secondaryButton")
+        self.btn_test_cloud_key.setStyleSheet("padding: 4px 10px; font-size: 11px;")
+        self.btn_test_cloud_key.clicked.connect(self._test_action_cloud_key)
+        ck_row.addWidget(_c_copy)
+        ck_row.addWidget(self.btn_test_cloud_key)
+        ck_row.addWidget(_c_save)
+        ck_row.addWidget(self._cloud_key_status)
+        self.lay_cloud.addLayout(ck_row)
+
         self.lbl_cloud_url = QLabel("API Base URL (Optional for standard endpoints)", self.card_cloud)
         self.lay_cloud.addWidget(self.lbl_cloud_url)
         self.cloud_api_url = QLineEdit(self.card_cloud)
@@ -1173,36 +1787,14 @@ class Settings(QDialog):
 
         self.engine_stack.addWidget(self.card_cloud)
 
-        # Card 2: Local LLM Configuration (GGUFs)
+        # Card 2: Local LLM Configuration (GGUFs). No separate selector dropdown -
+        # the model cards below ARE the selector ("Use Model" activates one).
         self.card_local_llm = QWidget()
         lay_llm = QVBoxLayout(self.card_local_llm)
         lay_llm.setContentsMargins(0, 0, 0, 0)
-        
-        # Local LLM selection combo
-        llm_pick_frame = QFrame(self.card_local_llm)
-        llm_pick_frame.setObjectName("cardFrame")
-        llm_p_lay = QVBoxLayout(llm_pick_frame)
-        llm_p_lay.addWidget(QLabel("Select Local AI Model", llm_pick_frame))
-        
-        self.combo_local_model = QComboBox(llm_pick_frame)
-        for val, info in local_llm.MODEL_CATALOG.items():
-            self.combo_local_model.addItem(info["label"], val)
-            
-        if self.app:
-            model = self.app.cfg.get("action_model", local_llm.QWEN_TINY_ID)
-            # Default fallback if cloud was active previously
-            if model not in local_llm.MODEL_CATALOG:
-                model = local_llm.QWEN_TINY_ID
-            idx = self.combo_local_model.findData(model)
-            if idx >= 0:
-                self.combo_local_model.setCurrentIndex(idx)
-        self.combo_local_model.currentIndexChanged.connect(self._on_local_llm_model_changed)
-        self._configure_dropdown(self.combo_local_model, show_all_items=True)
-        llm_p_lay.addWidget(self.combo_local_model)
-        lay_llm.addWidget(llm_pick_frame)
 
-        # GGUF model cards — scroll with the whole tab (no nested mini-scroll)
-        llm_cards_label = QLabel("Local model downloads", self.card_local_llm)
+        # GGUF model cards - scroll with the whole tab (no nested mini-scroll)
+        llm_cards_label = QLabel("Local AI models - download once, then Use Model to activate", self.card_local_llm)
         llm_cards_label.setObjectName("subtitleLabel")
         llm_cards_label.setStyleSheet("font-weight: 600; color: #475569; margin-top: 4px;")
         lay_llm.addWidget(llm_cards_label)
@@ -1214,6 +1806,36 @@ class Settings(QDialog):
             self._update_llm_card_ui(name)
 
         self.engine_stack.addWidget(self.card_local_llm)
+
+        # Card 3: Managed Pro cloud (no configuration, no key). The stack sizes
+        # itself to its TALLEST page (the cloud key form), so the card is hosted
+        # in a top-aligned container - the card itself stays compact instead of
+        # stretching into a huge empty purple box.
+        managed_page = QWidget()
+        managed_page_lay = QVBoxLayout(managed_page)
+        managed_page_lay.setContentsMargins(0, 0, 0, 0)
+        self.card_managed = QFrame(managed_page)
+        self.card_managed.setObjectName("cardFrame")
+        self.card_managed.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        lay_managed = QVBoxLayout(self.card_managed)
+        lay_managed.setContentsMargins(16, 14, 16, 14)
+        lay_managed.setSpacing(6)
+        _mtitle = QLabel("Managed by Transcribe Pro", self.card_managed)
+        _mtitle.setStyleSheet("font-weight: 700; font-size: 16px; color: #6d28d9;")
+        lay_managed.addWidget(_mtitle)
+        _mbody = QLabel(
+            "Your Smart Actions run on our servers with a high-quality model - "
+            "no API key, no setup, included with Pro. Nothing to configure here.",
+            self.card_managed,
+        )
+        _mbody.setWordWrap(True)
+        _mbody.setStyleSheet("color: #475569; font-size: 14px;")
+        lay_managed.addWidget(_mbody)
+        self._apply_pro_glow(self.card_managed)
+        managed_page_lay.addWidget(self.card_managed, 0, Qt.AlignTop)
+        managed_page_lay.addStretch(1)
+        self.engine_stack.addWidget(managed_page)
 
         engine_section_lay.addWidget(self.engine_stack)
         layout.addWidget(self.engine_section)
@@ -1241,16 +1863,41 @@ class Settings(QDialog):
         self._refresh_mode_cards_layout()
         # Initial enabled state: engine controls active only in Smart mode.
         if hasattr(self, "engine_section"):
-            self.engine_section.setEnabled(self.rb_smart.isChecked())
+            self.engine_section.setEnabled(True)  # always selectable, even in transcribe-only
         return tab
+
+    def _is_pro(self):
+        return bool(self.app and hasattr(self.app, "is_pro") and self.app.is_pro())
+
+    def _can_use_smart(self):
+        try:
+            auth = getattr(self.app, "auth", None) if self.app else None
+            cfg = self.app.cfg if self.app else None
+            return entitlements.can_use_smart_action(auth, cfg)
+        except Exception:
+            return True
 
     def _on_output_mode_changed(self):
         is_smart = self.rb_smart.isChecked()
+
+        # Smart Actions: Pro = unlimited; non-Pro can select it while they still
+        # have free tries left. Only bounce + upsell once the 5 tries are gone.
+        if is_smart and self.app and not self._is_pro() and not self._can_use_smart():
+            self.rb_transcribe.blockSignals(True)
+            self.rb_smart.blockSignals(True)
+            self.rb_transcribe.setChecked(True)
+            self.rb_smart.setChecked(False)
+            self.rb_transcribe.blockSignals(False)
+            self.rb_smart.blockSignals(False)
+            is_smart = False
+            if hasattr(self.app, "_pro_upsell"):
+                self.app._pro_upsell("Smart Actions")
+
         # Engine controls stay visible at all times; they're just disabled
         # (grayed out) when Transcribe-only is selected. No hide/expand so the
         # layout never shifts.
         if hasattr(self, "engine_section"):
-            self.engine_section.setEnabled(is_smart)
+            self.engine_section.setEnabled(True)
         new_mode = actions.ACTION_SMART_AUTO if is_smart else actions.ACTION_TRANSCRIBE_ONLY
         self.cfg_working["output_action"] = new_mode
         for card, sel in (
@@ -1265,7 +1912,7 @@ class Settings(QDialog):
 
         The engine section is always visible now (just enabled/disabled), so
         the cards no longer need to expand to fill space when Transcribe-only
-        is selected — that previously caused the giant-empty-card layout.
+        is selected - that previously caused the giant-empty-card layout.
         """
         if not hasattr(self, "card_transcribe"):
             return
@@ -1294,6 +1941,9 @@ class Settings(QDialog):
         outer.setSpacing(0)
 
         row_host = QWidget(card)
+        # Plain QWidget containers otherwise inherit the global grey QWidget
+        # background (#f8fafc), which shows up as an ugly box behind the text.
+        row_host.setStyleSheet("background: transparent;")
         row_host.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
         )
@@ -1309,12 +1959,21 @@ class Settings(QDialog):
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(4)
 
+        # Title + badge share the top row, so the badge always has its own space
+        # and never competes with the wrapping description below it.
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
         lbl_title = QLabel(title, row_host)
         lbl_title.setStyleSheet("font-size: 15px; font-weight: 600; color: #0f172a;")
-        lbl_title.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
-        )
-        text_col.addWidget(lbl_title)
+        title_row.addWidget(lbl_title)
+        title_row.addStretch(1)
+        # Hidden PRO / "N/5 FREE" pill - shown for non-Pro users.
+        pro_badge = QLabel("PRO", row_host)
+        pro_badge.setObjectName("proBadge")
+        pro_badge.setVisible(False)
+        title_row.addWidget(pro_badge, 0, Qt.AlignVCenter)
+        text_col.addLayout(title_row)
 
         lbl_desc = QLabel(description, row_host)
         lbl_desc.setObjectName("subtitleLabel")
@@ -1326,10 +1985,29 @@ class Settings(QDialog):
         text_col.addWidget(lbl_desc)
 
         row.addLayout(text_col, 1)
+
         outer.addWidget(row_host, 0, Qt.AlignTop)
         outer.addStretch(1)
         card.radio = radio
+        card.pro_badge = pro_badge
+        card.text_col = text_col
         return card
+
+    # Badges inside the mode cards get an explicit stylesheet: the cards have
+    # their own stylesheet (selected/unselected backgrounds), and in Qt the
+    # closest stylesheet wins - which washed out the app-level #proBadge rule
+    # (white text on the card background). Inline CSS makes them deterministic.
+    _PRO_BADGE_CSS = (
+        "QLabel { background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+        " stop:0 rgba(168, 85, 247, 235), stop:1 rgba(126, 34, 206, 235));"
+        " color: #ffffff; border: 1px solid rgba(255, 255, 255, 150);"
+        " border-radius: 9px; font-size: 11px; font-weight: bold; padding: 2px 10px; }"
+    )
+    _FREE_BADGE_CSS = (
+        "QLabel { background-color: rgba(34, 197, 94, 45); color: #15803d;"
+        " border: 1px solid rgba(34, 197, 94, 120);"
+        " border-radius: 9px; font-size: 11px; font-weight: bold; padding: 2px 10px; }"
+    )
 
     @staticmethod
     def _mode_card_style(selected):
@@ -1348,6 +2026,16 @@ class Settings(QDialog):
             "  background: #ffffff;"
             "}"
         )
+
+    def _refresh_mode_card_styles(self):
+        """Apply the selected/unselected highlight to both mode cards from the
+        current radio state (so exactly one ever looks selected)."""
+        for card, rb in (
+            (getattr(self, "card_transcribe", None), getattr(self, "rb_transcribe", None)),
+            (getattr(self, "card_smart", None), getattr(self, "rb_smart", None)),
+        ):
+            if card is not None and rb is not None:
+                card.setStyleSheet(self._mode_card_style(rb.isChecked()))
 
     def _build_llm_card(self, name, info):
         card = QFrame()
@@ -1463,21 +2151,68 @@ class Settings(QDialog):
         card.btn_action.style().unpolish(card.btn_action)
         card.btn_action.style().polish(card.btn_action)
 
+    def _refresh_engine_availability(self):
+        """Pills on the engine dropdown: PRO (purple, right-aligned) on the
+        managed cloud row - always active so a free user can tap it and get the
+        paywall (see _on_engine_changed) - and LOCAL (green) on the on-device
+        engines. A stale managed selection for a non-Pro user heals silently."""
+        if not hasattr(self, "combo_engine"):
+            return
+        model = self.combo_engine.model()
+        # LOCAL tags on the on-device engines (privacy-friendly choices).
+        for local_id in ("local_llm", actions.RULE_BASED_ID):
+            lidx = self.combo_engine.findData(local_id)
+            if lidx >= 0 and model.item(lidx) is not None:
+                model.item(lidx).setData("local", _PillItemDelegate.PILL_ROLE)
+        pro = self._is_pro()
+        idx = self.combo_engine.findData(actions.API_MANAGED_ID)
+        if idx < 0:
+            return
+        item = model.item(idx)
+        if item is not None:
+            item.setEnabled(True)  # selectable for everyone; gating is the paywall
+            item.setData("pro", _PillItemDelegate.PILL_ROLE)
+        if not pro and self.combo_engine.currentData() == actions.API_MANAGED_ID:
+            self.combo_engine.blockSignals(True)
+            ridx = self.combo_engine.findData(actions.RULE_BASED_ID)
+            if ridx >= 0:
+                self.combo_engine.setCurrentIndex(ridx)
+            self.combo_engine.blockSignals(False)
+            self.cfg_working["action_model"] = actions.RULE_BASED_ID
+            # During tab construction the stack doesn't exist yet; the later
+            # _load_values_into_widgets pass sets the panel from the combo.
+            if hasattr(self, "engine_stack"):
+                self._set_backend_layout(actions.RULE_BASED_ID)
+
     def _on_engine_changed(self, idx):
         provider = self.combo_engine.itemData(idx)
+        # Managed engine is Pro-only: a free/guest user choosing it gets the
+        # paywall, and the selection reverts to their previous engine.
+        if provider == actions.API_MANAGED_ID and not self._is_pro():
+            prev = self.cfg_working.get("action_model", actions.RULE_BASED_ID)
+            if prev in local_llm.MODEL_CATALOG:
+                prev = "local_llm"
+            ridx = self.combo_engine.findData(prev)
+            if ridx < 0 or prev == actions.API_MANAGED_ID:
+                ridx = self.combo_engine.findData(actions.RULE_BASED_ID)
+            self.combo_engine.blockSignals(True)
+            self.combo_engine.setCurrentIndex(max(0, ridx))
+            self.combo_engine.blockSignals(False)
+            self._set_backend_layout(self.combo_engine.currentData())
+            if self.app and hasattr(self.app, "_pro_upsell"):
+                self.app._pro_upsell("Managed Smart Actions")
+            return
         self._set_backend_layout(provider)
         self._save_action_configs()
 
-    def _on_local_llm_model_changed(self, idx):
-        model_id = self.combo_local_model.itemData(idx)
-        if self.app:
-            self.cfg_working["action_model"] = model_id
 
     def _set_backend_layout(self, provider):
         if provider == actions.RULE_BASED_ID:
             self.engine_stack.setCurrentIndex(0)
         elif provider == "local_llm":
             self.engine_stack.setCurrentIndex(2)
+        elif provider == actions.API_MANAGED_ID:
+            self.engine_stack.setCurrentIndex(3)
         else:
             self.engine_stack.setCurrentIndex(1)
             
@@ -1488,7 +2223,9 @@ class Settings(QDialog):
             
             self.cloud_api_model.clear()
             
-            gemini_models = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-1.5-flash"]
+            # gemini-1.5-flash was removed by Google (404 on v1beta) - verified
+            # against the live API; keep this list to models that actually work.
+            gemini_models = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3.5-flash", "gemini-3.1-flash-lite"]
             anthropic_models = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest", "claude-3-5-opus-latest", "claude-3-haiku-20240307", "claude-3-opus-20240229"]
             openai_models = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"]
             
@@ -1498,10 +2235,9 @@ class Settings(QDialog):
                 models_info = [
                     ("gemini-2.5-flash (~$0.075 / 1M tokens)", "gemini-2.5-flash"),
                     ("gemini-2.5-flash-lite (~$0.0375 / 1M tokens)", "gemini-2.5-flash-lite"),
-                    ("gemini-2.5-pro (~$1.25 / 1M tokens)", "gemini-2.5-pro"),
+                    ("gemini-2.5-pro (~$1.25 / 1M tokens, needs paid tier)", "gemini-2.5-pro"),
                     ("gemini-3.5-flash (~$0.075 / 1M tokens)", "gemini-3.5-flash"),
                     ("gemini-3.1-flash-lite (~$0.0375 / 1M tokens)", "gemini-3.1-flash-lite"),
-                    ("gemini-1.5-flash (~$0.075 / 1M tokens)", "gemini-1.5-flash"),
                 ]
                 for label, model_id in models_info:
                     self.cloud_api_model.addItem(label, model_id)
@@ -1510,6 +2246,8 @@ class Settings(QDialog):
                 
                 saved_model = self.cfg_working.get("action_api_model", "") or "gemini-2.5-flash"
                 if saved_model in set(anthropic_models + openai_models):
+                    saved_model = "gemini-2.5-flash"
+                if saved_model == "gemini-1.5-flash":  # removed by Google (404)
                     saved_model = "gemini-2.5-flash"
                 
                 idx = self.cloud_api_model.findData(saved_model)
@@ -1623,12 +2361,27 @@ class Settings(QDialog):
             
         self._save_action_configs()
 
+    def _on_privacy_toggled(self, _state=None):
+        # Privacy Mode is global and immediate (mirrors the tray toggle): apply it
+        # to the live app config and rebuild the tray now, not only on Save, so the
+        # in-app checkbox and the tray switch always agree.
+        self._save_general_configs()
+        if self.app and hasattr(self.app, "set_privacy_mode"):
+            self.app.set_privacy_mode(self.chk_privacy.isChecked(), notify=False)
+
     def _save_general_configs(self):
         if not self.app:
             return
         self.cfg_working["language"] = self.combo_lang.currentData()
         self.cfg_working["initial_prompt"] = self.vocab_input.toPlainText().strip()
         self.cfg_working["privacy_mode"] = self.chk_privacy.isChecked()
+        # Privacy Mode and Cloud transcription are mutually exclusive.
+        if self.chk_privacy.isChecked() and hasattr(self, "chk_managed") and self.chk_managed.isChecked():
+            self.chk_managed.blockSignals(True)
+            self.chk_managed.setChecked(False)
+            self.chk_managed.blockSignals(False)
+            if self.cfg_working.get("backend") == "managed":
+                self.cfg_working["backend"] = "local"
         if hasattr(self, "combo_device"):
             self.cfg_working["meeting_audio_mode"] = self.combo_device.currentData()
         if hasattr(self, "google_key_input"):
@@ -1656,12 +2409,10 @@ class Settings(QDialog):
                     for m_name in list(self.mistral_cards.keys()):
                         self._update_mistral_card_ui(m_name)
         if self.chk_privacy.isChecked():
-            self.cfg_working["save_history"] = False
-            if hasattr(self, "chk_history"):
-                self.chk_history.blockSignals(True)
-                self.chk_history.setChecked(False)
-                self.chk_history.blockSignals(False)
-            
+            # Privacy Mode only blocks the cloud - local history is left to the
+            # user's own "Save local transcription history" setting (it stays on
+            # the device).
+
             # Force backend to local offline Whisper if privacy is on
             if self.cfg_working.get("backend") in ("mistral", "google"):
                 self.cfg_working["backend"] = "local"
@@ -1689,67 +2440,79 @@ class Settings(QDialog):
 
     def _update_privacy_ui_state(self):
         is_private = self.chk_privacy.isChecked() if hasattr(self, "chk_privacy") else False
-        
-        # Disable/grey out Mistral cards
+        PALE = "QFrame { background-color: #f8fafc; border: 1px solid #e9eef5; border-radius: 10px; }"
+
+        # Fast cloud transcription sends audio off-device, so Privacy Mode turns it
+        # off and locks it. The PRO badge stays visible but pales (not hidden).
+        if hasattr(self, "chk_managed"):
+            self.chk_managed.setEnabled(not is_private)
+            self.chk_managed.setToolTip(
+                "Disabled by Privacy Mode (everything stays on your device)" if is_private else ""
+            )
+            if is_private and self.chk_managed.isChecked():
+                self.chk_managed.blockSignals(True)
+                self.chk_managed.setChecked(False)
+                self.chk_managed.blockSignals(False)
+                if self.cfg_working.get("backend") == "managed":
+                    self.cfg_working["backend"] = "local"
+        if hasattr(self, "_cloud_pro_badge"):
+            self._cloud_pro_badge.setStyleSheet(
+                "background-color:#e2e8f0; color:#94a3b8; border-radius:6px; padding:1px 6px; font-weight:700;"
+                if is_private else self._PRO_BADGE_CSS
+            )
+
+        # Cloud STT cards render their own privacy-aware disabled look (pale card +
+        # disabled button), so just refresh them - no dashed overlay.
         if hasattr(self, "mistral_cards"):
-            for name, card in self.mistral_cards.items():
-                card.setEnabled(not is_private)
-                if is_private:
-                    card.setStyleSheet("background-color: #f1f5f9; border: 1px dashed #cbd5e1;")
-                else:
-                    self._update_mistral_card_ui(name)
-                    
-        # Disable/grey out Google card
-        if hasattr(self, "google_card") and self.google_card:
-            self.google_card.setEnabled(not is_private)
-            if is_private:
-                self.google_card.setStyleSheet("background-color: #f1f5f9; border: 1px dashed #cbd5e1;")
-            else:
-                self._update_google_card_ui()
-                
-        # Disable/grey out API credentials frame
-        if hasattr(self, "keys_frame") and self.keys_frame:
-            self.keys_frame.setEnabled(not is_private)
-            if is_private:
-                self.keys_frame.setStyleSheet("background-color: #f1f5f9; border: 1px dashed #cbd5e1;")
-            else:
-                self.keys_frame.setStyleSheet("")
+            for name in list(self.mistral_cards.keys()):
+                self._update_mistral_card_ui(name)
+        if getattr(self, "google_card", None):
+            self._update_google_card_ui()
 
-        # Disable/grey out cloud options in combo_engine dropdown
-        if hasattr(self, "combo_engine") and self.combo_engine:
+        # Cloud API credentials + cloud action config frames: clean pale lock.
+        for attr in ("keys_frame", "card_cloud"):
+            frame = getattr(self, attr, None)
+            if frame:
+                frame.setEnabled(not is_private)
+                frame.setStyleSheet(PALE if is_private else "")
+
+        # Cloud engines in the AI Actions dropdown - disable any engine that
+        # leaves the device under Privacy Mode (matched by id, not index).
+        if getattr(self, "combo_engine", None):
+            cloud_ids = {
+                actions.API_MANAGED_ID, actions.API_GEMINI_ID,
+                actions.API_OPENAI_ID, actions.API_ANTHROPIC_ID,
+            }
             model = self.combo_engine.model()
-            # Indexes 2, 3, and 4 in self.combo_engine are the cloud engines:
-            # Index 2: Google Gemini API
-            # Index 3: OpenAI-compatible API
-            # Index 4: Anthropic Claude API
-            for i in (2, 3, 4):
+            for i in range(self.combo_engine.count()):
                 item = model.item(i)
-                if item:
+                if item and self.combo_engine.itemData(i) in cloud_ids:
                     item.setEnabled(not is_private)
-                    if is_private:
-                        item.setForeground(QColor("#cbd5e1"))
-                    else:
-                        item.setForeground(QColor("#1e293b"))
-            if is_private and self.combo_engine.currentIndex() in (2, 3, 4):
-                self.combo_engine.setCurrentIndex(1) # Switch to Rule-based Formatter
-
-        # Disable/grey out card_cloud API config frame
-        if hasattr(self, "card_cloud") and self.card_cloud:
-            self.card_cloud.setEnabled(not is_private)
-            if is_private:
-                self.card_cloud.setStyleSheet("background-color: #f1f5f9; border: 1px dashed #cbd5e1;")
-            else:
-                self.card_cloud.setStyleSheet("")
+                    item.setForeground(QColor("#cbd5e1") if is_private else QColor("#1e293b"))
+            if is_private and self.combo_engine.currentData() in cloud_ids:
+                idx = self.combo_engine.findData(actions.RULE_BASED_ID)
+                if idx >= 0:
+                    self.combo_engine.setCurrentIndex(idx)  # back to Rule-based Formatter
 
     def _save_action_configs(self):
         if not self.app:
             return
         provider = self.combo_engine.currentData()
-        
+
         if provider == "local_llm":
-            self.cfg_working["action_model"] = self.combo_local_model.currentData()
+            # The active local model is whatever card the user pressed "Use
+            # Model" on; keep it if valid, else fall back to the default.
+            import local_llm
+            current = self.cfg_working.get("action_model")
+            if current not in local_llm.MODEL_CATALOG:
+                self.cfg_working["action_model"] = local_llm.QWEN_TINY_ID
         elif provider == actions.RULE_BASED_ID:
             self.cfg_working["action_model"] = actions.RULE_BASED_ID
+        elif provider == actions.API_MANAGED_ID:
+            # Managed Pro cloud: nothing to configure, no key to store. Never
+            # persist it for a non-Pro user (the option is grayed out anyway).
+            self.cfg_working["action_model"] = (
+                actions.API_MANAGED_ID if self._is_pro() else actions.RULE_BASED_ID)
         else: # Cloud API config saving
             self.cfg_working["action_model"] = provider
             key_text = self.cloud_api_key.text().strip()
@@ -1771,44 +2534,116 @@ class Settings(QDialog):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
 
+        # Actions row (clear / export).
         hist_frame = QFrame(tab)
         hist_frame.setObjectName("cardFrame")
         h_lay = QVBoxLayout(hist_frame)
-        h_lay.addWidget(QLabel("Transcription History Database", hist_frame))
-        
+        h_lay.addWidget(QLabel("Transcription History", hist_frame))
+
         btn_lay = QHBoxLayout()
         btn_clear = QPushButton("Clear All History", hist_frame)
         btn_clear.clicked.connect(self._clear_all_history)
         btn_lay.addWidget(btn_clear)
-        
+
         btn_exp_csv = QPushButton("Export CSV", hist_frame)
         btn_exp_csv.clicked.connect(lambda: self._export_history("csv"))
         btn_lay.addWidget(btn_exp_csv)
-        
+
         btn_exp_txt = QPushButton("Export TXT", hist_frame)
         btn_exp_txt.clicked.connect(lambda: self._export_history("txt"))
         btn_lay.addWidget(btn_exp_txt)
         h_lay.addLayout(btn_lay)
         layout.addWidget(hist_frame)
 
-        # History toggle checkbox
+        # Search box.
+        self._history_search = QLineEdit(tab)
+        self._history_search.setPlaceholderText("Search your transcripts...")
+        self._history_search.setClearButtonEnabled(True)
+        self._history_search.setMinimumHeight(34)
+        self._history_search.textChanged.connect(lambda _t: self._populate_history_list())
+        layout.addWidget(self._history_search)
+
+        # Scrollable list of past transcripts and AI outputs (newest first).
+        self._history_scroll = QScrollArea(tab)
+        self._history_scroll.setWidgetResizable(True)
+        self._history_scroll.setFrameShape(QFrame.NoFrame)
+        self._history_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._history_container = QWidget()
+        self._history_vlay = QVBoxLayout(self._history_container)
+        self._history_vlay.setContentsMargins(0, 0, 0, 0)
+        self._history_vlay.setSpacing(8)
+        self._history_scroll.setWidget(self._history_container)
+        layout.addWidget(self._history_scroll, 1)
+        self._populate_history_list()
+
+        # History toggle checkbox.
         self.chk_history = QCheckBox("Save local transcription history", tab)
         if self.app:
             self.chk_history.setChecked(bool(self.cfg_working.get("save_history", True)))
         self.chk_history.stateChanged.connect(self._save_history_config)
         layout.addWidget(self.chk_history)
 
-        # Telemetry Consent checkbox
+        # Telemetry Consent checkbox.
         self.chk_telemetry = QCheckBox("Share anonymous usage metrics to improve Armenian AI models", tab)
         if self.app:
             self.chk_telemetry.setChecked(bool(self.app.cfg.get("analytics_enabled", True)))
         self.chk_telemetry.stateChanged.connect(self._save_telemetry_config)
         layout.addWidget(self.chk_telemetry)
 
-        layout.addStretch()
         return tab
+
+    def _populate_history_list(self):
+        """(Re)build the scrollable transcript list from saved history."""
+        if not hasattr(self, "_history_vlay"):
+            return
+        while self._history_vlay.count():
+            item = self._history_vlay.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        query = self._history_search.text().strip() if hasattr(self, "_history_search") else ""
+        try:
+            entries = hist.search(query) if query else hist.load()
+        except Exception:
+            entries = []
+
+        if not entries:
+            if query:
+                msg = "No transcripts match your search."
+            elif not self.cfg_working.get("save_history", True):
+                msg = ("History saving is off. Turn on “Save local transcription "
+                       "history” below to keep a searchable log here.")
+            else:
+                msg = "No transcripts yet. Your dictations and AI outputs will appear here."
+            empty = QLabel(msg)
+            empty.setObjectName("subtitleLabel")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setWordWrap(True)
+            empty.setContentsMargins(0, 28, 0, 28)
+            self._history_vlay.addWidget(empty)
+            self._history_vlay.addStretch()
+            return
+
+        for e in entries[:100]:
+            card = QFrame()
+            card.setObjectName("cardFrame")
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(12, 10, 12, 10)
+            cl.setSpacing(3)
+            meta_bits = [b for b in (e.get("timestamp", ""), e.get("language", ""),
+                                     e.get("backend", "")) if b]
+            meta = QLabel("   ·   ".join(meta_bits), card)
+            meta.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            cl.addWidget(meta)
+            body = QLabel(e.get("text", ""), card)
+            body.setWordWrap(True)
+            body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            cl.addWidget(body)
+            self._history_vlay.addWidget(card)
+        self._history_vlay.addStretch()
 
     def _clear_all_history(self):
         reply = QMessageBox.question(
@@ -1818,6 +2653,7 @@ class Settings(QDialog):
         )
         if reply == QMessageBox.Yes:
             hist.clear()
+            self._populate_history_list()
             QMessageBox.information(self, "Success", "History has been cleared successfully.")
 
     def _export_history(self, fmt):
@@ -1841,7 +2677,13 @@ class Settings(QDialog):
     def _save_history_config(self):
         if not self.app:
             return
-        self.cfg_working["save_history"] = self.chk_history.isChecked()
+        on = self.chk_history.isChecked()
+        self.cfg_working["save_history"] = on
+        # Apply immediately (not only on Save): turning it off must stop saving
+        # right away, and turning it on must start saving right away.
+        self.app.cfg["save_history"] = on
+        self.app.save_config()
+        self._populate_history_list()
 
     def _save_telemetry_config(self):
         if not self.app:
@@ -1902,10 +2744,24 @@ class Settings(QDialog):
         from PySide6.QtGui import QPixmap
 
         lbl_aibuben_logo = QLabel(aibuben_frame)
-        logo_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "aibuben_logo.png")
+        # Resolve the asset in a PyInstaller-safe way: bundled builds put assets
+        # under sys._MEIPASS, while running from source uses the repo path. Using
+        # the same resource_path() helper as main.py means the logo renders in the
+        # packaged app instead of falling back to text.
+        try:
+            from main import resource_path
+            logo_path = resource_path("assets", "aibuben_logo.png")
+        except Exception:
+            logo_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "assets", "aibuben_logo.png",
+            )
         pixmap = QPixmap(logo_path)
         if not pixmap.isNull():
-            lbl_aibuben_logo.setPixmap(pixmap.scaledToHeight(55, Qt.SmoothTransformation))
+            # Bound to a tidy box, preserving the wordmark's aspect ratio.
+            lbl_aibuben_logo.setPixmap(
+                pixmap.scaled(280, 80, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
         else:
             lbl_aibuben_logo.setText("Powered by AIBUBEN")
             lbl_aibuben_logo.setStyleSheet("font-size: 14px; font-weight: bold; color: #3b82f6;")
@@ -1913,7 +2769,7 @@ class Settings(QDialog):
         aibuben_lay.addWidget(lbl_aibuben_logo)
 
         lbl_aibuben_desc = QLabel(
-            "This project is proud to be part of the <b>AIBUBEN</b> AI community in Yerevan—"
+            "This project is proud to be part of the <b>AIBUBEN</b> AI community in Yerevan-"
             "empowering AI builders, creators, and students to learn, connect, and build state-of-the-art products.",
             aibuben_frame
         )
@@ -1929,13 +2785,13 @@ class Settings(QDialog):
         links_layout.setSpacing(24)
 
         lbl_web_link = QLabel(aibuben_frame)
-        lbl_web_link.setText("<a href='https://aibuben.xyz' style='color: #3b82f6; text-decoration: none; font-weight: bold;'>🌐 Visit aibuben.xyz</a>")
+        lbl_web_link.setText("<a href='https://aibuben.xyz' style='color: #3b82f6; text-decoration: none; font-weight: bold;'>Visit aibuben.xyz</a>")
         lbl_web_link.setOpenExternalLinks(True)
         lbl_web_link.setStyleSheet("font-size: 12px;")
         links_layout.addWidget(lbl_web_link)
 
         lbl_linkedin_link = QLabel(aibuben_frame)
-        lbl_linkedin_link.setText("<a href='https://www.linkedin.com/in/aram-adamyan-2k/' style='color: #0077b5; text-decoration: none; font-weight: bold;'>🔗 Aram Adamyan on LinkedIn</a>")
+        lbl_linkedin_link.setText("<a href='https://www.linkedin.com/in/aram-adamyan-2k/' style='color: #0077b5; text-decoration: none; font-weight: bold;'>Aram Adamyan on LinkedIn</a>")
         lbl_linkedin_link.setOpenExternalLinks(True)
         lbl_linkedin_link.setStyleSheet("font-size: 12px;")
         links_layout.addWidget(lbl_linkedin_link)
@@ -1969,7 +2825,7 @@ class Settings(QDialog):
 
         lbl_github_link = QLabel(contrib_frame)
         lbl_github_link.setText(
-            "<a href='https://github.com/Aram2K/transcribe-app' style='color: #22c55e; text-decoration: none; font-weight: bold;'>💻 Contribute on GitHub / Aram2K/transcribe-app</a>"
+            "<a href='https://github.com/Aram2K/transcribe-app' style='color: #22c55e; text-decoration: none; font-weight: bold;'>Contribute on GitHub / Aram2K/transcribe-app</a>"
         )
         lbl_github_link.setOpenExternalLinks(True)
         lbl_github_link.setStyleSheet("font-size: 12px;")
@@ -1991,6 +2847,759 @@ class Settings(QDialog):
         scroll.setWidget(scroll_content)
         layout.addWidget(scroll)
         return tab
+
+    # ── TAB 6: Account & Billing ─────────────────────────────────────────────
+    def _create_account_tab(self):
+        # Scrollable: the account card + feedback box (with up to 4 image chips)
+        # + perks can exceed the window height. Without a scroll area the layout
+        # over-constrains and widgets collide (the chips were overlapping the
+        # text box).
+        tab = QWidget()
+        _outer = QVBoxLayout(tab)
+        _outer.setContentsMargins(0, 0, 0, 0)
+        _scroll = QScrollArea(tab)
+        _scroll.setWidgetResizable(True)
+        _scroll.setFrameShape(QFrame.NoFrame)
+        _scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # Frosted-glass account card
+        card = QFrame(tab)
+        card.setObjectName("glassCard")
+        card.setMinimumHeight(150)
+        c = QVBoxLayout(card)
+        c.setContentsMargins(20, 20, 20, 20)
+        c.setSpacing(12)
+
+        head = QHBoxLayout()
+        title = QLabel("Your Account", card)
+        title.setObjectName("titleLabel")
+        head.addWidget(title)
+        head.addStretch()
+        self._acct_badge = QLabel("FREE", card)
+        self._acct_badge.setObjectName("freeBadge")
+        head.addWidget(self._acct_badge)
+        c.addLayout(head)
+
+        self._acct_status_label = QLabel("Not signed in", card)
+        self._acct_status_label.setObjectName("subtitleLabel")
+        c.addWidget(self._acct_status_label)
+
+        self._acct_plan_label = QLabel("", card)
+        self._acct_plan_label.setObjectName("subtitleLabel")
+        self._acct_plan_label.setWordWrap(True)
+        c.addWidget(self._acct_plan_label)
+
+        btns = QHBoxLayout()
+        self._acct_signin_btn = QPushButton("Sign in / Create account", card)
+        self._acct_signin_btn.setObjectName("primaryButton")
+        self._acct_signin_btn.clicked.connect(self._acct_sign_in)
+        btns.addWidget(self._acct_signin_btn)
+
+        self._acct_upgrade_btn = QPushButton("Upgrade to Pro", card)
+        self._acct_upgrade_btn.setObjectName("primaryButton")
+        self._acct_upgrade_btn.clicked.connect(self._acct_upgrade)
+        btns.addWidget(self._acct_upgrade_btn)
+
+        self._acct_manage_btn = QPushButton("Manage subscription", card)
+        self._acct_manage_btn.clicked.connect(self._acct_manage)
+        btns.addWidget(self._acct_manage_btn)
+
+        self._acct_signout_btn = QPushButton("Sign out", card)
+        self._acct_signout_btn.clicked.connect(self._acct_sign_out)
+        btns.addWidget(self._acct_signout_btn)
+
+        btns.addStretch()
+        c.addLayout(btns)
+
+        # Legal links + GDPR account deletion.
+        legal_row = QHBoxLayout()
+        legal_row.setSpacing(8)
+        self._legal_links = QLabel(
+            '<a href="https://aibuben.xyz/terms">Terms of Service</a> &nbsp;·&nbsp; '
+            '<a href="https://aibuben.xyz/privacy">Privacy Policy</a>', card)
+        self._legal_links.setObjectName("subtitleLabel")
+        self._legal_links.setOpenExternalLinks(True)
+        self._legal_links.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        legal_row.addWidget(self._legal_links)
+        legal_row.addStretch()
+        self._acct_delete_btn = QPushButton("Delete account", card)
+        self._acct_delete_btn.setFlat(True)
+        self._acct_delete_btn.setCursor(Qt.PointingHandCursor)
+        self._acct_delete_btn.setStyleSheet(
+            "QPushButton { color: #dc2626; border: none; font-size: 12px; }"
+            "QPushButton:hover { text-decoration: underline; }")
+        self._acct_delete_btn.clicked.connect(self._acct_delete_account)
+        self._acct_delete_btn.setVisible(False)  # signed-in users only
+        legal_row.addWidget(self._acct_delete_btn)
+        c.addLayout(legal_row)
+
+        # Super-admin only: force a tier locally (for testing / control).
+        self._admin_row = QWidget(card)
+        ar = QHBoxLayout(self._admin_row)
+        ar.setContentsMargins(0, 6, 0, 0)
+        ar.setSpacing(8)
+        admin_lbl = QLabel("Admin · Force tier:", self._admin_row)
+        admin_lbl.setObjectName("subtitleLabel")
+        ar.addWidget(admin_lbl)
+        self._admin_tier_combo = QComboBox(self._admin_row)
+        for label, val in (("Auto", "auto"), ("Guest", "guest"), ("Free", "free"), ("Pro", "pro")):
+            self._admin_tier_combo.addItem(label, val)
+        self._admin_tier_combo.currentIndexChanged.connect(self._on_admin_tier_changed)
+        ar.addWidget(self._admin_tier_combo)
+        ar.addStretch()
+        self._admin_row.setVisible(False)
+        c.addWidget(self._admin_row)
+
+        layout.addWidget(card)
+
+        # ── Feedback / feature request ──────────────────────────────────────
+        fb = QFrame(tab)
+        fb.setObjectName("cardFrame")
+        fb_lay = QVBoxLayout(fb)
+        fb_lay.setContentsMargins(16, 14, 16, 14)
+        fb_lay.setSpacing(8)
+
+        fb_title = QLabel("Send feedback or request a feature", fb)
+        fb_title.setStyleSheet("font-weight: 700; color: #0f172a;")
+        fb_lay.addWidget(fb_title)
+
+        fb_sub = QLabel(
+            "Tell us what to build next - a feature, a language or model, or a bug. "
+            "Paste up to 4 screenshots with Ctrl+V.", fb)
+        fb_sub.setObjectName("subtitleLabel")
+        fb_sub.setWordWrap(True)
+        fb_lay.addWidget(fb_sub)
+
+        # Chat-style input: type text and paste/drop PNG/JPG images with Ctrl+V.
+        self._fb_text = FeedbackTextEdit(self._fb_on_image, fb)
+        self._fb_text.setPlaceholderText(
+            "Type your feedback, idea, or bug report... (paste screenshots with Ctrl+V)")
+        self._fb_text.setMinimumHeight(90)
+        self._fb_text.setMaximumHeight(150)
+        fb_lay.addWidget(self._fb_text)
+
+        # Thumbnails of pasted images, each with its own remove button (hidden
+        # until at least one is added).
+        self._fb_thumb_row = QWidget(fb)
+        self._fb_thumb_lay = QHBoxLayout(self._fb_thumb_row)
+        self._fb_thumb_lay.setContentsMargins(0, 6, 0, 2)
+        self._fb_thumb_lay.setSpacing(14)
+        self._fb_thumb_row.setVisible(False)
+        fb_lay.addWidget(self._fb_thumb_row)
+
+        fb_row = QHBoxLayout()
+        self._fb_signin_btn = QPushButton("Sign in to send feedback", fb)
+        self._fb_signin_btn.setCursor(Qt.PointingHandCursor)
+        self._fb_signin_btn.clicked.connect(self._acct_sign_in)
+        fb_row.addWidget(self._fb_signin_btn)
+        fb_row.addStretch()
+        self._fb_send_btn = QPushButton("Send", fb)
+        self._fb_send_btn.setObjectName("primaryButton")
+        self._fb_send_btn.clicked.connect(self._send_feedback)
+        fb_row.addWidget(self._fb_send_btn)
+        fb_lay.addLayout(fb_row)
+
+        self._fb_status = QLabel("", fb)
+        self._fb_status.setObjectName("subtitleLabel")
+        self._fb_status.setWordWrap(True)
+        fb_lay.addWidget(self._fb_status)
+
+        self._fb_images = []  # list of QImage, sent as PNG base64
+        layout.addWidget(fb)
+        self._fb_update_auth_state()
+
+        self._acct_perks = QLabel(
+            "<div style='font-size:11px; line-height:150%;'>"
+            "<b>Transcribe Pro</b> includes:<br>"
+            "<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; <b>Unlimited Smart Actions</b> - rewrite, translate, summarize and draft emails by voice<br>"
+            "<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; <b>Smart meeting recording</b> with AI-generated notes and summaries<br>"
+            "<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; <b>Fast cloud transcription</b> - no setup, no API key, no timeouts<br>"
+            "<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; <b>Priority access</b> to new models, plus direct support"
+            "</div>",
+            tab,
+        )
+        self._acct_perks.setWordWrap(True)
+        self._acct_perks.setObjectName("subtitleLabel")
+        layout.addWidget(self._acct_perks)
+        layout.addStretch()
+
+        _scroll.setWidget(content)
+        _outer.addWidget(_scroll)
+        self.refresh_pro_state()
+        return tab
+
+    # ── Feedback / feature request ──────────────────────────────────────────
+    _FB_MAX_IMAGES = 4
+
+    def _fb_on_image(self, qimage):
+        """Receive an image pasted/dropped into the feedback box (any format).
+        We keep up to 4 and show a thumbnail for each."""
+        from PySide6.QtCore import QBuffer, QIODevice
+        if len(self._fb_images) >= self._FB_MAX_IMAGES:
+            self._fb_set_status(f"You can attach up to {self._FB_MAX_IMAGES} images.", error=True)
+            return
+        buf = QBuffer()
+        buf.open(QIODevice.WriteOnly)
+        qimage.save(buf, "PNG")
+        if len(bytes(buf.data())) > 6_000_000:
+            self._fb_set_status("That image is too large (max ~6 MB).", error=True)
+            return
+        self._fb_images.append(qimage)
+        self._fb_render_thumbs()
+        self._fb_set_status(f"{len(self._fb_images)} image(s) attached.", error=False)
+
+    def _fb_remove_icon(self):
+        """A crisp painted 'remove' badge (dark circle + white x). Painted rather
+        than a font glyph so it renders on every system. Cached after first use."""
+        if getattr(self, "_fb_rm_icon", None) is not None:
+            return self._fb_rm_icon
+        from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QIcon
+        S = 40
+        pm = QPixmap(S, S)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(15, 23, 42, 215))
+        p.drawEllipse(0, 0, S, S)
+        pen = QPen(QColor(255, 255, 255))
+        pen.setWidth(4)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        m = S * 0.34
+        p.drawLine(int(m), int(m), int(S - m), int(S - m))
+        p.drawLine(int(S - m), int(m), int(m), int(S - m))
+        p.end()
+        self._fb_rm_icon = QIcon(pm)
+        return self._fb_rm_icon
+
+    def _fb_render_thumbs(self):
+        from PySide6.QtWidgets import QGridLayout
+        from PySide6.QtGui import QPixmap
+        while self._fb_thumb_lay.count():
+            it = self._fb_thumb_lay.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+        SIZE = 54
+        for i, img in enumerate(self._fb_images):
+            # A fixed-size chip. The remove badge is placed by a QGridLayout in the
+            # chip's top-right corner (no absolute positioning, so it can never
+            # drift over the text box).
+            chip = QFrame(self._fb_thumb_row)
+            chip.setObjectName("fbChip")  # scope the style so it won't hit the child QLabel
+            chip.setFixedSize(SIZE, SIZE)
+            chip.setStyleSheet(
+                "QFrame#fbChip { background:#f1f5f9; border:1px solid #e2e8f0; border-radius:8px; }")
+            g = QGridLayout(chip)
+            g.setContentsMargins(3, 3, 3, 3)
+            g.setSpacing(0)
+
+            thumb = QLabel(chip)
+            thumb.setAlignment(Qt.AlignCenter)
+            thumb.setStyleSheet("background: transparent; border: none;")
+            thumb.setPixmap(QPixmap.fromImage(img).scaled(
+                SIZE - 6, SIZE - 6, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            g.addWidget(thumb, 0, 0)
+
+            from PySide6.QtCore import QSize
+            # The badge is a PAINTED icon (dark circle + white x), not a text
+            # glyph, so it always renders regardless of the available fonts and
+            # the global QPushButton padding.
+            rm = QPushButton(chip)
+            rm.setFixedSize(18, 18)
+            rm.setIcon(self._fb_remove_icon())
+            rm.setIconSize(QSize(18, 18))
+            rm.setCursor(Qt.PointingHandCursor)
+            rm.setToolTip("Remove image")
+            rm.setAutoDefault(False)
+            rm.setFlat(True)
+            rm.setStyleSheet(
+                "QPushButton { background: transparent; border: none;"
+                " padding: 0; margin: 0; min-width: 0; min-height: 0; }")
+            rm.clicked.connect(lambda _=False, idx=i: self._fb_remove_image(idx))
+            g.addWidget(rm, 0, 0, Qt.AlignTop | Qt.AlignRight)
+
+            self._fb_thumb_lay.addWidget(chip)
+        self._fb_thumb_lay.addStretch()
+        self._fb_thumb_row.setVisible(bool(self._fb_images))
+
+    def _fb_remove_image(self, idx):
+        if 0 <= idx < len(self._fb_images):
+            del self._fb_images[idx]
+            self._fb_render_thumbs()
+
+    def _fb_clear_images(self):
+        self._fb_images = []
+        if hasattr(self, "_fb_thumb_lay"):
+            self._fb_render_thumbs()
+
+    def _fb_update_auth_state(self):
+        """Only signed-in users can send feedback; guests see a sign-in prompt."""
+        if not hasattr(self, "_fb_text"):
+            return
+        authed = bool(self.app and getattr(self.app, "auth", None)
+                      and self.app.auth.is_authenticated)
+        self._fb_text.setEnabled(authed)
+        self._fb_send_btn.setVisible(authed)
+        self._fb_signin_btn.setVisible(not authed)
+        if authed:
+            self._fb_text.setPlaceholderText(
+                "Type your feedback, idea, or bug report... (paste a screenshot with Ctrl+V)")
+        else:
+            self._fb_text.setPlaceholderText("Sign in to send feedback and feature requests.")
+            self._fb_clear_images()
+            self._fb_set_status("", error=False)
+
+    def _fb_set_status(self, text, error=False):
+        self._fb_status.setText(text)
+        self._fb_status.setStyleSheet("color: #ef4444;" if error else "color: #16a34a;")
+
+    def _send_feedback(self):
+        if not self.app:
+            return
+        msg = self._fb_text.toPlainText().strip()
+        if not msg:
+            self._fb_set_status("Please type a message first.", error=True)
+            return
+        auth = getattr(self.app, "auth", None)
+        if not (auth and auth.is_authenticated):
+            self._fb_set_status("Please sign in first so we can follow up with you.", error=True)
+            if hasattr(self.app, "show_auth_gate"):
+                self.app.show_auth_gate()
+            return
+        self._fb_send_btn.setEnabled(False)
+        self._fb_set_status("Sending...", error=False)
+        # Convert the pasted images to PNG base64 on the GUI thread (Qt image ops
+        # belong here), then hand the plain strings to the worker.
+        import base64
+        from PySide6.QtCore import QBuffer, QIODevice
+        imgs_b64 = []
+        for img in self._fb_images:
+            buf = QBuffer()
+            buf.open(QIODevice.WriteOnly)
+            img.save(buf, "PNG")
+            imgs_b64.append(base64.b64encode(bytes(buf.data())).decode("ascii"))
+        import main as m
+        version = getattr(m, "APP_VERSION", "")
+
+        def worker():
+            import requests
+            try:
+                token = auth.get_access_token()
+                if not token:
+                    self.feedback_finished.emit(False, "Your session expired. Sign in again.")
+                    return
+                payload = {"message": msg, "app_version": version, "category": "feedback"}
+                if imgs_b64:
+                    payload["images"] = imgs_b64
+                resp = requests.post(
+                    m.FEEDBACK_URL, json=payload,
+                    headers={"Authorization": f"Bearer {token}"}, timeout=30)
+                if resp.status_code == 200:
+                    self.feedback_finished.emit(True, "Thanks! Your feedback was sent. We read every message.")
+                elif resp.status_code == 503:
+                    self.feedback_finished.emit(False, "Feedback isn't fully set up on the server yet. Please try later.")
+                elif resp.status_code == 429:
+                    self.feedback_finished.emit(False, "You've sent a lot of feedback today - thank you! Please try again tomorrow.")
+                elif resp.status_code in (401, 403):
+                    self.feedback_finished.emit(False, "Your session expired. Sign in again and retry.")
+                else:
+                    self.feedback_finished.emit(False, f"Could not send right now (HTTP {resp.status_code}). Please try again later.")
+            except Exception as e:
+                self.feedback_finished.emit(False, f"Network error: {str(e)[:60]}")
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_feedback_finished(self, ok, message):
+        self._fb_send_btn.setEnabled(True)
+        self._fb_set_status(message, error=not ok)
+        if ok:
+            self._fb_text.clear()
+            self._fb_clear_images()
+
+    def _acct_delete_account(self):
+        """GDPR right-to-erasure: double confirmation (typed DELETE), then the
+        server cancels any subscription, scrubs PII, and deletes the account."""
+        auth = getattr(self.app, "auth", None) if self.app else None
+        if not (auth and auth.is_authenticated):
+            return
+        from PySide6.QtWidgets import QMessageBox, QInputDialog, QLineEdit as _QLE
+        box = QMessageBox(self)
+        box.setWindowTitle("Delete account")
+        box.setIcon(QMessageBox.Warning)
+        box.setText("This permanently deletes your account.")
+        box.setInformativeText(
+            "Your subscription (if any) is cancelled, your server data is "
+            "erased, and you will be signed out. Local transcripts on this "
+            "computer are not touched.\n\nThis cannot be undone.")
+        cont = box.addButton("Continue", QMessageBox.DestructiveRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is not cont:
+            return
+        typed, ok = QInputDialog.getText(
+            self, "Confirm deletion", 'Type DELETE to confirm:', _QLE.Normal, "")
+        if not ok or typed.strip() != "DELETE":
+            return
+        self._acct_delete_btn.setEnabled(False)
+
+        def worker():
+            import requests
+            import main as m
+            try:
+                token = auth.get_access_token()
+                if not token:
+                    self.account_delete_finished.emit(False, "Your session expired. Sign in again and retry.")
+                    return
+                resp = requests.post(
+                    m.DELETE_ACCOUNT_URL, json={"confirm": "DELETE"},
+                    headers={"Authorization": f"Bearer {token}"}, timeout=30)
+                if resp.status_code == 200:
+                    self.account_delete_finished.emit(True, "Your account was deleted.")
+                else:
+                    self.account_delete_finished.emit(
+                        False, f"Could not delete the account (HTTP {resp.status_code}). Try again later.")
+            except Exception as e:
+                self.account_delete_finished.emit(False, f"Network error: {str(e)[:60]}")
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_account_delete_finished(self, ok, message):
+        from PySide6.QtWidgets import QMessageBox
+        if hasattr(self, "_acct_delete_btn"):
+            self._acct_delete_btn.setEnabled(True)
+        if ok:
+            if self.app and hasattr(self.app, "sign_out"):
+                self.app.sign_out()
+            QMessageBox.information(self, "Account deleted", message)
+        else:
+            QMessageBox.warning(self, "Delete account", message)
+
+    def _acct_sign_in(self):
+        if self.app and hasattr(self.app, "show_auth_gate"):
+            self.app.show_auth_gate()
+
+    def _acct_sign_out(self):
+        if self.app and hasattr(self.app, "sign_out"):
+            self.app.sign_out()
+
+    def _acct_upgrade(self):
+        if self.app and hasattr(self.app, "_pro_upsell"):
+            self.app._pro_upsell()
+
+    def _acct_manage(self):
+        if self.app and hasattr(self.app, "open_billing"):
+            self.app.open_billing()
+
+    def _on_admin_tier_changed(self):
+        if getattr(self, "_suppress_admin_combo", False):
+            return
+        if self.app and hasattr(self.app, "set_admin_tier_override"):
+            self.app.set_admin_tier_override(self._admin_tier_combo.currentData())
+
+    def _header_cta_clicked(self):
+        if not self.app:
+            return
+        auth = getattr(self.app, "auth", None)
+        if not (auth and auth.is_authenticated):
+            if hasattr(self.app, "show_auth_gate"):
+                self.app.show_auth_gate()
+        elif hasattr(self.app, "_pro_upsell"):
+            self.app._pro_upsell()
+
+    @staticmethod
+    def _trial_days_left(auth):
+        try:
+            import math
+            from datetime import datetime, timezone
+            end = getattr(auth, "period_end", None)
+            if not end:
+                return 0
+            dt = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+            secs = (dt - datetime.now(timezone.utc)).total_seconds()
+            return max(0, math.ceil(secs / 86400.0))
+        except Exception:
+            return 0
+
+    def reload_secret_fields(self):
+        """Pull the (just-swapped) per-user API keys + engine config from the app
+        config into the working copy and the visible inputs. Called when the
+        signed-in user changes so a different account never sees the old keys."""
+        if not self.app:
+            return
+        scoped = (
+            "google_api_key", "action_api_key", "mistral_api_key",
+            "action_model", "action_api_provider", "action_api_base_url",
+            "action_api_model", "backend", "managed_provider",
+        )
+        for k in scoped:
+            if k in self.app.cfg:
+                self.cfg_working[k] = self.app.cfg.get(k)
+        # Mistral / Google key inputs (General tab).
+        for attr, key in (("mistral_key_input", "mistral_api_key"),
+                          ("google_key_input", "google_api_key")):
+            w = getattr(self, attr, None)
+            if w is not None:
+                w.blockSignals(True)
+                w.setText(self.cfg_working.get(key, ""))
+                w.setStyleSheet("")
+                w.blockSignals(False)
+        # Managed-cloud toggle (Models tab).
+        if hasattr(self, "chk_managed"):
+            self.chk_managed.blockSignals(True)
+            self.chk_managed.setChecked(self.cfg_working.get("backend") == "managed")
+            self.chk_managed.blockSignals(False)
+        # AI Actions engine dropdown + its cloud key field.
+        if hasattr(self, "combo_engine"):
+            prov = self.cfg_working.get("action_model", "rule_based")
+            import local_llm
+            if prov in (local_llm.QWEN_TINY_ID, local_llm.QWEN_3B_ID,
+                        local_llm.QWEN_7B_ID, local_llm.GEMMA_2B_ID):
+                prov = "local_llm"
+            idx = self.combo_engine.findData(prov)
+            if idx >= 0:
+                self.combo_engine.blockSignals(True)
+                self.combo_engine.setCurrentIndex(idx)
+                self.combo_engine.blockSignals(False)
+            self._set_backend_layout(self.combo_engine.currentData())
+
+    def refresh_pro_state(self):
+        """Update the Account tab to reflect the current auth/entitlement state.
+        Safe to call from main.py's auth-changed handler (and before the tab is
+        built)."""
+        if not hasattr(self, "_acct_badge"):
+            return
+        auth = getattr(self.app, "auth", None) if self.app else None
+        authed = bool(auth and auth.is_authenticated)
+
+        # Effective tier honors the super-admin override (used for the badge).
+        if self.app and hasattr(self.app, "current_tier"):
+            t = self.app.current_tier()
+        else:
+            t = entitlements.tier(auth)
+        # Feature gating uses real Pro access so a genuine Pro user is never shown
+        # upgrade prompts or the free counter, regardless of the preview tier.
+        is_pro = entitlements.has_pro_access(auth, self.app.cfg if self.app else None)
+
+        # Tier badge: purple PRO / green FREE / gray GUEST.
+        if is_pro:
+            self._acct_badge.setText("PRO"); self._acct_badge.setObjectName("proBadge")
+        elif t == entitlements.TIER_FREE:
+            self._acct_badge.setText("FREE"); self._acct_badge.setObjectName("freeBadge")
+        else:
+            self._acct_badge.setText("GUEST"); self._acct_badge.setObjectName("guestBadge")
+        self._acct_badge.style().unpolish(self._acct_badge)
+        self._acct_badge.style().polish(self._acct_badge)
+
+        # Header: "Welcome, {name}" + matching tier badge.
+        if hasattr(self, "_welcome_label"):
+            name = None
+            if authed and auth:
+                name = getattr(auth, "user_name", None) or (
+                    auth.user_email.split("@")[0] if auth.user_email else None
+                )
+            self._welcome_label.setText(f"Welcome, {name}" if name else "Welcome")
+            if is_pro:
+                self._header_badge.setText("PRO"); self._header_badge.setObjectName("proBadge")
+            elif t == entitlements.TIER_FREE:
+                self._header_badge.setText("FREE"); self._header_badge.setObjectName("freeBadge")
+            else:
+                self._header_badge.setText("GUEST"); self._header_badge.setObjectName("guestBadge")
+            self._header_badge.style().unpolish(self._header_badge)
+            self._header_badge.style().polish(self._header_badge)
+
+        # Smart-action lock pill follows Pro state.
+        # Smart Actions: Pro = unlimited (no badge); non-Pro shows a "N/5 FREE"
+        # counter, and once exhausted the option locks (PRO badge + disabled).
+        if getattr(self, "_smart_pro_badge", None) is not None:
+            guest_hint = getattr(self, "_smart_guest_hint", None)
+            if guest_hint is not None:
+                guest_hint.setVisible(False)
+
+            def _lock_smart_radio():
+                if hasattr(self, "rb_smart"):
+                    self.rb_smart.setEnabled(False)
+                    if self.rb_smart.isChecked():
+                        self.rb_smart.blockSignals(True)
+                        self.rb_transcribe.setChecked(True)
+                        self.rb_smart.setChecked(False)
+                        self.rb_smart.blockSignals(False)
+                        self.cfg_working["output_action"] = actions.ACTION_TRANSCRIBE_ONLY
+
+            if is_pro:
+                # Pro keeps the PRO tag visible (so the premium feature stays
+                # recognizable) but the control is unlimited + enabled.
+                self._smart_pro_badge.setText("PRO")
+                self._smart_pro_badge.setStyleSheet(self._PRO_BADGE_CSS)
+                if hasattr(self, "rb_smart"):
+                    self.rb_smart.setEnabled(True)
+            elif t == entitlements.TIER_GUEST:
+                # Guests: locked behind sign-up - signing up grants the 5 trials.
+                self._smart_pro_badge.setText("PRO")
+                self._smart_pro_badge.setStyleSheet(self._PRO_BADGE_CSS)
+                if guest_hint is not None:
+                    guest_hint.setVisible(True)
+                _lock_smart_radio()
+            else:
+                try:
+                    rem = entitlements.smart_actions_remaining(auth, self.app.cfg if self.app else None)
+                except Exception:
+                    rem = entitlements.FREE_SMART_ACTION_TRIES
+                if rem > 0:
+                    self._smart_pro_badge.setText(f"{rem}/5 FREE")
+                    self._smart_pro_badge.setStyleSheet(self._FREE_BADGE_CSS)
+                    if hasattr(self, "rb_smart"):
+                        self.rb_smart.setEnabled(True)
+                else:
+                    # Exhausted: show the count is spent AND that it's now Pro-only.
+                    self._smart_pro_badge.setText("0/5 · PRO")
+                    self._smart_pro_badge.setStyleSheet(self._PRO_BADGE_CSS)
+                    _lock_smart_radio()
+            self._smart_pro_badge.setVisible(True)
+
+        # Meeting controls: locked but readable for non-Pro (clicking prompts upgrade).
+        if hasattr(self, "btn_launch_meeting"):
+            if is_pro:
+                self.btn_launch_meeting.setText("Start Smart Meeting Transcription")
+                self.btn_launch_meeting.setStyleSheet("")  # default primary style
+            else:
+                self.btn_launch_meeting.setText("Smart Meeting Transcription   (Pro)")
+                self.btn_launch_meeting.setStyleSheet(
+                    "QPushButton { background-color: #eef2f7; color: #475569;"
+                    " border: 1px solid #cbd5e1; border-radius: 8px; font-weight: 600; }"
+                    "QPushButton:hover { background-color: #e2e8f0; }"
+                )
+            self.btn_launch_meeting.setEnabled(True)
+        if hasattr(self, "combo_device"):
+            self.combo_device.setEnabled(is_pro)
+        if hasattr(self, "_meeting_pro_badge"):
+            # Keep the PRO tag visible for Pro users too, so the premium feature
+            # stays recognizable (only the gating/enablement changes with tier).
+            self._meeting_pro_badge.setVisible(True)
+        # The purple glow marks locked Pro features; Pro users keep only the pill.
+        for _f in (getattr(self, "_meeting_card", None), getattr(self, "_cloud_card", None)):
+            self._set_pro_glow(_f, not is_pro)
+
+        # Privacy Mode (can be toggled from the tray) deactivates cloud options
+        # with a clear reason so users know why they're disabled.
+        privacy = bool(self.app and self.app.cfg.get("privacy_mode"))
+        if hasattr(self, "chk_privacy") and self.chk_privacy.isChecked() != privacy:
+            self.chk_privacy.blockSignals(True)
+            self.chk_privacy.setChecked(privacy)
+            self.chk_privacy.blockSignals(False)
+            self.cfg_working["privacy_mode"] = privacy
+        if hasattr(self, "chk_managed"):
+            self.chk_managed.setEnabled(not privacy)
+            self.chk_managed.setToolTip(
+                "Disabled by Privacy Mode (everything stays on your device)" if privacy else ""
+            )
+            if privacy and self.chk_managed.isChecked():
+                self.chk_managed.blockSignals(True)
+                self.chk_managed.setChecked(False)
+                self.chk_managed.blockSignals(False)
+                self.cfg_working["backend"] = "local"
+        if hasattr(self, "_cloud_pro_badge"):
+            self._cloud_pro_badge.setVisible(not privacy)
+
+        plan = getattr(auth, "plan", None) if auth else None
+        on_trial = is_pro and plan == "trial"
+
+        if authed:
+            self._acct_status_label.setText(f"Signed in as {auth.user_email or 'your account'}")
+            if on_trial:
+                days = self._trial_days_left(auth)
+                self._acct_plan_label.setText(
+                    f"Pro trial - {days} day(s) left. Subscribe to keep Pro after it ends."
+                )
+            elif is_pro:
+                plan_name = (plan or "Pro").capitalize()
+                renew = ""
+                if getattr(auth, "period_end", None):
+                    verb = "Cancels" if auth.cancel_at_period_end else "Renews"
+                    renew = f"  ·  {verb} {str(auth.period_end)[:10]}"
+                self._acct_plan_label.setText(f"Plan: {plan_name}{renew}")
+            else:
+                self._acct_plan_label.setText(
+                    "Plan: Free - upgrade to unlock Meetings, Smart Actions, and fast cloud transcription."
+                )
+        else:
+            self._acct_status_label.setText("Not signed in  ·  Guest")
+            try:
+                mins = entitlements.guest_minutes_remaining()
+                self._acct_plan_label.setText(
+                    f"Guest trial: ~{mins} min of free recording left. "
+                    "Create a free account to keep dictating + get 3 days of Pro."
+                )
+            except Exception:
+                self._acct_plan_label.setText("Sign in to manage your subscription and unlock Pro.")
+
+        # Top-right CTA: neutral "Sign up" for guests, purple "Upgrade" for free/trial.
+        if hasattr(self, "_header_cta"):
+            neutral = (
+                "QPushButton { background: #ffffff; border: 1px solid #cbd5e1; color: #334155;"
+                " font-weight: 600; border-radius: 8px; padding: 6px 14px; }"
+                "QPushButton:hover { border-color: #3b82f6; color: #1e293b; }"
+            )
+            purple = (
+                "QPushButton { background-color: #a855f7; border: 1px solid #9333ea; color: white;"
+                " font-weight: 700; border-radius: 8px; padding: 6px 14px; }"
+                "QPushButton:hover { background-color: #9333ea; }"
+            )
+            if not authed:
+                try:
+                    mins = entitlements.guest_minutes_remaining()
+                except Exception:
+                    mins = 0
+                self._header_cta.setText(f"Sign up   ·   {mins} min left")
+                self._header_cta.setStyleSheet(neutral)
+                self._header_cta.setVisible(True)
+            elif on_trial:
+                self._header_cta.setText(f"Upgrade   ·   Trial {self._trial_days_left(auth)}d left")
+                self._header_cta.setStyleSheet(purple)
+                self._header_cta.setVisible(True)
+            elif is_pro:
+                self._header_cta.setVisible(False)
+            else:
+                self._header_cta.setText("Upgrade to Pro")
+                self._header_cta.setStyleSheet(purple)
+                self._header_cta.setVisible(True)
+
+        # Super-admin tier override row (visible only to admins).
+        if hasattr(self, "_admin_row"):
+            is_admin = entitlements.is_super_admin(auth)
+            self._admin_row.setVisible(is_admin)
+            if is_admin and self.app:
+                ov = self.app.cfg.get("admin_tier_override", "auto")
+                idx = self._admin_tier_combo.findData(ov)
+                if idx >= 0:
+                    self._suppress_admin_combo = True
+                    self._admin_tier_combo.setCurrentIndex(idx)
+                    self._suppress_admin_combo = False
+
+        self._acct_signin_btn.setVisible(not authed)
+        self._acct_upgrade_btn.setVisible(authed and not is_pro)
+        self._acct_manage_btn.setVisible(authed and is_pro)
+        self._acct_signout_btn.setVisible(authed)
+        if hasattr(self, "_acct_delete_btn"):
+            self._acct_delete_btn.setVisible(authed)
+        # Pro users already have everything, so don't sell them the perks list.
+        if hasattr(self, "_acct_perks"):
+            self._acct_perks.setVisible(not is_pro)
+        # Feedback box is sign-in gated; refresh when auth state changes.
+        if hasattr(self, "_fb_text"):
+            self._fb_update_auth_state()
+        # Cloud STT cards switch between Pro (keyless) and free (BYO key) styling.
+        if hasattr(self, "google_card") or hasattr(self, "mistral_cards"):
+            self._refresh_cloud_cards()
+        # Managed AI-Actions engine is Pro-only; keep the dropdown in sync.
+        self._refresh_engine_availability()
 
     def _check_for_updates(self):
         if self.app and self.cfg_working.get("pending_update_version"):
@@ -2031,6 +3640,9 @@ class Settings(QDialog):
             if self.app:
                 self.cfg_working["backend"] = "local"
                 self.cfg_working["whisper_model"] = name
+            # Activating a local model means cloud is no longer the backend, so
+            # the "Fast cloud transcription" checkbox must uncheck itself.
+            self._sync_managed_checkbox()
             for m_name in list(self.whisper_cards.keys()):
                 self._update_whisper_card_ui(m_name)
             if hasattr(self, "mistral_cards"):
@@ -2077,14 +3689,9 @@ class Settings(QDialog):
 
     def _download_llm(self, name):
         if self._local_llm_states.get(name) == "downloaded":
+            # "Use Model": the card click IS the model selection.
             if self.app:
                 self.cfg_working["action_model"] = name
-            if hasattr(self, "combo_local_model"):
-                idx = self.combo_local_model.findData(name)
-                if idx >= 0:
-                    self.combo_local_model.blockSignals(True)
-                    self.combo_local_model.setCurrentIndex(idx)
-                    self.combo_local_model.blockSignals(False)
             for m_name in list(self.llm_cards.keys()):
                 self._update_llm_card_ui(m_name)
             return
@@ -2209,10 +3816,6 @@ class Settings(QDialog):
             if state == "downloaded":
                 if self.app:
                     self.cfg_working["action_model"] = name
-                # Select it in combo
-                idx = self.combo_local_model.findData(name)
-                if idx >= 0:
-                    self.combo_local_model.setCurrentIndex(idx)
                 QMessageBox.information(self, "Download Complete", f"{local_llm.MODEL_CATALOG[name]['label']} is ready for action modes!")
         else:
             self._model_states[model_name] = state
@@ -2307,7 +3910,7 @@ class Settings(QDialog):
         else:
             return
 
-        # Modifier-less binding is only safe for Function keys (F1–F12); a bare
+        # Modifier-less binding is only safe for Function keys (F1-F12); a bare
         # typing/navigation key would fire during normal use. Require a modifier
         # otherwise (mouse buttons are handled separately in eventFilter).
         is_function_key = len(key_str) >= 2 and key_str[0] == "f" and key_str[1:].isdigit()
@@ -2315,7 +3918,7 @@ class Settings(QDialog):
             QMessageBox.warning(
                 self, "Modifier Required",
                 "Use at least one modifier (Ctrl, Alt, Shift, or Win), a Function "
-                "key (F1–F12), or a mouse button.\n\nA single typing key can't be a "
+                "key (F1-F12), or a mouse button.\n\nA single typing key can't be a "
                 "hotkey because it would trigger while you type."
             )
             return

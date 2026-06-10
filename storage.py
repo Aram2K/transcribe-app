@@ -12,6 +12,10 @@ APP_DIR_NAME = "Transcribe"
 SECRET_SERVICE = "TranscribeApp"
 GOOGLE_API_KEY_SECRET = "google_api_key"
 ACTION_API_KEY_SECRET = "action_api_key"
+MISTRAL_API_KEY_SECRET = "mistral_api_key"
+# JSON blob holding the per-user stashed API keys (the user_secrets store), so
+# keys swapped out on account switch never sit in plaintext config.json either.
+USER_SECRETS_SECRET = "user_secrets_keys"
 MEETINGS_DIR_NAME = "meetings"
 
 
@@ -80,7 +84,7 @@ def append_jsonl(path, record):
 
 def read_jsonl(path):
     """Read a JSONL file produced by `append_jsonl` into a list. Skips
-    malformed lines rather than failing — chunk recovery should be robust
+    malformed lines rather than failing - chunk recovery should be robust
     even if the last write was partial."""
     out = []
     p = Path(path)

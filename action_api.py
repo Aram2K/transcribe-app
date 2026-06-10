@@ -71,7 +71,7 @@ def build_messages(text, mode, source_lang="auto", target_lang="en"):
     elif mode == "summarize":
         instruction = (
             "Summarize this text in 3-5 sentences capturing the main points. "
-            "Output only the summary — no preamble, no headings."
+            "Output only the summary - no preamble, no headings."
         )
     elif mode == "meeting_notes":
         # Prompt engineering applied from Microsoft Research's meeting-recap
@@ -82,13 +82,13 @@ def build_messages(text, mode, source_lang="auto", target_lang="en"):
         instruction = (
             "You are summarising a meeting transcript. Think carefully before writing:\n"
             "1. First mentally identify the most important utterances in the transcript "
-            "(decisions, commitments, questions, blockers). DO NOT output this — it is "
+            "(decisions, commitments, questions, blockers). DO NOT output this - it is "
             "internal reasoning to ground the notes.\n"
             "2. Then produce well-formed Markdown with EXACTLY these four sections in "
             "this order, even if a section is empty:\n\n"
             "## Summary\n"
             "2-4 sentences in third person ('The team discussed…', 'Aram committed to…'). "
-            "Never use first-person ('I will…') — convert to third person using whoever "
+            "Never use first-person ('I will…') - convert to third person using whoever "
             "spoke when known, or 'the speaker' otherwise.\n\n"
             "## Key decisions\n"
             "Bullet list of concrete decisions reached. Skip if none.\n\n"
@@ -119,6 +119,34 @@ def build_messages(text, mode, source_lang="auto", target_lang="en"):
         {"role": "system", "content": "You are a concise assistant. Never add commentary."},
         {"role": "user", "content": f"{instruction}\n\nText:\n{text}"},
     ]
+
+
+SMART_ACTION_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/smart-action"
+
+
+def run_managed_action(text, mode, token, source_lang="auto", target_lang="en"):
+    """Pro Smart Actions via the server (no BYO key): we build the messages here
+    and the edge function runs them through the founder's Mistral key."""
+    if not token:
+        raise ActionAPIError("Sign in with Pro to use managed Smart Actions.")
+    messages = build_messages(text, mode, source_lang, target_lang)
+    try:
+        resp = requests.post(
+            SMART_ACTION_URL,
+            json={"messages": messages, "max_tokens": _max_tokens_for(mode)},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=45,
+        )
+    except requests.RequestException as e:
+        raise ActionAPIError(f"Network error reaching Smart Actions: {e}")
+    if resp.status_code == 403:
+        raise ActionAPIError("Pro is required for managed Smart Actions.")
+    if resp.status_code == 429:
+        raise ActionAPIError("Daily Smart Actions limit reached - try again tomorrow.")
+    if resp.status_code == 503:
+        raise ActionAPIError("Managed Smart Actions aren't set up on the server yet.")
+    data = _json_or_error(resp)
+    return (data.get("text") or "").strip()
 
 
 def run_action(text, mode, config, source_lang="auto", target_lang="en"):
