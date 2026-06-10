@@ -68,8 +68,9 @@ class MeetingsWindow(QDialog):
         self.app = main_app
         
         self.setWindowTitle("Record Meeting")
-        self.setMinimumSize(780, 620)
+        self.setMinimumSize(640, 500)
         self.resize(800, 650)
+        self.setSizeGripEnabled(True)
         
         # Apply global styling
         if self.app and hasattr(self.app, "style_content"):
@@ -102,6 +103,13 @@ class MeetingsWindow(QDialog):
 
         self._build_ui()
         self._populate_audio_devices()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        from ui.winfit import fit_on_screen, size_to_screen
+        if not getattr(self, "_fit_positioned", False):
+            size_to_screen(self, 0.44, 0.64, 680, 520, 900, 820)
+        fit_on_screen(self)
 
     def _build_ui(self):
         self.main_layout = QVBoxLayout(self)

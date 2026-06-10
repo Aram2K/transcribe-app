@@ -23,7 +23,11 @@ class Onboarding(QDialog):
         self.account_only = account_only
 
         self.setWindowTitle("Sign in to Transcribe" if account_only else "Welcome to Transcribe")
-        self.setFixedSize(520, 680)
+        # Resizable with a soft minimum (was setFixedSize(520, 680), which both
+        # overflowed small/scaled screens and refused user resizing).
+        self.setMinimumSize(460, 520)
+        self.resize(520, 680)
+        self.setSizeGripEnabled(True)
         
         # Apply style sheet
         if self.app and hasattr(self.app, "style_content"):
@@ -58,15 +62,12 @@ class Onboarding(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
-        # Center on the active screen every time it opens (avoids the window
-        # appearing cut off at the top-left on first launch).
-        scr = self.screen() or QApplication.primaryScreen()
-        if scr:
-            geo = scr.availableGeometry()
-            self.move(
-                geo.x() + (geo.width() - self.width()) // 2,
-                geo.y() + (geo.height() - self.height()) // 2,
-            )
+        # Size proportionally to the screen on first open, cap to the work
+        # area, and center on the active screen every open.
+        from ui.winfit import fit_on_screen, size_to_screen
+        if not getattr(self, "_fit_positioned", False):
+            size_to_screen(self, 0.30, 0.66, 500, 540, 560, 720)
+        fit_on_screen(self, recenter=True)
 
     def _build_ui(self):
         self.main_layout = QVBoxLayout(self)

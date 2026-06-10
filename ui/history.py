@@ -16,8 +16,9 @@ class HistoryWindow(QDialog):
         self.app = main_app
         
         self.setWindowTitle("History")
-        self.setMinimumSize(540, 600)
+        self.setMinimumSize(440, 420)
         self.resize(540, 650)
+        self.setSizeGripEnabled(True)
         
         # Apply the global stylesheet
         if self.app and hasattr(self.app, "style_content"):
@@ -29,6 +30,13 @@ class HistoryWindow(QDialog):
         
         self._build_ui()
         self.refresh_list()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        from ui.winfit import fit_on_screen, size_to_screen
+        if not getattr(self, "_fit_positioned", False):
+            size_to_screen(self, 0.28, 0.62, 480, 480, 620, 800)
+        fit_on_screen(self)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)

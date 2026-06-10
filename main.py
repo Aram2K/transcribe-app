@@ -40,7 +40,7 @@ import auth
 import entitlements
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 
 # ── Managed cloud transcription (Pro moat) ────────────────────────────────────
 MANAGED_PROXY_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-proxy"
@@ -1464,6 +1464,10 @@ class AppController(QObject):
         self.history_win = HistoryWindow(main_app=self)
         self.meetings_win = MeetingsWindow(main_app=self)
         self.onboarding_win = Onboarding(main_app=self)
+        # When onboarding completes (guest or signed in), land the user in the
+        # app panel instead of silently minimizing to the tray - first-run
+        # users otherwise think the app closed.
+        self.onboarding_win.accepted.connect(self.show_settings)
 
         # Wire Signals to main-thread handlers. QueuedConnection guarantees the
         # slot runs on this QObject's owning thread (the Qt main thread),
@@ -1538,6 +1542,18 @@ class AppController(QObject):
         action_title.setEnabled(False)
         menu.addAction(action_title)
 
+        # The #1 thing people open the menu for - first, bold, one click.
+        action_open = QAction("Open Settings", self)
+        _f = action_open.font()
+        _f.setBold(True)
+        action_open.setFont(_f)
+        action_open.setIcon(self._dot_icon(self._tier_color()))
+        action_open.triggered.connect(self.show_settings)
+        menu.addAction(action_open)
+        menu.setDefaultAction(action_open)
+
+        menu.addSeparator()
+
         # ── Account section ──
         if self.auth.is_authenticated:
             who = self.auth.user_email or "Account"
@@ -1569,12 +1585,6 @@ class AppController(QObject):
         action_rec_meet = QAction("Record Meeting..." + ("" if is_pro else "   (Pro)"), self)
         action_rec_meet.triggered.connect(self.show_meeting)
         menu.addAction(action_rec_meet)
-
-        action_settings = QAction("Settings", self)
-        # Tier indicator dot - green = Free, purple = Pro, gray = Guest.
-        action_settings.setIcon(self._dot_icon(self._tier_color()))
-        action_settings.triggered.connect(self.show_settings)
-        menu.addAction(action_settings)
 
         action_history = QAction("History Log", self)
         action_history.triggered.connect(self.show_history)
@@ -1844,7 +1854,11 @@ class AppController(QObject):
         self.show_auth_gate()
 
     def _on_tray_activated(self, reason):
-        if reason == QSystemTrayIcon.Trigger:
+        # Any direct click on the tray icon opens the panel - single, double,
+        # or middle click. (Right-click shows the menu, whose first item is
+        # also "Open Settings".)
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick,
+                      QSystemTrayIcon.MiddleClick):
             self.show_settings()
 
     def update_tray_icon(self):
@@ -1928,25 +1942,30 @@ class AppController(QObject):
             logger.warning("Update download failed: %s", e)
 
     # ── Modular Window Surface Triggers (Main thread-safe wrappers) ──
+    @staticmethod
+    def _bring_to_front(w):
+        """Reliably surface a window. A minimized window ignores plain show() on
+        Windows - which made tray clicks look like they did nothing - and a
+        window behind others needs the raise+activate pair."""
+        if w.isMinimized():
+            w.showNormal()
+        w.show()
+        w.raise_()
+        w.activateWindow()
+
     def show_settings(self):
-        self.settings_win.show()
-        self.settings_win.raise_()
-        self.settings_win.activateWindow()
+        self._bring_to_front(self.settings_win)
 
     def show_history(self):
         self.history_win.refresh_list()
-        self.history_win.show()
-        self.history_win.raise_()
-        self.history_win.activateWindow()
+        self._bring_to_front(self.history_win)
 
     def show_meeting(self):
         # Meeting recording + AI notes are Pro-only.
         if not self.is_pro():
             self._pro_upsell("Meeting recording")
             return
-        self.meetings_win.show()
-        self.meetings_win.raise_()
-        self.meetings_win.activateWindow()
+        self._bring_to_front(self.meetings_win)
 
     def show_onboarding(self):
         self.onboarding_win.show()
@@ -2041,6 +2060,9 @@ class AppController(QObject):
             return
         from ui.onboarding import Onboarding
         self._account_gate = Onboarding(main_app=self, account_only=True)
+        # Same as first-run onboarding: finishing the gate (guest or sign-in)
+        # opens the app panel instead of dropping the user at the tray.
+        self._account_gate.accepted.connect(self.show_settings)
         self._account_gate.show()
         self._account_gate.raise_()
         self._account_gate.activateWindow()

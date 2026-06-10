@@ -18,9 +18,15 @@ class ProDialog(QDialog):
         self._plan = "annual"  # default to the best-value plan
         self.setWindowTitle("Transcribe Pro")
         self.setMinimumWidth(440)
+        self.setSizeGripEnabled(True)
         if self.app and hasattr(self.app, "style_content"):
             self.setStyleSheet(self.app.style_content)
         self._build(feature)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        from ui.winfit import fit_on_screen
+        fit_on_screen(self)
 
     def _build(self, feature):
         root = QVBoxLayout(self)
@@ -114,7 +120,9 @@ class ProDialog(QDialog):
         card = QFrame(self)
         card.setObjectName("cardFrame")
         card.setCursor(Qt.PointingHandCursor)
-        card.setMinimumHeight(94)
+        # Tall enough for title + the 30px price line + badge row; a smaller
+        # minimum let the layout squeeze the price label, clipping the digits.
+        card.setMinimumHeight(112)
         v = QVBoxLayout(card)
         v.setContentsMargins(14, 12, 14, 12)
         v.setSpacing(6)
@@ -132,6 +140,10 @@ class ProDialog(QDialog):
             prow.addWidget(o, 0, Qt.AlignBottom)
         p = QLabel(price, card)
         p.setStyleSheet("font-size: 30px; font-weight: 800; color: #0f172a;")
+        # Never let the layout squeeze the price below its glyph height
+        # (30px font needs ~42px with ascenders/descenders) - that's what
+        # was cutting the bottom off "€7.99".
+        p.setMinimumHeight(42)
         prow.addWidget(p)
         u = QLabel(per, card)
         u.setObjectName("subtitleLabel")

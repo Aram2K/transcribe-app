@@ -105,10 +105,12 @@ class Settings(QDialog):
         self.cfg_working = copy.deepcopy(self.app.cfg if self.app else {})
         
         self.setWindowTitle("Settings")
-        # Wider so the cloud model cards (badge + state + buttons) are not clipped
-        # on the right.
-        self.setMinimumSize(660, 680)
+        # Soft minimum only - every tab scrolls, so the user may shrink the
+        # window well below the design size. The actual default size is chosen
+        # proportionally to the screen on first show (see showEvent).
+        self.setMinimumSize(560, 480)
         self.resize(720, 780)
+        self.setSizeGripEnabled(True)  # visible resize handle (also edge-drag)
         
         # Apply global stylesheet
         if self.app and hasattr(self.app, "style_content"):
@@ -156,11 +158,20 @@ class Settings(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._fit_on_screen()
         import copy
         if self.app:
             self.cfg_working = copy.deepcopy(self.app.cfg)
         self._scan_model_statuses()
         self._load_values_into_widgets()
+
+    def _fit_on_screen(self):
+        from ui.winfit import fit_on_screen, size_to_screen
+        if not getattr(self, "_fit_positioned", False):
+            # First open: ~38% of the work-area width, ~72% of its height -
+            # comfortable on laptops, not a tower on big monitors.
+            size_to_screen(self, 0.38, 0.72, 640, 540, 780, 880)
+        fit_on_screen(self)
         for name in list(self.whisper_cards.keys()):
             self._update_whisper_card_ui(name)
         if hasattr(self, "mistral_cards"):
@@ -309,11 +320,15 @@ class Settings(QDialog):
         self.chk_privacy.blockSignals(False)
         
         # 5. Engine Provider - Pro defaults to the managed cloud (matches the
-        # actual routing in main._stop), everyone else to rule-based.
+        # actual routing in main._stop), everyone else to the local engine.
         _pro = entitlements.has_pro_access(self.app.auth if self.app else None, self.cfg_working)
-        provider = self.cfg_working.get("action_model", actions.API_MANAGED_ID if _pro else "rule_based")
+        provider = self.cfg_working.get("action_model", actions.API_MANAGED_ID if _pro else "local_llm")
         import local_llm
         if provider in (local_llm.QWEN_TINY_ID, local_llm.QWEN_3B_ID, local_llm.QWEN_7B_ID, local_llm.GEMMA_2B_ID):
+            provider = "local_llm"
+        # The rule-based formatter is no longer a visible engine; an old config
+        # that still points at it shows the local engine instead.
+        if provider == actions.RULE_BASED_ID:
             provider = "local_llm"
         idx = self.combo_engine.findData(provider)
         if idx >= 0:
@@ -1696,7 +1711,9 @@ class Settings(QDialog):
         self.combo_engine = QComboBox(engine_frame)
         self.combo_engine.addItem("Transcribe Pro - managed cloud (no key needed)", actions.API_MANAGED_ID)
         self.combo_engine.addItem("Local Offline LLM Engine (Qwen / Gemma)", "local_llm")
-        self.combo_engine.addItem("Rule-based Formatter (Fast, Local, Offline)", actions.RULE_BASED_ID)
+        # NOTE: the rule-based formatter is no longer offered as a pickable
+        # engine - it survives only as the app's invisible safety fallback
+        # (privacy mode, lapsed Pro, missing local model).
         self.combo_engine.addItem("Google Gemini API (Cloud Engine)", actions.API_GEMINI_ID)
         self.combo_engine.addItem("OpenAI-compatible API (Cloud Engine)", actions.API_OPENAI_ID)
         self.combo_engine.addItem("Anthropic Claude API (Cloud Engine)", actions.API_ANTHROPIC_ID)
@@ -2159,11 +2176,10 @@ class Settings(QDialog):
         if not hasattr(self, "combo_engine"):
             return
         model = self.combo_engine.model()
-        # LOCAL tags on the on-device engines (privacy-friendly choices).
-        for local_id in ("local_llm", actions.RULE_BASED_ID):
-            lidx = self.combo_engine.findData(local_id)
-            if lidx >= 0 and model.item(lidx) is not None:
-                model.item(lidx).setData("local", _PillItemDelegate.PILL_ROLE)
+        # LOCAL tag on the on-device engine (privacy-friendly choice).
+        lidx = self.combo_engine.findData("local_llm")
+        if lidx >= 0 and model.item(lidx) is not None:
+            model.item(lidx).setData("local", _PillItemDelegate.PILL_ROLE)
         pro = self._is_pro()
         idx = self.combo_engine.findData(actions.API_MANAGED_ID)
         if idx < 0:
@@ -2174,27 +2190,28 @@ class Settings(QDialog):
             item.setData("pro", _PillItemDelegate.PILL_ROLE)
         if not pro and self.combo_engine.currentData() == actions.API_MANAGED_ID:
             self.combo_engine.blockSignals(True)
-            ridx = self.combo_engine.findData(actions.RULE_BASED_ID)
+            ridx = self.combo_engine.findData("local_llm")
             if ridx >= 0:
                 self.combo_engine.setCurrentIndex(ridx)
             self.combo_engine.blockSignals(False)
-            self.cfg_working["action_model"] = actions.RULE_BASED_ID
+            if self.cfg_working.get("action_model") not in local_llm.MODEL_CATALOG:
+                self.cfg_working["action_model"] = local_llm.QWEN_TINY_ID
             # During tab construction the stack doesn't exist yet; the later
             # _load_values_into_widgets pass sets the panel from the combo.
             if hasattr(self, "engine_stack"):
-                self._set_backend_layout(actions.RULE_BASED_ID)
+                self._set_backend_layout("local_llm")
 
     def _on_engine_changed(self, idx):
         provider = self.combo_engine.itemData(idx)
         # Managed engine is Pro-only: a free/guest user choosing it gets the
         # paywall, and the selection reverts to their previous engine.
         if provider == actions.API_MANAGED_ID and not self._is_pro():
-            prev = self.cfg_working.get("action_model", actions.RULE_BASED_ID)
-            if prev in local_llm.MODEL_CATALOG:
+            prev = self.cfg_working.get("action_model", "local_llm")
+            if prev in local_llm.MODEL_CATALOG or prev == actions.RULE_BASED_ID:
                 prev = "local_llm"
             ridx = self.combo_engine.findData(prev)
             if ridx < 0 or prev == actions.API_MANAGED_ID:
-                ridx = self.combo_engine.findData(actions.RULE_BASED_ID)
+                ridx = self.combo_engine.findData("local_llm")
             self.combo_engine.blockSignals(True)
             self.combo_engine.setCurrentIndex(max(0, ridx))
             self.combo_engine.blockSignals(False)
@@ -2490,9 +2507,9 @@ class Settings(QDialog):
                     item.setEnabled(not is_private)
                     item.setForeground(QColor("#cbd5e1") if is_private else QColor("#1e293b"))
             if is_private and self.combo_engine.currentData() in cloud_ids:
-                idx = self.combo_engine.findData(actions.RULE_BASED_ID)
+                idx = self.combo_engine.findData("local_llm")
                 if idx >= 0:
-                    self.combo_engine.setCurrentIndex(idx)  # back to Rule-based Formatter
+                    self.combo_engine.setCurrentIndex(idx)  # back to the local engine
 
     def _save_action_configs(self):
         if not self.app:
@@ -3358,10 +3375,12 @@ class Settings(QDialog):
             self.chk_managed.blockSignals(False)
         # AI Actions engine dropdown + its cloud key field.
         if hasattr(self, "combo_engine"):
-            prov = self.cfg_working.get("action_model", "rule_based")
+            prov = self.cfg_working.get("action_model", "local_llm")
             import local_llm
             if prov in (local_llm.QWEN_TINY_ID, local_llm.QWEN_3B_ID,
                         local_llm.QWEN_7B_ID, local_llm.GEMMA_2B_ID):
+                prov = "local_llm"
+            if prov == actions.RULE_BASED_ID:
                 prov = "local_llm"
             idx = self.combo_engine.findData(prov)
             if idx >= 0:
