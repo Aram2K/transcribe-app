@@ -74,6 +74,7 @@ class Settings(QDialog):
     google_test_finished = Signal(bool, str)
     action_key_test_finished = Signal(bool, str)  # AI Actions cloud key test
     feedback_finished = Signal(bool, str)
+    account_delete_finished = Signal(bool, str)
     specs_ready = Signal(str)  # GPU name detected on a worker thread
 
     def __init__(self, parent=None, main_app=None):
@@ -114,6 +115,7 @@ class Settings(QDialog):
         self.google_test_finished.connect(self._on_google_test_finished)
         self.action_key_test_finished.connect(self._on_action_key_test_finished)
         self.feedback_finished.connect(self._on_feedback_finished)
+        self.account_delete_finished.connect(self._on_account_delete_finished)
         self.specs_ready.connect(self._on_specs_ready)
         
         # Whisper model card controls references
@@ -309,8 +311,9 @@ class Settings(QDialog):
             self.combo_local_model.setCurrentIndex(idx)
             self.combo_local_model.blockSignals(False)
             
-        # 7. Stack layout based on engine
+        # 7. Stack layout based on engine (+ Pro-only availability of managed)
         self._set_backend_layout(provider)
+        self._refresh_engine_availability()
         
         # 8. Telemetry
         self.chk_telemetry.blockSignals(True)
@@ -1668,6 +1671,9 @@ class Settings(QDialog):
                 self.combo_engine.setCurrentIndex(idx)
         self.combo_engine.currentIndexChanged.connect(self._on_engine_changed)
         self._configure_dropdown(self.combo_engine, min_width=320)
+        from PySide6.QtCore import QSize
+        self.combo_engine.setIconSize(QSize(36, 18))  # room for the PRO pill
+        self._refresh_engine_availability()
         engine_lay.addWidget(self.combo_engine)
         engine_section_lay.addWidget(engine_frame)
 
@@ -2115,6 +2121,34 @@ class Settings(QDialog):
         card.btn_action.style().unpolish(card.btn_action)
         card.btn_action.style().polish(card.btn_action)
 
+    def _refresh_engine_availability(self):
+        """The managed cloud engine is Pro-only: for free/guest users the option
+        is grayed out with a small PRO pill, and any stale managed selection is
+        switched back to the rule-based engine."""
+        if not hasattr(self, "combo_engine"):
+            return
+        from PySide6.QtGui import QIcon
+        from ui.icons import pro_pill_icon
+        pro = self._is_pro()
+        idx = self.combo_engine.findData(actions.API_MANAGED_ID)
+        if idx < 0:
+            return
+        item = self.combo_engine.model().item(idx)
+        if item is not None:
+            item.setEnabled(pro)
+        self.combo_engine.setItemIcon(idx, QIcon() if pro else pro_pill_icon())
+        if not pro and self.combo_engine.currentData() == actions.API_MANAGED_ID:
+            self.combo_engine.blockSignals(True)
+            ridx = self.combo_engine.findData(actions.RULE_BASED_ID)
+            if ridx >= 0:
+                self.combo_engine.setCurrentIndex(ridx)
+            self.combo_engine.blockSignals(False)
+            self.cfg_working["action_model"] = actions.RULE_BASED_ID
+            # During tab construction the stack doesn't exist yet; the later
+            # _load_values_into_widgets pass sets the panel from the combo.
+            if hasattr(self, "engine_stack"):
+                self._set_backend_layout(actions.RULE_BASED_ID)
+
     def _on_engine_changed(self, idx):
         provider = self.combo_engine.itemData(idx)
         self._set_backend_layout(provider)
@@ -2420,8 +2454,10 @@ class Settings(QDialog):
         elif provider == actions.RULE_BASED_ID:
             self.cfg_working["action_model"] = actions.RULE_BASED_ID
         elif provider == actions.API_MANAGED_ID:
-            # Managed Pro cloud: nothing to configure, no key to store.
-            self.cfg_working["action_model"] = actions.API_MANAGED_ID
+            # Managed Pro cloud: nothing to configure, no key to store. Never
+            # persist it for a non-Pro user (the option is grayed out anyway).
+            self.cfg_working["action_model"] = (
+                actions.API_MANAGED_ID if self._is_pro() else actions.RULE_BASED_ID)
         else: # Cloud API config saving
             self.cfg_working["action_model"] = provider
             key_text = self.cloud_api_key.text().strip()
@@ -2824,6 +2860,28 @@ class Settings(QDialog):
         btns.addStretch()
         c.addLayout(btns)
 
+        # Legal links + GDPR account deletion.
+        legal_row = QHBoxLayout()
+        legal_row.setSpacing(8)
+        self._legal_links = QLabel(
+            '<a href="https://aibuben.xyz/terms">Terms of Service</a> &nbsp;·&nbsp; '
+            '<a href="https://aibuben.xyz/privacy">Privacy Policy</a>', card)
+        self._legal_links.setObjectName("subtitleLabel")
+        self._legal_links.setOpenExternalLinks(True)
+        self._legal_links.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        legal_row.addWidget(self._legal_links)
+        legal_row.addStretch()
+        self._acct_delete_btn = QPushButton("Delete account", card)
+        self._acct_delete_btn.setFlat(True)
+        self._acct_delete_btn.setCursor(Qt.PointingHandCursor)
+        self._acct_delete_btn.setStyleSheet(
+            "QPushButton { color: #dc2626; border: none; font-size: 12px; }"
+            "QPushButton:hover { text-decoration: underline; }")
+        self._acct_delete_btn.clicked.connect(self._acct_delete_account)
+        self._acct_delete_btn.setVisible(False)  # signed-in users only
+        legal_row.addWidget(self._acct_delete_btn)
+        c.addLayout(legal_row)
+
         # Super-admin only: force a tier locally (for testing / control).
         self._admin_row = QWidget(card)
         ar = QHBoxLayout(self._admin_row)
@@ -3109,6 +3167,65 @@ class Settings(QDialog):
         if ok:
             self._fb_text.clear()
             self._fb_clear_images()
+
+    def _acct_delete_account(self):
+        """GDPR right-to-erasure: double confirmation (typed DELETE), then the
+        server cancels any subscription, scrubs PII, and deletes the account."""
+        auth = getattr(self.app, "auth", None) if self.app else None
+        if not (auth and auth.is_authenticated):
+            return
+        from PySide6.QtWidgets import QMessageBox, QInputDialog, QLineEdit as _QLE
+        box = QMessageBox(self)
+        box.setWindowTitle("Delete account")
+        box.setIcon(QMessageBox.Warning)
+        box.setText("This permanently deletes your account.")
+        box.setInformativeText(
+            "Your subscription (if any) is cancelled, your server data is "
+            "erased, and you will be signed out. Local transcripts on this "
+            "computer are not touched.\n\nThis cannot be undone.")
+        cont = box.addButton("Continue", QMessageBox.DestructiveRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is not cont:
+            return
+        typed, ok = QInputDialog.getText(
+            self, "Confirm deletion", 'Type DELETE to confirm:', _QLE.Normal, "")
+        if not ok or typed.strip() != "DELETE":
+            return
+        self._acct_delete_btn.setEnabled(False)
+
+        def worker():
+            import requests
+            import main as m
+            try:
+                token = auth.get_access_token()
+                if not token:
+                    self.account_delete_finished.emit(False, "Your session expired. Sign in again and retry.")
+                    return
+                resp = requests.post(
+                    m.DELETE_ACCOUNT_URL, json={"confirm": "DELETE"},
+                    headers={"Authorization": f"Bearer {token}"}, timeout=30)
+                if resp.status_code == 200:
+                    self.account_delete_finished.emit(True, "Your account was deleted.")
+                else:
+                    self.account_delete_finished.emit(
+                        False, f"Could not delete the account (HTTP {resp.status_code}). Try again later.")
+            except Exception as e:
+                self.account_delete_finished.emit(False, f"Network error: {str(e)[:60]}")
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_account_delete_finished(self, ok, message):
+        from PySide6.QtWidgets import QMessageBox
+        if hasattr(self, "_acct_delete_btn"):
+            self._acct_delete_btn.setEnabled(True)
+        if ok:
+            if self.app and hasattr(self.app, "sign_out"):
+                self.app.sign_out()
+            QMessageBox.information(self, "Account deleted", message)
+        else:
+            QMessageBox.warning(self, "Delete account", message)
 
     def _acct_sign_in(self):
         if self.app and hasattr(self.app, "show_auth_gate"):
@@ -3412,6 +3529,8 @@ class Settings(QDialog):
         self._acct_upgrade_btn.setVisible(authed and not is_pro)
         self._acct_manage_btn.setVisible(authed and is_pro)
         self._acct_signout_btn.setVisible(authed)
+        if hasattr(self, "_acct_delete_btn"):
+            self._acct_delete_btn.setVisible(authed)
         # Pro users already have everything, so don't sell them the perks list.
         if hasattr(self, "_acct_perks"):
             self._acct_perks.setVisible(not is_pro)
@@ -3421,6 +3540,8 @@ class Settings(QDialog):
         # Cloud STT cards switch between Pro (keyless) and free (BYO key) styling.
         if hasattr(self, "google_card") or hasattr(self, "mistral_cards"):
             self._refresh_cloud_cards()
+        # Managed AI-Actions engine is Pro-only; keep the dropdown in sync.
+        self._refresh_engine_availability()
 
     def _check_for_updates(self):
         if self.app and self.cfg_working.get("pending_update_version"):

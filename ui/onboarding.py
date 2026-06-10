@@ -233,6 +233,19 @@ class Onboarding(QDialog):
         self.btn_google.clicked.connect(self._choose_google)
         cl.addWidget(self.btn_google)
 
+        # Clickwrap consent: agreeing at account creation is the legally binding
+        # moment (much stronger than an installer EULA click-through).
+        self._legal_label = QLabel(
+            'By continuing you agree to our '
+            '<a href="https://aibuben.xyz/terms">Terms of Service</a> and '
+            '<a href="https://aibuben.xyz/privacy">Privacy Policy</a>.', card)
+        self._legal_label.setObjectName("subtitleLabel")
+        self._legal_label.setWordWrap(True)
+        self._legal_label.setAlignment(Qt.AlignCenter)
+        self._legal_label.setOpenExternalLinks(True)
+        self._legal_label.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        cl.addWidget(self._legal_label)
+
         # Pressing Enter to sign in must NOT also fire another button. Qt makes
         # buttons "auto-default" inside dialogs, so Enter was triggering "Forgot
         # password?" on every email sign-in (a reset email each time). The

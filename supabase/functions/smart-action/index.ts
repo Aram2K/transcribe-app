@@ -14,7 +14,9 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
 const MISTRAL_KEY = Deno.env.get("MISTRAL_STT_KEY") ?? "";
 const MODEL = "mistral-small-latest"; // good-enough, fast + cheap
-const DAILY_CAP = 3000;
+// 200/day is ~10x any human's realistic dictation pace - a cost-abuse ceiling,
+// not a usage limit. Counted separately from the cloud-STT quota.
+const DAILY_CAP = 200;
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -41,7 +43,7 @@ Deno.serve(async (req) => {
   if (proErr) return json({ error: "entitlement_check_failed" }, 500);
   if (pro !== true) return json({ error: "pro_required" }, 403);
 
-  const { data: underCap, error: qErr } = await supa.rpc("use_cloud_quota", { max_per_day: DAILY_CAP });
+  const { data: underCap, error: qErr } = await supa.rpc("use_smart_action_quota", { max_per_day: DAILY_CAP });
   if (qErr) return json({ error: "quota_check_failed" }, 500);
   if (underCap !== true) return json({ error: "quota_exceeded" }, 429);
 

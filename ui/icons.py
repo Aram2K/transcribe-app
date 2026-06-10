@@ -87,6 +87,31 @@ def _draw_speaker(p, rect, color=_SLATE):
         p.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), -50 * 16, 100 * 16)
 
 
+def pro_pill_icon(width=36, height=18):
+    """Small purple 'PRO' pill used to mark Pro-only choices in dropdowns."""
+    key = ("propill", width, height)
+    if key in _ICON_CACHE:
+        return _ICON_CACHE[key]
+    # Paint at 2x for crispness; QIcon scales down.
+    W, H = width * 2, height * 2
+    pm = QPixmap(W, H)
+    pm.fill(Qt.transparent)
+    p = _painter(pm)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(168, 85, 247))
+    p.drawRoundedRect(QRectF(0, 0, W, H), H / 2, H / 2)
+    f = p.font()
+    f.setBold(True)
+    f.setPixelSize(int(H * 0.58))
+    p.setFont(f)
+    p.setPen(QColor("#ffffff"))
+    p.drawText(QRectF(0, 0, W, H), Qt.AlignCenter, "PRO")
+    p.end()
+    icon = QIcon(pm)
+    _ICON_CACHE[key] = icon
+    return icon
+
+
 def eye_icon(open_=True, size=22, color=_SLATE):
     """Eye for password fields: open (click to reveal) or slashed (click to hide)."""
     key = ("eye", open_, size)

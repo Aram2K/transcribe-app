@@ -20,6 +20,37 @@ import telemetry
 class MeetingProcessingSignal(QObject):
     finished = Signal(str, str) # notes, error_msg
 
+
+def ensure_recording_consent(parent, app):
+    """One-time notice before the first meeting recording: capturing other
+    people's voices may require their consent depending on jurisdiction. The
+    user must acknowledge once; we persist the acknowledgement. Returns True
+    when recording may proceed."""
+    cfg = getattr(app, "cfg", None)
+    if cfg is None or cfg.get("meeting_consent_ack"):
+        return True
+    box = QMessageBox(parent)
+    box.setWindowTitle("Before you record")
+    box.setIcon(QMessageBox.Information)
+    box.setText("You're about to record a meeting - including other people's voices.")
+    box.setInformativeText(
+        "Depending on your country or state, recording a conversation may "
+        "require the consent of all participants. By continuing you confirm "
+        "you have any consent required where you are.\n\n"
+        "This notice is shown only once."
+    )
+    ok = box.addButton("I understand - continue", QMessageBox.AcceptRole)
+    box.addButton("Cancel", QMessageBox.RejectRole)
+    box.exec()
+    if box.clickedButton() is ok:
+        cfg["meeting_consent_ack"] = True
+        try:
+            app.save_config()
+        except Exception:
+            pass
+        return True
+    return False
+
 class MeetingsWindow(QDialog):
     STATE_IDLE = "idle"
     STATE_RECORDING = "recording"
@@ -321,6 +352,11 @@ class MeetingsWindow(QDialog):
     # ── State Machine Triggers ──
     def _start_meeting(self):
         if not self.app or not self.app.recorder:
+            return
+
+        # One-time legal notice: recording other participants may require their
+        # consent. Must be acknowledged before the first recording ever starts.
+        if not ensure_recording_consent(self, self.app):
             return
 
         # A plain Alt-R dictation shares this same AudioRecorder + audio device.

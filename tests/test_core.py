@@ -177,6 +177,39 @@ class TestConfig(unittest.TestCase):
         finally:
             m.CONFIG_PATH = orig
 
+    def test_save_config_keeps_secrets_out_of_disk_when_keyring_available(self):
+        # All BYO keys (incl. Mistral) and the per-user stashed keys must go to
+        # the OS keyring - plaintext config.json only ever stores "".
+        import json as _json
+        import main as m
+        written = {}
+
+        def fake_write(name, value):
+            written[name] = value
+            return True
+
+        with patch.object(m.storage, "write_secret", side_effect=fake_write), \
+             patch.object(m.storage, "atomic_write_json") as aw:
+            cfg = {**m.DEFAULT,
+                   "google_api_key": "G-key", "action_api_key": "A-key",
+                   "mistral_api_key": "M-key",
+                   "user_secrets": {"user:A": {"google_api_key": "UG-key",
+                                               "backend": "local"}}}
+            m.save_config(cfg)
+
+        disk = aw.call_args[0][1]
+        self.assertEqual(disk["google_api_key"], "")
+        self.assertEqual(disk["action_api_key"], "")
+        self.assertEqual(disk["mistral_api_key"], "")
+        self.assertEqual(disk["user_secrets"]["user:A"]["google_api_key"], "")
+        self.assertEqual(disk["user_secrets"]["user:A"]["backend"], "local")
+        # Keyring received the real values.
+        self.assertEqual(written[m.storage.MISTRAL_API_KEY_SECRET], "M-key")
+        blob = _json.loads(written[m.storage.USER_SECRETS_SECRET])
+        self.assertEqual(blob["user:A"]["google_api_key"], "UG-key")
+        # The in-memory config the app keeps using is untouched.
+        self.assertEqual(cfg["user_secrets"]["user:A"]["google_api_key"], "UG-key")
+
     def test_partial_config_merged_with_defaults(self):
         import main as m
         orig = m.CONFIG_PATH

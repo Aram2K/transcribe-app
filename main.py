@@ -45,6 +45,7 @@ APP_VERSION = "1.5.48"
 # ── Managed cloud transcription (Pro moat) ────────────────────────────────────
 MANAGED_PROXY_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-proxy"
 FEEDBACK_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/submit-feedback"
+DELETE_ACCOUNT_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/delete-account"
 
 # ── Monetization links (Stripe) ───────────────────────────────────────────────
 PRO_MONTHLY_URL = "https://buy.stripe.com/3cI5kC30N1oeari7rh0Ba00"
@@ -83,6 +84,7 @@ DEFAULT = {
     "accent_color":  "#3b82f6",
     "backend":       "local",
     "google_api_key": "",
+    "mistral_api_key": "",
     "initial_prompt": "",
     "output_action": "transcribe_only",
     "action_model": "rule_based",
@@ -109,6 +111,7 @@ DEFAULT = {
     "pending_update_body": "",
     "previous_version": "",
     "tray_hint_shown": False,
+    "meeting_consent_ack": False,  # one-time recording-consent notice
 }
 
 storage.migrate_legacy_file(LEGACY_CONFIG_PATH, CONFIG_PATH)
@@ -124,6 +127,35 @@ MISTRAL_STT_MODELS = {"voxtral-mini-latest", "voxtral-mini-2602", "voxtral-mini-
 
 def normalize_mistral_model(model):
     return model if model in MISTRAL_STT_MODELS else MISTRAL_STT_DEFAULT
+
+
+# BYO key fields that must never sit in plaintext config.json (they live in the
+# OS keyring; config keeps "" once migrated).
+_SECRET_CFG_KEYS = ("google_api_key", "action_api_key", "mistral_api_key")
+
+
+def _strip_user_secret_keys(store):
+    """Split cfg['user_secrets'] into (sanitized_store_for_disk, keys_blob).
+    The blob ({owner: {key_field: value}}) goes to the OS keyring; the on-disk
+    store keeps everything else (engine choices) with the key fields blanked."""
+    if not isinstance(store, dict):
+        return store, {}
+    sanitized, blob = {}, {}
+    for owner, snap in store.items():
+        if not isinstance(snap, dict):
+            sanitized[owner] = snap
+            continue
+        clean = dict(snap)
+        keys = {}
+        for k in _SECRET_CFG_KEYS:
+            v = clean.get(k)
+            if isinstance(v, str) and v.strip():
+                keys[k] = v
+            clean[k] = ""
+        sanitized[owner] = clean
+        if keys:
+            blob[owner] = keys
+    return sanitized, blob
 
 
 def load_config():
@@ -170,6 +202,36 @@ def load_config():
     else:
         loaded["action_api_key"] = storage.read_secret(storage.ACTION_API_KEY_SECRET)
 
+    mistral_key = (loaded.get("mistral_api_key") or "").strip()
+    if mistral_key:
+        # Migrate a plaintext Mistral key from config.json into the OS keyring.
+        if storage.write_secret(storage.MISTRAL_API_KEY_SECRET, mistral_key):
+            loaded["mistral_api_key"] = mistral_key
+            disk = {**loaded, "google_api_key": "", "action_api_key": "", "mistral_api_key": ""}
+            try:
+                storage.atomic_write_json(CONFIG_PATH, disk)
+            except OSError as e:
+                logger.warning("Could not sanitize Mistral API key in config: %s", e)
+    else:
+        loaded["mistral_api_key"] = storage.read_secret(storage.MISTRAL_API_KEY_SECRET)
+
+    # Per-user stashed keys (account switching) live in the keyring as one JSON
+    # blob; merge them back over the sanitized on-disk snapshots.
+    try:
+        blob_raw = storage.read_secret(storage.USER_SECRETS_SECRET)
+        if blob_raw:
+            blob = json.loads(blob_raw)
+            store = loaded.get("user_secrets")
+            if isinstance(blob, dict) and isinstance(store, dict):
+                for owner, keys in blob.items():
+                    snap = store.get(owner)
+                    if isinstance(snap, dict) and isinstance(keys, dict):
+                        for k, v in keys.items():
+                            if k in _SECRET_CFG_KEYS and v and not snap.get(k):
+                                snap[k] = v
+    except Exception:
+        logger.debug("Could not merge user secrets from keyring", exc_info=True)
+
     if ANALYTICS_CONSENT_PATH.exists() and not loaded.get("analytics_consent_applied"):
         if ANALYTICS_DECLINED_PATH.exists():
             loaded["analytics_enabled"] = False
@@ -195,6 +257,17 @@ def save_config(c):
     action_key = (disk.get("action_api_key") or "").strip()
     if storage.write_secret(storage.ACTION_API_KEY_SECRET, action_key):
         disk["action_api_key"] = ""
+    mistral_key = (disk.get("mistral_api_key") or "").strip()
+    if storage.write_secret(storage.MISTRAL_API_KEY_SECRET, mistral_key):
+        disk["mistral_api_key"] = ""
+    # Per-user stashed keys (account switching) go to the keyring too - the
+    # on-disk store keeps only the non-secret engine config per user.
+    sanitized_store, keys_blob = _strip_user_secret_keys(disk.get("user_secrets"))
+    try:
+        if storage.write_secret(storage.USER_SECRETS_SECRET, json.dumps(keys_blob)):
+            disk["user_secrets"] = sanitized_store
+    except Exception:
+        logger.debug("Could not stash user secrets in keyring", exc_info=True)
     storage.atomic_write_json(CONFIG_PATH, disk)
 
 cfg = load_config()
