@@ -325,23 +325,35 @@ class MeetingsWindow(QDialog):
     # ── Audio Device Scan ──
     def _populate_audio_devices(self):
         from ui.icons import meeting_mode_icon
+        # Only offer system-audio capture where loopback genuinely exists
+        # (Windows/WASAPI). Elsewhere - notably macOS - those modes would
+        # silently record the mic anyway, so they're hidden.
+        try:
+            import main as _m
+            has_loopback = bool(getattr(_m, "HAS_LOOPBACK", False))
+        except Exception:
+            has_loopback = False
         self.combo_device.clear()
-        self.combo_device.addItem(
-            meeting_mode_icon("smart_meeting"),
-            "System sound + Microphone (best for meetings)", "smart_meeting")
+        if has_loopback:
+            self.combo_device.addItem(
+                meeting_mode_icon("smart_meeting"),
+                "System sound + Microphone (best for meetings)", "smart_meeting")
         self.combo_device.addItem(
             meeting_mode_icon("default_mic"),
             "Microphone only", "default_mic")
-        self.combo_device.addItem(
-            meeting_mode_icon("system_only"),
-            "System sound only (no microphone)", "system_only")
+        if has_loopback:
+            self.combo_device.addItem(
+                meeting_mode_icon("system_only"),
+                "System sound only (no microphone)", "system_only")
 
-        # Get from active config
-        current_dev = "smart_meeting"
+        # Get from active config (heal modes this system can't capture)
+        valid = ("smart_meeting", "default_mic", "system_only") if has_loopback else ("default_mic",)
+        default_mode = "smart_meeting" if has_loopback else "default_mic"
+        current_dev = default_mode
         if self.app:
-            current_dev = self.app.cfg.get("meeting_audio_mode", "smart_meeting")
-            if current_dev not in ("smart_meeting", "default_mic", "system_only"):
-                current_dev = "smart_meeting"
+            current_dev = self.app.cfg.get("meeting_audio_mode", default_mode)
+            if current_dev not in valid:
+                current_dev = default_mode
 
         idx = self.combo_device.findData(str(current_dev))
         if idx >= 0:

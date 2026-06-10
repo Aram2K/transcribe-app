@@ -604,21 +604,34 @@ class Settings(QDialog):
 
     def _populate_audio_devices(self):
         from ui.icons import meeting_mode_icon
+        # System-audio capture rides on WASAPI loopback (Windows). On macOS /
+        # systems without it, offering those modes would silently record the
+        # mic anyway - so only show what genuinely works here.
+        try:
+            import main as _m
+            has_loopback = bool(getattr(_m, "HAS_LOOPBACK", False))
+        except Exception:
+            has_loopback = False
         self.combo_device.clear()
-        self.combo_device.addItem(
-            meeting_mode_icon("smart_meeting"),
-            "System sound + Microphone (best for meetings)", "smart_meeting")
+        if has_loopback:
+            self.combo_device.addItem(
+                meeting_mode_icon("smart_meeting"),
+                "System sound + Microphone (best for meetings)", "smart_meeting")
         self.combo_device.addItem(
             meeting_mode_icon("default_mic"),
             "Microphone only", "default_mic")
-        self.combo_device.addItem(
-            meeting_mode_icon("system_only"),
-            "System sound only (no microphone)", "system_only")
+        if has_loopback:
+            self.combo_device.addItem(
+                meeting_mode_icon("system_only"),
+                "System sound only (no microphone)", "system_only")
 
-        # Set to current saved meeting capture mode
-        current_dev = self.cfg_working.get("meeting_audio_mode", "smart_meeting")
-        if current_dev not in ("smart_meeting", "default_mic", "system_only"):
-            current_dev = "smart_meeting"
+        # Set to current saved meeting capture mode (heal modes that this
+        # system can't capture).
+        valid = ("smart_meeting", "default_mic", "system_only") if has_loopback else ("default_mic",)
+        default_mode = "smart_meeting" if has_loopback else "default_mic"
+        current_dev = self.cfg_working.get("meeting_audio_mode", default_mode)
+        if current_dev not in valid:
+            current_dev = default_mode
 
         idx = self.combo_device.findData(str(current_dev))
         if idx >= 0:

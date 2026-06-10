@@ -112,6 +112,7 @@ DEFAULT = {
     "previous_version": "",
     "tray_hint_shown": False,
     "meeting_consent_ack": False,  # one-time recording-consent notice
+    "macos_perms_guide_shown": False,  # one-time macOS permission walkthrough
 }
 
 storage.migrate_legacy_file(LEGACY_CONFIG_PATH, CONFIG_PATH)
@@ -1505,6 +1506,11 @@ class AppController(QObject):
         elif not self.cfg.get("account_gate_seen", False):
             QTimer.singleShot(900, self.show_account_gate)
 
+        # macOS needs explicit permission grants (mic / Accessibility / Input
+        # Monitoring) or dictation looks silently broken. One-time guided setup.
+        if sys.platform == "darwin" and not self.cfg.get("macos_perms_guide_shown", False):
+            QTimer.singleShot(1200, self.show_macos_permissions_guide)
+
         # If a previous session already detected an update, prompt at startup
         # immediately - don't wait for the network check to confirm. (The
         # background check still runs and will clear the flag if no update.)
@@ -1946,6 +1952,65 @@ class AppController(QObject):
         self.onboarding_win.show()
         self.onboarding_win.raise_()
         self.onboarding_win.activateWindow()
+
+    def show_macos_permissions_guide(self):
+        """macOS only: a one-time walkthrough of the three permissions the app
+        needs (Microphone for dictation, Accessibility for auto-paste, Input
+        Monitoring for the global hotkey), with buttons that deep-link straight
+        into the right System Settings pane. Without these grants the app looks
+        silently broken on a Mac."""
+        if sys.platform != "darwin":
+            return
+        from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
+                                       QLabel, QPushButton)
+        import subprocess
+
+        dlg = QDialog()
+        dlg.setWindowTitle("Set up macOS permissions")
+        if hasattr(self, "style_content"):
+            dlg.setStyleSheet(self.style_content)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(10)
+        title = QLabel("Three quick permissions", dlg)
+        title.setStyleSheet("font-size: 17px; font-weight: 700; color: #0f172a;")
+        lay.addWidget(title)
+        sub = QLabel(
+            "macOS requires your explicit approval for each of these. "
+            "Grant them once and dictation just works.", dlg)
+        sub.setWordWrap(True)
+        sub.setStyleSheet("color: #475569;")
+        lay.addWidget(sub)
+
+        perms = (
+            ("Microphone", "Hear your voice for dictation.",
+             "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"),
+            ("Accessibility", "Paste the finished text into the app you're using.",
+             "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"),
+            ("Input Monitoring", "Detect the global dictation hotkey.",
+             "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"),
+        )
+        for name, why, url in perms:
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            txt = QLabel(f"<b>{name}</b><br><span style='color:#64748b'>{why}</span>", dlg)
+            txt.setWordWrap(True)
+            row.addWidget(txt, 1)
+            btn = QPushButton("Open Settings", dlg)
+            btn.setObjectName("secondaryButton")
+            btn.clicked.connect(lambda _=False, u=url: subprocess.Popen(["open", u]))
+            row.addWidget(btn, 0)
+            lay.addLayout(row)
+
+        done = QPushButton("Done - I've granted them", dlg)
+        done.setObjectName("primaryButton")
+        done.setMinimumHeight(38)
+        done.clicked.connect(dlg.accept)
+        lay.addWidget(done)
+
+        dlg.exec()
+        self.cfg["macos_perms_guide_shown"] = True
+        self.save_config()
 
     def show_auth_gate(self):
         """Open the email-first sign in / sign up dialog. Used by the Account tab,
