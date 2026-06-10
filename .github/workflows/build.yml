@@ -304,6 +304,15 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           prev="$(git tag --sort=-version:refname --list 'v*.*.*' | grep -vFx "${tag}" | head -n 1 || true)"
           {
+            # Hand-written notes win when present (docs/release-notes/<tag>.md);
+            # otherwise fall back to the commit-log digest.
+            if [ -f "docs/release-notes/${tag}.md" ]; then
+              cat "docs/release-notes/${tag}.md"
+              echo
+              if [ -n "${prev}" ]; then
+                echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${prev}...${tag}"
+              fi
+            else
             echo "## What's new in ${tag}"
             echo
             if [ -n "${prev}" ]; then
@@ -317,6 +326,7 @@ jobs:
               echo "First tagged release."
               echo
               git log --no-merges --pretty=format:'- %s' "${tag}"
+            fi
             fi
             echo
             echo

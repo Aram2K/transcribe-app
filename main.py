@@ -40,7 +40,7 @@ import auth
 import entitlements
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.5.48"
+APP_VERSION = "1.6.0"
 
 # ── Managed cloud transcription (Pro moat) ────────────────────────────────────
 MANAGED_PROXY_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-proxy"
