@@ -7,15 +7,35 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QCheckBox, QTabWidget, QWidget, QLineEdit, QTextEdit, QFrame, QScrollArea,
     QMessageBox, QGridLayout, QProgressBar, QStackedWidget, QRadioButton,
-    QButtonGroup, QSizePolicy,
+    QButtonGroup, QSizePolicy, QStyledItemDelegate, QStyle,
 )
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtGui import QFont, QColor, QIcon
 import local_llm
 import history as hist
 import telemetry
 import action_api
 import actions
 import entitlements
+
+
+class _PillItemDelegate(QStyledItemDelegate):
+    """Paints a small LOCAL/PRO pill RIGHT-aligned in dropdown rows (item icons
+    in Qt are hard-left, so the pills are drawn by hand instead)."""
+    PILL_ROLE = Qt.UserRole + 77
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        kind = index.data(self.PILL_ROLE)
+        if not kind:
+            return
+        from ui.icons import pro_pill_icon, local_pill_icon
+        icon, w = (pro_pill_icon(), 36) if kind == "pro" else (local_pill_icon(), 42)
+        h = 18
+        r = option.rect
+        mode = QIcon.Normal if (option.state & QStyle.State_Enabled) else QIcon.Disabled
+        icon.paint(painter, r.right() - w - 12, r.top() + (r.height() - h) // 2,
+                   w, h, Qt.AlignCenter, mode)
+
 
 class DownloadProgressSignal(QObject):
     progress = Signal(str, int, int, int) # model_name, percent, downloaded, total
@@ -1681,8 +1701,8 @@ class Settings(QDialog):
                 self.combo_engine.setCurrentIndex(idx)
         self.combo_engine.currentIndexChanged.connect(self._on_engine_changed)
         self._configure_dropdown(self.combo_engine, min_width=320)
-        from PySide6.QtCore import QSize
-        self.combo_engine.setIconSize(QSize(42, 18))  # room for the PRO/LOCAL pills
+        # Right-aligned LOCAL/PRO pills in the popup rows.
+        self.combo_engine.view().setItemDelegate(_PillItemDelegate(self.combo_engine.view()))
         self._refresh_engine_availability()
         engine_lay.addWidget(self.combo_engine)
         engine_section_lay.addWidget(engine_frame)
@@ -2119,27 +2139,26 @@ class Settings(QDialog):
         card.btn_action.style().polish(card.btn_action)
 
     def _refresh_engine_availability(self):
-        """The managed cloud engine is Pro-only: for free/guest users the option
-        is grayed out with a small PRO pill, and any stale managed selection is
-        switched back to the rule-based engine. Fully on-device engines always
-        carry a green LOCAL pill."""
+        """The managed cloud engine is Pro-only: it always shows a PRO pill
+        (right-aligned via _PillItemDelegate) and is grayed out for free/guest
+        users, with any stale managed selection switched back to rule-based.
+        Fully on-device engines always carry a green LOCAL pill."""
         if not hasattr(self, "combo_engine"):
             return
-        from PySide6.QtGui import QIcon
-        from ui.icons import pro_pill_icon, local_pill_icon
+        model = self.combo_engine.model()
         # LOCAL tags on the on-device engines (privacy-friendly choices).
         for local_id in ("local_llm", actions.RULE_BASED_ID):
             lidx = self.combo_engine.findData(local_id)
-            if lidx >= 0:
-                self.combo_engine.setItemIcon(lidx, local_pill_icon())
+            if lidx >= 0 and model.item(lidx) is not None:
+                model.item(lidx).setData("local", _PillItemDelegate.PILL_ROLE)
         pro = self._is_pro()
         idx = self.combo_engine.findData(actions.API_MANAGED_ID)
         if idx < 0:
             return
-        item = self.combo_engine.model().item(idx)
+        item = model.item(idx)
         if item is not None:
             item.setEnabled(pro)
-        self.combo_engine.setItemIcon(idx, QIcon() if pro else pro_pill_icon())
+            item.setData("pro", _PillItemDelegate.PILL_ROLE)
         if not pro and self.combo_engine.currentData() == actions.API_MANAGED_ID:
             self.combo_engine.blockSignals(True)
             ridx = self.combo_engine.findData(actions.RULE_BASED_ID)
