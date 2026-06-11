@@ -89,6 +89,19 @@ class FakeWin:
         self._x, self._y = x, y
 
 
+class FakeFramedWin(FakeWin):
+    """A window that, like a real shown window, reports an OS frame (title
+    bar) around the client area via frameGeometry()."""
+
+    def __init__(self, *args, frame_w=0, frame_h=32, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._frame_w, self._frame_h = frame_w, frame_h
+
+    def frameGeometry(self):
+        return FakeRect(self._x, self._y,
+                        self._w + self._frame_w, self._h + self._frame_h)
+
+
 class TestFitOnScreen(unittest.TestCase):
     def _fit(self, win, **kw):
         from ui.winfit import fit_on_screen
@@ -96,9 +109,13 @@ class TestFitOnScreen(unittest.TestCase):
 
     def _fully_visible(self, win):
         a = win.screen().availableGeometry()
+        fw = fh = 0
+        if hasattr(win, "frameGeometry"):
+            fg = win.frameGeometry()
+            fw, fh = fg.width() - win.width(), fg.height() - win.height()
         return (win.x() >= a.left() and win.y() >= a.top()
-                and win.x() + win.width() <= a.right() + 1
-                and win.y() + win.height() <= a.bottom() + 1)
+                and win.x() + win.width() + fw <= a.right() + 1
+                and win.y() + win.height() + fh <= a.bottom() + 1)
 
     def test_oversized_fixed_window_shrinks_and_centers(self):
         # A 520x680 fixed-size window (min == size) on a 600px-tall work area:
@@ -138,6 +155,35 @@ class TestFitOnScreen(unittest.TestCase):
         win._fit_positioned = True
         self._fit(win)
         self.assertGreaterEqual(win.y(), 40)
+
+    def test_title_bar_never_pushes_bottom_off_screen(self):
+        # The reported bug: a 1536x816 work area (1080p laptop at 125%) and a
+        # window stretched to near the cap. The old math capped the CLIENT
+        # height to the work area but moved by FRAME coordinates, so the
+        # 32px title bar hung the bottom edge ~20px below the screen.
+        win = FakeFramedWin(640, 792, x=448, y=12,
+                            screen_rect=FakeRect(0, 0, 1536, 816))
+        win._fit_positioned = True
+        self._fit(win)
+        self.assertTrue(self._fully_visible(win))
+
+    def test_frame_counted_when_centering(self):
+        # First show of an oversized window: shrink + center must keep the
+        # whole frame (not just the client area) inside the work area.
+        win = FakeFramedWin(900, 700, min_w=900, min_h=700,
+                            screen_rect=FakeRect(0, 0, 1000, 600))
+        self._fit(win)
+        self.assertLessEqual(win.height() + 32, 600 - 24 + 32)  # client capped
+        self.assertTrue(self._fully_visible(win))
+
+    def test_size_to_screen_leaves_room_for_frame(self):
+        # The proportional default size must subtract the frame too, so the
+        # proposal already fits with its title bar on small screens.
+        from ui.winfit import size_to_screen
+        win = FakeFramedWin(720, 780, screen_rect=FakeRect(0, 0, 1000, 580))
+        size_to_screen(win, 0.5, 0.95, 400, 540, 800, 880)
+        a = win.screen().availableGeometry()
+        self.assertLessEqual(win.height() + 32, a.height() - 24)
 
 
 if __name__ == "__main__":
