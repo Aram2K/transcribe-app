@@ -100,9 +100,8 @@ class Settings(QDialog):
     def __init__(self, parent=None, main_app=None):
         super().__init__(parent)
         self.app = main_app
-        
-        import copy
-        self.cfg_working = copy.deepcopy(self.app.cfg if self.app else {})
+
+        self.cfg_working = self._snapshot_cfg()
         
         self.setWindowTitle("Settings")
         # Soft minimum only - every tab scrolls, so the user may shrink the
@@ -156,12 +155,27 @@ class Settings(QDialog):
         self._set_backend_layout(_init_engine or (self.cfg_working.get("action_api_provider", "api_openai_compatible") if self.app else "api_openai_compatible"))
         self._load_values_into_widgets()
 
+    # Config keys owned by live controls that write app.cfg directly the moment
+    # they change (never staged through Save). They must not ride along in the
+    # cfg_working snapshot: Save does app.cfg.update(cfg_working), so a stale
+    # copy of such a key would silently revert a value changed after the
+    # snapshot - e.g. the admin force-tier preview snapping back to "free"
+    # while the header still showed PRO, re-locking Pro features behind the
+    # paywall.
+    _LIVE_APP_KEYS = ("admin_tier_override",)
+
+    def _snapshot_cfg(self):
+        import copy
+        cfg = copy.deepcopy(self.app.cfg if self.app else {})
+        for key in self._LIVE_APP_KEYS:
+            cfg.pop(key, None)
+        return cfg
+
     def showEvent(self, event):
         super().showEvent(event)
         self._fit_on_screen()
-        import copy
         if self.app:
-            self.cfg_working = copy.deepcopy(self.app.cfg)
+            self.cfg_working = self._snapshot_cfg()
         self._scan_model_statuses()
         self._load_values_into_widgets()
 

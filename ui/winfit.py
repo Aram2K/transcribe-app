@@ -13,6 +13,21 @@ from PySide6.QtWidgets import QApplication
 _MARGIN = 24
 
 
+def _frame_overhead(win):
+    """Extra width/height the OS window frame adds around the client area.
+
+    Qt's resize()/width()/height() exclude the frame, but move()/x()/y()
+    position the frame's top-left corner - so all fitting math must add the
+    frame back, or a window capped to the work area still hangs its title
+    bar's worth of pixels off the bottom edge of the screen."""
+    try:
+        fg = win.frameGeometry()
+        return (max(0, fg.width() - win.width()),
+                max(0, fg.height() - win.height()))
+    except Exception:
+        return 0, 0
+
+
 def size_to_screen(win, frac_w, frac_h, min_w, min_h, max_w, max_h):
     """Give `win` a default size proportional to the work area, clamped to a
     sane [min, max] design range - so dialogs feel the same on a 13" laptop at
@@ -22,12 +37,13 @@ def size_to_screen(win, frac_w, frac_h, min_w, min_h, max_w, max_h):
     if scr is None:
         return
     a = scr.availableGeometry()
+    fw, fh = _frame_overhead(win)
     w = int(min(max(a.width() * frac_w, min_w), max_w))
     h = int(min(max(a.height() * frac_h, min_h), max_h))
     # Never propose more than the work area itself (fit_on_screen still runs
     # after this as the final guarantee).
-    w = min(w, a.width() - _MARGIN)
-    h = min(h, a.height() - _MARGIN)
+    w = min(w, a.width() - _MARGIN - fw)
+    h = min(h, a.height() - _MARGIN - fh)
     win.resize(w, h)
 
 
@@ -44,8 +60,9 @@ def fit_on_screen(win, recenter=False):
     if scr is None:
         return
     avail = scr.availableGeometry()
-    max_w = max(320, avail.width() - _MARGIN)
-    max_h = max(240, avail.height() - _MARGIN)
+    fw, fh = _frame_overhead(win)
+    max_w = max(320, avail.width() - _MARGIN - fw)
+    max_h = max(240, avail.height() - _MARGIN - fh)
 
     # Hard minimums that don't fit this display must come down first,
     # otherwise resize() silently refuses to shrink the window.
@@ -61,9 +78,10 @@ def fit_on_screen(win, recenter=False):
     first = not getattr(win, "_fit_positioned", False)
     win._fit_positioned = True
     if first or recenter:
-        win.move(avail.center().x() - w // 2, avail.center().y() - h // 2)
+        win.move(avail.center().x() - (w + fw) // 2,
+                 avail.center().y() - (h + fh) // 2)
         return
-    x = max(avail.left(), min(win.x(), avail.right() - w + 1))
-    y = max(avail.top(), min(win.y(), avail.bottom() - h + 1))
+    x = max(avail.left(), min(win.x(), avail.right() - (w + fw) + 1))
+    y = max(avail.top(), min(win.y(), avail.bottom() - (h + fh) + 1))
     if (x, y) != (win.x(), win.y()):
         win.move(x, y)
