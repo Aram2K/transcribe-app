@@ -578,6 +578,9 @@ class AudioRecorder:
         # so bars stay calibrated to recent mic activity (handles mics with
         # very different gain levels - laptop mic vs. headset vs. far-field).
         self._level_peak      = 0.05
+        # Per-session language override (the meeting window's language
+        # selector). None = use the global cfg["language"] default.
+        self.language_override = None
 
     @staticmethod
     def _whisper_device():
@@ -692,6 +695,21 @@ class AudioRecorder:
         associated with the active default system playback/output device.
         If no exact match is found, falls back to the first WASAPI loopback or any loopback device.
         """
+        # PyAudioWPatch ships a native resolver that pairs the default output
+        # device with its loopback twin - always prefer it. The name matching
+        # below is only a fallback, and names can collide: a virtual device
+        # like 'Speakers (Steam Streaming Microphone)' also starts with
+        # 'Speakers', so a loose match can capture a silent virtual endpoint
+        # instead of the real speakers.
+        try:
+            info = self.audio.get_default_wasapi_loopback()
+            if info is not None and info.get("index") is not None:
+                logger.info("Native default WASAPI loopback: '%s' (index %s)",
+                            info.get("name", "?"), info.get("index"))
+                return int(info["index"])
+        except Exception as e:
+            logger.debug("get_default_wasapi_loopback unavailable: %s", e)
+
         out_name = ""
         try:
             default_out = self.audio.get_default_output_device_info()
@@ -739,19 +757,33 @@ class AudioRecorder:
                 logger.debug("Error scanning audio device %d: %s", i, e)
                 
         if wasapi_loopbacks:
+            # The loopback twin carries the FULL output device name
+            # ("Speakers (Realtek(R) Audio) [Loopback]") - match on that first.
+            # The loose core-name match alone picked the wrong device when
+            # several share a prefix (e.g. Steam's virtual speakers).
+            if out_name:
+                for idx, name in wasapi_loopbacks:
+                    if out_name.lower() in name.lower():
+                        logger.info("Matched WASAPI loopback device: '%s' (index %d) for output '%s'", name, idx, out_name)
+                        return idx
             if core_name:
                 for idx, name in wasapi_loopbacks:
                     if core_name.lower() in name.lower():
-                        logger.info("Matched WASAPI loopback device: '%s' (index %d) for output '%s'", name, idx, out_name)
+                        logger.info("Loosely matched WASAPI loopback device: '%s' (index %d) for output '%s'", name, idx, out_name)
                         return idx
             logger.info("Using first available WASAPI loopback device: '%s' (index %d)", wasapi_loopbacks[0][1], wasapi_loopbacks[0][0])
             return wasapi_loopbacks[0][0]
-            
+
         if any_loopbacks:
+            if out_name:
+                for idx, name in any_loopbacks:
+                    if out_name.lower() in name.lower():
+                        logger.info("Matched fallback loopback device: '%s' (index %d)", name, idx)
+                        return idx
             if core_name:
                 for idx, name in any_loopbacks:
                     if core_name.lower() in name.lower():
-                        logger.info("Matched fallback loopback device: '%s' (index %d)", name, idx)
+                        logger.info("Loosely matched fallback loopback device: '%s' (index %d)", name, idx)
                         return idx
             logger.info("Using first available loopback device: '%s' (index %d)", any_loopbacks[0][1], any_loopbacks[0][0])
             return any_loopbacks[0][0]
@@ -759,8 +791,47 @@ class AudioRecorder:
         logger.warning("No loopback audio devices found on the system.")
         return None
 
-    def start_recording(self, capture_mode=None):
+    def _loopback_to_mono16k(self, raw):
+        """Convert raw float32 loopback bytes (device rate/channels) to the
+        16 kHz mono float32 stream the rest of the pipeline expects."""
+        arr = np.frombuffer(raw, dtype=np.float32)
+        # Stereo to mono. Truncate to a whole number of frames first so a
+        # short/misaligned read can't crash reshape.
+        if self._loopback_channels > 1 and len(arr) > 0:
+            usable = len(arr) - (len(arr) % self._loopback_channels)
+            arr = (arr[:usable].reshape(-1, self._loopback_channels).mean(axis=1)
+                   if usable > 0 else arr[:0])
+        if self._loopback_rate != cfg["sample_rate"] and len(arr) > 0:
+            duration = len(arr) / self._loopback_rate
+            target = int(duration * cfg["sample_rate"])
+            if target > 0:
+                indices = np.linspace(0, len(arr) - 1, target)
+                arr = np.interp(indices, np.arange(len(arr)), arr).astype(np.float32)
+            else:
+                arr = arr[:0]
+        return arr.astype(np.float32, copy=False)
+
+    def _read_available_loopback(self, stream):
+        """Non-blockingly read whatever the loopback stream has buffered, as
+        16 kHz mono. Returns an empty array when nothing is playing - WASAPI
+        loopback devices deliver NO frames while the computer is silent, so a
+        blocking read could stall forever (and closing the stream under that
+        blocked read crashed the whole app natively)."""
+        try:
+            avail = stream.get_read_available()
+            if avail <= 0:
+                return np.zeros(0, dtype=np.float32)
+            raw = stream.read(avail, exception_on_overflow=False)
+            return self._loopback_to_mono16k(raw)
+        except Exception as e:
+            logger.debug("loopback read failed: %s", e)
+            return np.zeros(0, dtype=np.float32)
+
+    def start_recording(self, capture_mode=None, language=None):
         self.recording = True
+        # Per-session language: the meeting window passes its selector value;
+        # plain dictation passes nothing, which resets to the global default.
+        self.language_override = language or None
         with self._chunk_lock:
             self._chunk_frames     = []
             self._chunk_results    = {}
@@ -852,10 +923,59 @@ class AudioRecorder:
                 logger.warning("Could not open secondary mic stream: %s", me)
                 
         self.stop_requested = False
-        self._record_thread = threading.Thread(target=self._record, args=(is_loopback,), daemon=True)
+        # The recording thread OWNS the streams: it is the only reader and the
+        # only closer. Stream handles are passed as locals so a later
+        # start_recording can never make an old thread close the new streams.
+        self._record_thread = threading.Thread(
+            target=self._record, args=(is_loopback, self.stream, self.mic_stream),
+            daemon=True)
         self._record_thread.start()
 
-    def _record(self, is_loopback):
+    def _record(self, is_loopback, stream, mic_stream):
+        try:
+            self._record_loop(is_loopback, stream, mic_stream)
+        finally:
+            self._drain_and_close_streams(is_loopback, stream, mic_stream)
+
+    def _drain_and_close_streams(self, is_loopback, stream, mic_stream):
+        """Pull any tail audio still in PortAudio's buffers, then close the
+        streams. Runs on the recording thread, which owns the streams -
+        closing them from another thread while a read is in flight is a
+        native crash (access violation inside PortAudio), which is exactly
+        what happened when a meeting was stopped while the loopback read sat
+        blocked on a silent device."""
+        try:
+            avail = stream.get_read_available()
+            if avail > 0:
+                extra = stream.read(avail, exception_on_overflow=False)
+                if extra:
+                    if is_loopback:
+                        extra = self._loopback_to_mono16k(extra).tobytes()
+                    if extra:
+                        with self._chunk_lock:
+                            self._chunk_frames.append(extra)
+        except Exception as e:
+            logger.debug("Failed to drain primary stream: %s", e)
+        if mic_stream is not None:
+            try:
+                avail = mic_stream.get_read_available()
+                if avail > 0:
+                    extra_mic = mic_stream.read(avail, exception_on_overflow=False)
+                    if extra_mic:
+                        with self._chunk_lock:
+                            self._chunk_frames.append(extra_mic)
+            except Exception as e:
+                logger.debug("Failed to drain secondary mic stream: %s", e)
+        for s in (stream, mic_stream):
+            if s is None:
+                continue
+            try:
+                s.stop_stream()
+                s.close()
+            except Exception:
+                pass
+
+    def _record_loop(self, is_loopback, stream, mic_stream):
         sr          = cfg["sample_rate"]
         frame_dur   = cfg["chunk_size"] / sr
         silence_trigger_sec = cfg_float("silence_trigger_sec", SILENCE_TRIGGER_SEC, 0.2, 5.0)
@@ -867,9 +987,14 @@ class AudioRecorder:
         silence_sec  = 0.0
         noise_hist   = []
         read_errors   = 0
- 
+
         post_roll_chunks = 0
         max_post_roll = 4  # ~256ms post-roll to catch final spoken syllables in flight
+
+        # Pending loopback samples (16 kHz mono) waiting to be mixed with mic
+        # frames, and how long the loopback has delivered nothing (silence).
+        loop_fifo = np.zeros(0, dtype=np.float32)
+        loop_idle_sec = 0.0
 
         while self.recording or post_roll_chunks > 0:
             if self.stop_requested and post_roll_chunks == 0:
@@ -881,47 +1006,56 @@ class AudioRecorder:
                     self.recording = False
 
             try:
-                if is_loopback:
-                    read_len = int(cfg["chunk_size"] * (self._loopback_rate / cfg["sample_rate"]))
-                    raw_data = self.stream.read(read_len, exception_on_overflow=False)
-                    arr_loopback = np.frombuffer(raw_data, dtype=np.float32)
-                    
-                    # Convert stereo to mono. Truncate to a whole number of
-                    # frames first so a short/misaligned read can't crash reshape.
-                    if self._loopback_channels > 1 and len(arr_loopback) > 0:
-                        usable = len(arr_loopback) - (len(arr_loopback) % self._loopback_channels)
-                        if usable > 0:
-                            arr_loopback = arr_loopback[:usable].reshape(-1, self._loopback_channels).mean(axis=1)
-                        
-                    # Resample to 16000 Hz
-                    if self._loopback_rate != cfg["sample_rate"] and len(arr_loopback) > 0:
-                        duration = len(arr_loopback) / self._loopback_rate
-                        target_samples = int(duration * cfg["sample_rate"])
-                        indices = np.linspace(0, len(arr_loopback) - 1, target_samples)
-                        arr_loopback = np.interp(indices, np.arange(len(arr_loopback)), arr_loopback).astype(np.float32)
-                        
-                    data = arr_loopback.tobytes()
+                if is_loopback and mic_stream is not None:
+                    # smart_meeting: the MIC is the loop's clock (it always
+                    # delivers frames); the loopback is drained opportunistically
+                    # and mixed in. The old code blocked on the loopback read
+                    # first - WASAPI loopbacks deliver nothing while the
+                    # computer is silent, so the whole loop stalled (not even
+                    # the mic was transcribed) and stopping then crashed the
+                    # app by closing the stream under the blocked read.
+                    mic_data = mic_stream.read(cfg["chunk_size"], exception_on_overflow=False)
+                    arr_mic = np.frombuffer(mic_data, dtype=np.float32)
+                    loop_chunk = self._read_available_loopback(stream)
+                    if len(loop_chunk) > 0:
+                        loop_fifo = np.concatenate([loop_fifo, loop_chunk])
+                        # Clock drift safety valve: keep at most ~1s queued so
+                        # mix latency stays bounded.
+                        if len(loop_fifo) > sr:
+                            loop_fifo = loop_fifo[-sr:]
+                    n = min(len(arr_mic), len(loop_fifo))
+                    if n > 0:
+                        mixed = arr_mic.copy()
+                        mixed[:n] = np.clip((arr_mic[:n] + loop_fifo[:n]) * 0.75, -1.0, 1.0)
+                        loop_fifo = loop_fifo[n:]
+                        data = mixed.tobytes()
+                    else:
+                        data = mic_data
+                elif is_loopback:
+                    # system_only: poll instead of blocking - a read blocked on
+                    # a silent loopback device cannot be interrupted or closed
+                    # safely. While silent, synthesize the occasional silence
+                    # frame so the VAD still flushes the last spoken chunk to
+                    # the live transcript.
+                    loop_chunk = self._read_available_loopback(stream)
+                    if len(loop_chunk) == 0:
+                        time.sleep(0.05)
+                        loop_idle_sec += 0.05
+                        if loop_idle_sec >= silence_trigger_sec and speech_sec >= min_speech_sec:
+                            loop_idle_sec = 0.0
+                            data = np.zeros(cfg["chunk_size"], dtype=np.float32).tobytes()
+                        else:
+                            continue
+                    else:
+                        loop_idle_sec = 0.0
+                        data = loop_chunk.tobytes()
                 else:
-                    data = self.stream.read(cfg["chunk_size"], exception_on_overflow=False)
-                
-                # If we have a mic stream open, read from it and mix!
-                if hasattr(self, "mic_stream") and self.mic_stream is not None:
-                    try:
-                        mic_data = self.mic_stream.read(cfg["chunk_size"], exception_on_overflow=False)
-                        arr_loopback = np.frombuffer(data, dtype=np.float32)
-                        arr_mic = np.frombuffer(mic_data, dtype=np.float32)
-                        
-                        min_len = min(len(arr_loopback), len(arr_mic))
-                        if min_len > 0:
-                            mixed_arr = (arr_loopback[:min_len] + arr_mic[:min_len]) * 0.75
-                            mixed_arr = np.clip(mixed_arr, -1.0, 1.0)
-                            data = mixed_arr.tobytes()
-                    except Exception as me:
-                        logger.warning("Failed to read/mix mic stream: %s", me)
-                        
+                    data = stream.read(cfg["chunk_size"], exception_on_overflow=False)
+
                 read_errors = 0
 
                 arr = np.frombuffer(data, dtype=np.float32)
+                this_dur = (len(arr) / sr) if len(arr) > 0 else frame_dur
                 rms = float(np.sqrt(np.mean(arr ** 2))) if len(arr) > 0 else 0.0
 
                 noise_hist.append(rms)
@@ -956,10 +1090,10 @@ class AudioRecorder:
                     self._chunk_frames.append(data)
 
                 if is_speech:
-                    speech_sec  += frame_dur
+                    speech_sec  += this_dur
                     silence_sec  = 0.0
                 elif speech_sec > 0:
-                    silence_sec += frame_dur
+                    silence_sec += this_dur
 
                 total_sec    = speech_sec + silence_sec
                 should_chunk = (
@@ -1034,47 +1168,19 @@ class AudioRecorder:
 
     def stop_recording(self):
         self.stop_requested = True
-        
-        # Wait for the recording thread to cleanly complete the post-roll phase (max 400ms)
-        if hasattr(self, "_record_thread") and self._record_thread is not None:
-            self._record_thread.join(timeout=0.4)
-            
-        self.recording = False
-        
-        # Drain any lingering frames from PortAudio device input buffers
-        try:
-            avail = self.stream.get_read_available()
-            if avail > 0:
-                extra_data = self.stream.read(avail, exception_on_overflow=False)
-                if extra_data:
-                    with self._chunk_lock:
-                        self._chunk_frames.append(extra_data)
-        except Exception as e:
-            logger.debug("Failed to drain primary stream: %s", e)
-            
-        if hasattr(self, "mic_stream") and self.mic_stream is not None:
-            try:
-                avail = self.mic_stream.get_read_available()
-                if avail > 0:
-                    extra_mic = self.mic_stream.read(avail, exception_on_overflow=False)
-                    if extra_mic:
-                        with self._chunk_lock:
-                            self._chunk_frames.append(extra_mic)
-            except Exception as e:
-                logger.debug("Failed to drain secondary mic stream: %s", e)
 
-        try:
-            self.stream.stop_stream()
-            self.stream.close()
-        except Exception:
-            pass
-        if hasattr(self, "mic_stream") and self.mic_stream is not None:
-            try:
-                self.mic_stream.stop_stream()
-                self.mic_stream.close()
-            except Exception:
-                pass
-            self.mic_stream = None
+        # The recording thread finishes its post-roll reads, drains the device
+        # tail, and closes the streams itself (it owns them). NEVER close the
+        # streams from this thread: a cross-thread close while a read is in
+        # flight is a native PortAudio crash - the meeting-stop crash.
+        t = getattr(self, "_record_thread", None)
+        if t is not None:
+            t.join(timeout=5.0)
+            if t.is_alive():
+                logger.warning("Recording thread still busy; it will close its streams itself.")
+
+        self.recording = False
+        self.mic_stream = None
 
     def transcribe(self):
         pending = list(self._chunk_threads)
@@ -1137,6 +1243,11 @@ class AudioRecorder:
             self.on_lang_detected(detected, LANG_NAMES.get(detected, detected.upper()))
         return full_text.strip(), detected or "en"
 
+    def _lang_setting(self):
+        """The language for THIS recording session: an explicit per-session
+        override (the meeting window's selector) wins over the global default."""
+        return self.language_override or cfg.get("language", "auto")
+
     def _run_local(self, audio):
         sr = cfg["sample_rate"]
         if len(audio) < sr // 2:
@@ -1160,7 +1271,7 @@ class AudioRecorder:
         with self._model_lock:
             model = self._model
 
-        lang_setting = cfg["language"]
+        lang_setting = self._lang_setting()
         if lang_setting not in ("auto", "multi"):
             lang_arg = lang_setting
         elif lang_setting == "auto" and self._session_lang is not None:
@@ -1207,7 +1318,7 @@ class AudioRecorder:
             wav_bytes = self._float_to_wav(audio)  # full WAV; Gemini reads the header
             b64_data = base64.b64encode(wav_bytes).decode("utf-8")
 
-            lang_setting = cfg.get("language", "auto")
+            lang_setting = self._lang_setting()
             lang_names = {"hy": "Armenian", "ru": "Russian", "en": "English",
                           "fr": "French", "de": "German", "es": "Spanish", "ar": "Arabic"}
             lang_hint = ""
@@ -1273,7 +1384,7 @@ class AudioRecorder:
                 json={
                     "audio": b64_data,
                     "sample_rate": cfg["sample_rate"],
-                    "language": cfg["language"],
+                    "language": self._lang_setting(),
                     "provider": provider,
                 },
                 headers={"Authorization": f"Bearer {token}"},
@@ -1311,7 +1422,7 @@ class AudioRecorder:
                 return "", "!mistral:Add your Mistral API key in Settings."
 
             model = normalize_mistral_model(cfg.get("mistral_stt_model", MISTRAL_STT_DEFAULT))
-            lang_setting = cfg.get("language", "auto")
+            lang_setting = self._lang_setting()
 
             wav_bytes = self._float_to_wav(audio)
             wav_io = io.BytesIO(wav_bytes)

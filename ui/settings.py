@@ -104,6 +104,11 @@ class Settings(QDialog):
         self.cfg_working = self._snapshot_cfg()
         
         self.setWindowTitle("Settings")
+        # QDialogs only get a Close button on Windows - add minimize/maximize
+        # so the panel behaves like a normal app window.
+        self.setWindowFlags(self.windowFlags()
+                            | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint)
         # Soft minimum only - every tab scrolls, so the user may shrink the
         # window well below the design size. The actual default size is chosen
         # proportionally to the screen on first show (see showEvent).
@@ -700,7 +705,8 @@ class Settings(QDialog):
             self.app.cfg.update(self.cfg_working)
             self.app.save_config()
             self.app.apply_tray_bindings()
-            self.accept()
+            # Settings stays open behind the meeting window - closing it here
+            # made starting a meeting feel like it kicked the user out of the app.
             self.app.show_meeting()
 
     # ── System specs ─────────────────────────────────────────────────────────

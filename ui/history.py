@@ -16,6 +16,11 @@ class HistoryWindow(QDialog):
         self.app = main_app
         
         self.setWindowTitle("History")
+        # QDialogs only get a Close button on Windows - add minimize/maximize
+        # so the window behaves like a normal app window.
+        self.setWindowFlags(self.windowFlags()
+                            | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint)
         self.setMinimumSize(440, 420)
         self.resize(540, 650)
         self.setSizeGripEnabled(True)
