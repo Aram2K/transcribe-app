@@ -989,7 +989,10 @@ class AudioRecorder:
         read_errors   = 0
 
         post_roll_chunks = 0
-        max_post_roll = 4  # ~256ms post-roll to catch final spoken syllables in flight
+        # ~512ms post-roll after stop to catch final spoken syllables in flight.
+        # 256ms still clipped word endings when the hotkey was pressed while the
+        # last word was being finished; the extra quarter second costs little.
+        max_post_roll = 8
 
         # Pending loopback samples (16 kHz mono) waiting to be mixed with mic
         # frames, and how long the loopback has delivered nothing (silence).
@@ -1529,6 +1532,17 @@ class AppController(QObject):
         super().__init__()
         self.qapp = qapp
         self.cfg = cfg
+
+        # Smart Actions is opt-in PER SESSION: every fresh app start begins in
+        # plain transcribe-only mode, so dictation always does the predictable
+        # thing after a restart; the user re-enables Smart mode when they want
+        # it for the session.
+        try:
+            if actions.normalize_action_mode(self.cfg.get("output_action")) != actions.ACTION_TRANSCRIBE_ONLY:
+                self.cfg["output_action"] = actions.ACTION_TRANSCRIBE_ONLY
+                save_config(self.cfg)  # module-level: UI/tray don't exist yet
+        except Exception:
+            logger.debug("could not reset output_action", exc_info=True)
 
         # Load stylesheet. Resolve the checkbox tick asset to an absolute path
         # so it renders regardless of the process working directory (packaged
@@ -2822,6 +2836,12 @@ def main():
 
     # Attach lock socket IPC listener
     start_ipc_server(lock_sock, lambda action: QTimer.singleShot(0, lambda: controller.show_settings()))
+
+    # The Settings panel IS the app - show it on every launch. The only quiet
+    # launch is the Windows-startup shortcut (--background), and the first run
+    # ever belongs to the onboarding wizard (which lands in the panel itself).
+    if "--background" not in sys.argv and controller.cfg.get("onboarding_done", False):
+        QTimer.singleShot(200, controller.show_settings)
 
     sys.exit(qapp.exec())
 
