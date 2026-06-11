@@ -800,6 +800,10 @@ class Settings(QDialog):
                     ["powershell", "-NoProfile", "-Command",
                      "(Get-CimInstance Win32_VideoController).Name -join '|'"],
                     capture_output=True, text=True, timeout=6,
+                    # The app is a windowed (no-console) build: without this
+                    # flag the child PowerShell pops a visible terminal window
+                    # on top of the app every time the specs card loads.
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
                 names = [n.strip() for n in (out.stdout or "").split("|") if n.strip()]
             elif sys.platform == "darwin":
