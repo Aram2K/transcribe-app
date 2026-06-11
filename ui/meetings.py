@@ -68,6 +68,11 @@ class MeetingsWindow(QDialog):
         self.app = main_app
         
         self.setWindowTitle("Record Meeting")
+        # QDialogs only get a Close button on Windows - add minimize/maximize
+        # so a long meeting can be tucked away without the close-prompt dance.
+        self.setWindowFlags(self.windowFlags()
+                            | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint)
         self.setMinimumSize(640, 500)
         self.resize(800, 650)
         self.setSizeGripEnabled(True)
@@ -185,6 +190,16 @@ class MeetingsWindow(QDialog):
         d_lay.addWidget(QLabel("Meeting Recording Mode", dev_frame))
         self.combo_device = QComboBox(dev_frame)
         d_lay.addWidget(self.combo_device)
+
+        d_lay.addWidget(QLabel("Spoken Language", dev_frame))
+        self.combo_lang = QComboBox(dev_frame)
+        try:
+            from main import LANG_NAMES  # deferred: main imports this module
+            for val, label in LANG_NAMES.items():
+                self.combo_lang.addItem(label, val)
+        except Exception:
+            self.combo_lang.addItem("Auto-detect", "auto")
+        d_lay.addWidget(self.combo_lang)
         lay.addWidget(dev_frame)
 
         # Start button row
@@ -369,6 +384,13 @@ class MeetingsWindow(QDialog):
         else:
             self.combo_device.setCurrentIndex(0)
 
+        # Default the language selector to the app-wide spoken language.
+        if hasattr(self, "combo_lang"):
+            lang = self.app.cfg.get("language", "auto") if self.app else "auto"
+            lidx = self.combo_lang.findData(lang)
+            if lidx >= 0:
+                self.combo_lang.setCurrentIndex(lidx)
+
     # ── State Machine Triggers ──
     def _start_meeting(self):
         if not self.app or not self.app.recorder:
@@ -437,8 +459,11 @@ class MeetingsWindow(QDialog):
         # Start recording - guard against device-open failures (busy mic, no
         # loopback device, driver errors) so a failure never crashes the app or
         # leaves the window stuck in a fake "recording" state.
+        meeting_lang = (self.combo_lang.currentData()
+                        if hasattr(self, "combo_lang") else None)
         try:
-            self.app.recorder.start_recording(capture_mode=meeting_mode)
+            self.app.recorder.start_recording(capture_mode=meeting_mode,
+                                              language=meeting_lang)
         except Exception as e:
             self._restore_recorder_callbacks()
             self.state = self.STATE_IDLE
@@ -552,6 +577,7 @@ class MeetingsWindow(QDialog):
         try:
             # 1. Wait briefly to drain active audio queue and transcription threads
             text, detected_lang = self.app.recorder.transcribe()
+            self._final_lang = detected_lang if not str(detected_lang).startswith("!") else ""
             
             # Combine transcript chunk lists
             full_chunks_text = []
@@ -612,12 +638,26 @@ class MeetingsWindow(QDialog):
             
         self.state = self.STATE_DONE
         self._final_notes = notes
-        
+
         self.lbl_done_title.setText(self._meeting_title or "Meeting Notes")
         self.txt_summary.setPlainText(notes)
         self.txt_transcript.setPlainText(self._final_transcript)
-        
+
         self.container.setCurrentIndex(3)
+
+        # Persist to the app history (like dictations) so the notes are
+        # findable in the History tab later - unless the user disabled
+        # history or is in Privacy Mode.
+        try:
+            if self.app and self.app.cfg.get("save_history", True) \
+                    and not self.app.cfg.get("privacy_mode", False):
+                import history as hist
+                entry = (f"{self._meeting_title} - Meeting Notes\n\n{notes}"
+                         f"\n\n--- Full Transcript ---\n\n{self._final_transcript}")
+                hist.save_entry(entry, getattr(self, "_final_lang", "") or "", "meeting")
+        except Exception:
+            pass
+
         from main import APP_VERSION
         telemetry.track("meeting_notes_completed", {}, self.app.cfg, APP_VERSION)
 
