@@ -40,7 +40,7 @@ import auth
 import entitlements
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.6.12"
+APP_VERSION = "1.6.13"
 
 # ── Managed cloud transcription (Pro moat) ────────────────────────────────────
 MANAGED_PROXY_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-proxy"
@@ -2380,9 +2380,15 @@ class AppController(QObject):
             threading.Thread(target=self._stop, daemon=True).start()
 
     def _on_escape(self):
-        logger.info("[main] _on_escape fired (is_rec=%s)", self.is_rec)
+        logger.info("[main] _on_escape fired (is_rec=%s, busy=%s)", self.is_rec, getattr(self, "_busy", False))
         if self.is_rec:
             threading.Thread(target=self._cancel, daemon=True).start()
+        elif getattr(self, "_busy", False):
+            # Esc during the "Transcribing…/Thinking…" phase: abort and discard
+            # the in-flight result so nothing gets pasted. The worker thread
+            # can't be killed (Python), but its output is ignored.
+            self._cancel_processing = True
+            self.overlay.call_soon(self.overlay.hide_overlay)
 
     def _cloud_preflight_warn(self):
         """Immediate, friendly warning if a cloud backend is selected but clearly
@@ -2467,7 +2473,9 @@ class AppController(QObject):
                             self.sig_enter.emit()
                     elif key == pynput_keyboard.Key.esc:
                         logger.info("[hook] Esc pressed, is_rec=%s", self.is_rec)
-                        if self.is_rec:
+                        # Esc cancels while recording AND while transcribing/
+                        # processing, so a long transcription can be aborted.
+                        if self.is_rec or getattr(self, "_busy", False):
                             self.sig_escape.emit()
                 except Exception:
                     pass
@@ -2493,14 +2501,19 @@ class AppController(QObject):
         # hotkey press can't re-enter and clobber the shared recorder mid-flight
         # (a real crash source). Cleared in finally on every exit path.
         self._busy = True
+        self._cancel_processing = False
         try:
             self._stop_impl()
         finally:
             self._busy = False
+            # The Esc listener is kept alive through the transcribe/process
+            # phase (so it can abort it); tear it down once the pipeline ends.
+            self._unregister_transient_keys()
 
     def _stop_impl(self):
         self.recorder.stop_recording()
-        self._unregister_transient_keys()
+        # NOTE: the Esc/Enter listener is intentionally left running here so Esc
+        # can abort the transcription below; it's torn down in _stop's finally.
         from ui.overlay import TRANSCRIBING
         self.overlay.call_soon(self.overlay.set_state, TRANSCRIBING)
 
@@ -2511,10 +2524,20 @@ class AppController(QObject):
                 _result["text"], _result["lang"] = self.recorder.transcribe()
             except Exception as e:
                 _result["exc"] = e
-                
+
         t = threading.Thread(target=_do_transcribe, daemon=True)
         t.start()
-        t.join(timeout=TRANSCRIBE_TIMEOUT_SEC)
+        # Poll instead of a blocking join so Esc can cancel mid-transcription.
+        waited = 0.0
+        while t.is_alive() and waited < TRANSCRIBE_TIMEOUT_SEC:
+            if getattr(self, "_cancel_processing", False):
+                self.is_rec = False
+                self._account_recording_time()
+                self.overlay.call_soon(self.overlay.hide_overlay)
+                logger.info("[main] transcription cancelled by Esc")
+                return
+            t.join(timeout=0.1)
+            waited += 0.1
 
         self.is_rec = False
         self._account_recording_time()
@@ -2543,6 +2566,11 @@ class AppController(QObject):
             
         if "exc" in _result:
             self.overlay.call_soon(self.overlay.show_error, str(_result["exc"])[:80])
+            return
+
+        # Esc pressed while the transcription was finishing - discard it.
+        if getattr(self, "_cancel_processing", False):
+            self.overlay.call_soon(self.overlay.hide_overlay)
             return
 
         text = _result.get("text", "")
@@ -2641,6 +2669,11 @@ class AppController(QObject):
                 )
                 self.overlay.call_soon(self.overlay.show_error, str(e))
                 return
+
+        # Esc during the Smart Action / "Thinking…" phase: don't paste or save.
+        if getattr(self, "_cancel_processing", False):
+            self.overlay.call_soon(self.overlay.hide_overlay)
+            return
 
         if self.cfg.get("save_history", True) and not self.cfg.get("privacy_mode", False):
             hist.save_entry(output_text, lang, self.cfg["backend"])

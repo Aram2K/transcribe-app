@@ -121,13 +121,24 @@ Deno.serve(async (req) => {
   const provider = (body?.provider ?? "gemini").toString();
   if (!audio || typeof audio !== "string") return json({ error: "no_audio" }, 400);
 
-  // Mistral only when configured; otherwise fall back to Gemini.
-  let result;
-  if (provider === "mistral" && MISTRAL_KEY) {
-    result = await transcribeMistral(audio, language);
-    if (!result.ok) result = await transcribeGemini(audio, language); // graceful fallback
-  } else {
-    result = await transcribeGemini(audio, language);
+  // Use whichever provider actually has a key. Honor the client's choice when
+  // its key exists, otherwise fall through to the one that IS configured - so
+  // managed STT works as long as EITHER GOOGLE_STT_KEY or MISTRAL_STT_KEY is
+  // set (the default "gemini" choice no longer hard-requires GOOGLE_STT_KEY,
+  // which is the bug that made cloud transcription 502 when only the Mistral
+  // key was set for Smart Actions).
+  const order = provider === "mistral" ? ["mistral", "gemini"] : ["gemini", "mistral"];
+  const available = order.filter((p) =>
+    (p === "gemini" && GOOGLE_KEY) || (p === "mistral" && MISTRAL_KEY));
+  if (available.length === 0) {
+    return json({ error: "stt_not_configured" }, 503);
+  }
+  let result: any = { ok: false, detail: "no provider" };
+  for (const p of available) {
+    result = p === "mistral"
+      ? await transcribeMistral(audio, language)
+      : await transcribeGemini(audio, language);
+    if (result.ok) break;
   }
   if (!result.ok) return json({ error: "stt_failed", detail: result.detail }, 502);
 

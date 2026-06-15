@@ -601,6 +601,19 @@ class Settings(QDialog):
         layout.addStretch()
         return tab
 
+    def _dim_widget(self, widget, dim):
+        """Lower a widget's opacity to signal 'deactivated' (used on the cloud
+        PRO pill in Privacy Mode) instead of hiding or recoloring it."""
+        from PySide6.QtWidgets import QGraphicsOpacityEffect
+        if dim:
+            eff = widget.graphicsEffect()
+            if not isinstance(eff, QGraphicsOpacityEffect):
+                eff = QGraphicsOpacityEffect(widget)
+                widget.setGraphicsEffect(eff)
+            eff.setOpacity(0.38)
+        else:
+            widget.setGraphicsEffect(None)
+
     def _set_pro_glow(self, frame, on):
         """Glow marks features the user does NOT have yet. Pro users keep the
         PRO pill but lose the purple halo/border (it would be noise)."""
@@ -2497,10 +2510,11 @@ class Settings(QDialog):
                 if self.cfg_working.get("backend") == "managed":
                     self.cfg_working["backend"] = "local"
         if hasattr(self, "_cloud_pro_badge"):
-            self._cloud_pro_badge.setStyleSheet(
-                "background-color:#e2e8f0; color:#94a3b8; border-radius:6px; padding:1px 6px; font-weight:700;"
-                if is_private else self._PRO_BADGE_CSS
-            )
+            # Privacy Mode deactivates the cloud feature - keep its PRO pill
+            # visible but dimmed (lower opacity) rather than recoloring/hiding it.
+            self._cloud_pro_badge.setStyleSheet(self._PRO_BADGE_CSS)
+            self._cloud_pro_badge.setVisible(True)
+            self._dim_widget(self._cloud_pro_badge, is_private)
 
         # Cloud STT cards render their own privacy-aware disabled look (pale card +
         # disabled button), so just refresh them - no dashed overlay.
@@ -3549,7 +3563,10 @@ class Settings(QDialog):
                 self.chk_managed.blockSignals(False)
                 self.cfg_working["backend"] = "local"
         if hasattr(self, "_cloud_pro_badge"):
-            self._cloud_pro_badge.setVisible(not privacy)
+            # Always visible; dimmed (not hidden) when Privacy Mode deactivates
+            # the cloud feature.
+            self._cloud_pro_badge.setVisible(True)
+            self._dim_widget(self._cloud_pro_badge, privacy)
 
         plan = getattr(auth, "plan", None) if auth else None
         on_trial = is_pro and plan == "trial"
