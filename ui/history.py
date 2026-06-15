@@ -38,10 +38,10 @@ class HistoryWindow(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
-        from ui.winfit import fit_on_screen, size_to_screen
+        from ui.winfit import settle_on_screen, size_to_screen
         if not getattr(self, "_fit_positioned", False):
             size_to_screen(self, 0.28, 0.62, 480, 480, 620, 800)
-        fit_on_screen(self)
+        settle_on_screen(self)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)

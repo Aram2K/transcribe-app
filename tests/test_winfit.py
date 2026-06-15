@@ -176,6 +176,17 @@ class TestFitOnScreen(unittest.TestCase):
         self.assertLessEqual(win.height() + 32, 600 - 24 + 32)  # client capped
         self.assertTrue(self._fully_visible(win))
 
+    def test_first_show_top_clamped_into_view(self):
+        # The reported bug: on first show the window is taller than the work
+        # area (layout not settled / frame size unknown), so centering would
+        # put its top above the screen. The clamp must pull the top back to
+        # the work-area top so the title bar is always reachable.
+        win = FakeFramedWin(600, 900, min_h=900,
+                            screen_rect=FakeRect(0, 40, 1000, 760))
+        self.assertFalse(getattr(win, "_fit_positioned", False))  # first show
+        self._fit(win)
+        self.assertGreaterEqual(win.y(), 40)  # top never above the work area
+
     def test_size_to_screen_leaves_room_for_frame(self):
         # The proportional default size must subtract the frame too, so the
         # proposal already fits with its title bar on small screens.

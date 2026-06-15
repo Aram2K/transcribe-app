@@ -64,10 +64,10 @@ class Onboarding(QDialog):
         super().showEvent(event)
         # Size proportionally to the screen on first open, cap to the work
         # area, and center on the active screen every open.
-        from ui.winfit import fit_on_screen, size_to_screen
+        from ui.winfit import settle_on_screen, size_to_screen
         if not getattr(self, "_fit_positioned", False):
             size_to_screen(self, 0.30, 0.66, 500, 540, 560, 720)
-        fit_on_screen(self, recenter=True)
+        settle_on_screen(self, recenter=True)
 
     def _build_ui(self):
         self.main_layout = QVBoxLayout(self)
