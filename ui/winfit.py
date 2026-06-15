@@ -8,6 +8,7 @@ in every window's showEvent, guarantees: never larger than the work area,
 fully visible, centered on first open.
 """
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 _MARGIN = 24
@@ -80,8 +81,31 @@ def fit_on_screen(win, recenter=False):
     if first or recenter:
         win.move(avail.center().x() - (w + fw) // 2,
                  avail.center().y() - (h + fh) // 2)
-        return
+    # Always clamp fully into view afterwards. On first show the frame size
+    # estimate can be wrong (the OS hasn't decorated the window yet), so a
+    # centered window could still hang its title bar above the top edge -
+    # clamp so the top is never off-screen. On later shows this only nudges a
+    # window that drifted out of view; a position the user chose is untouched.
     x = max(avail.left(), min(win.x(), avail.right() - (w + fw) + 1))
     y = max(avail.top(), min(win.y(), avail.bottom() - (h + fh) + 1))
     if (x, y) != (win.x(), win.y()):
         win.move(x, y)
+
+
+def settle_on_screen(win, recenter=False):
+    """Fit now, then again on the next event-loop tick.
+
+    A window's true frame geometry (OS title bar) and final laid-out size
+    aren't known until after showEvent returns and the window is mapped. The
+    immediate fit positions it from estimates; the deferred fit re-clamps once
+    those are real - which is what fixes a first-open window whose top rendered
+    above the screen until the user closed and reopened it."""
+    fit_on_screen(win, recenter=recenter)
+
+    def _again():
+        try:
+            if win.isVisible():
+                fit_on_screen(win)
+        except RuntimeError:
+            pass  # window destroyed before the tick
+    QTimer.singleShot(0, _again)

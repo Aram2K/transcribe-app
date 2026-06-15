@@ -581,6 +581,8 @@ class AudioRecorder:
         # Per-session language override (the meeting window's language
         # selector). None = use the global cfg["language"] default.
         self.language_override = None
+        self._capture_mode = None     # smart_meeting/system_only/default_mic; None = dictation
+        self._loopback_peak = 0.0     # loudest loopback sample this session (0 = no system audio)
 
     @staticmethod
     def _whisper_device():
@@ -822,16 +824,41 @@ class AudioRecorder:
             if avail <= 0:
                 return np.zeros(0, dtype=np.float32)
             raw = stream.read(avail, exception_on_overflow=False)
-            return self._loopback_to_mono16k(raw)
+            arr = self._loopback_to_mono16k(raw)
+            if len(arr) > 0:
+                # Remember the loudest system-audio sample so the meeting UI
+                # can tell "nothing was playing on the captured device" apart
+                # from a real transcription failure.
+                self._loopback_peak = max(self._loopback_peak, float(np.abs(arr).max()))
+            return arr
         except Exception as e:
             logger.debug("loopback read failed: %s", e)
             return np.zeros(0, dtype=np.float32)
+
+    @staticmethod
+    def _read_input_draining(stream, sr):
+        """Read at least one chunk from an input stream, draining any backlog
+        in the same read. While Whisper saturates the CPU cores transcribing a
+        chunk, this loop stalls for hundreds of ms; with fixed-size reads the
+        backlog overflowed PortAudio's buffer and the overflowed audio was
+        silently dropped (words went missing mid-dictation/meeting). Reading
+        the whole backlog at once keeps up instead. Single reads are capped at
+        ~2s; anything beyond that drains on the next tick."""
+        avail = 0
+        try:
+            avail = int(stream.get_read_available())
+        except Exception:
+            pass
+        read_n = max(cfg["chunk_size"], min(avail, sr * 2))
+        return stream.read(read_n, exception_on_overflow=False)
 
     def start_recording(self, capture_mode=None, language=None):
         self.recording = True
         # Per-session language: the meeting window passes its selector value;
         # plain dictation passes nothing, which resets to the global default.
         self.language_override = language or None
+        self._capture_mode = capture_mode
+        self._loopback_peak = 0.0
         with self._chunk_lock:
             self._chunk_frames     = []
             self._chunk_results    = {}
@@ -999,6 +1026,17 @@ class AudioRecorder:
         loop_fifo = np.zeros(0, dtype=np.float32)
         loop_idle_sec = 0.0
 
+        # Meetings: continuous program audio (videos, music beds, long
+        # talkers) may never show a VAD pause, so the silence-gap chunker
+        # would sit on the whole recording until Stop and the live transcript
+        # stayed empty. On a meeting capture, force a chunk on a fixed
+        # cadence - gated on energy so quiet stretches don't send
+        # hallucination-prone silence to Whisper.
+        meeting_cadence = self._capture_mode is not None
+        MEETING_CHUNK_SEC = 10.0
+        buffered_sec = 0.0
+        chunk_peak = 0.0
+
         while self.recording or post_roll_chunks > 0:
             if self.stop_requested and post_roll_chunks == 0:
                 post_roll_chunks = max_post_roll
@@ -1017,15 +1055,15 @@ class AudioRecorder:
                     # computer is silent, so the whole loop stalled (not even
                     # the mic was transcribed) and stopping then crashed the
                     # app by closing the stream under the blocked read.
-                    mic_data = mic_stream.read(cfg["chunk_size"], exception_on_overflow=False)
+                    mic_data = self._read_input_draining(mic_stream, sr)
                     arr_mic = np.frombuffer(mic_data, dtype=np.float32)
                     loop_chunk = self._read_available_loopback(stream)
                     if len(loop_chunk) > 0:
                         loop_fifo = np.concatenate([loop_fifo, loop_chunk])
-                        # Clock drift safety valve: keep at most ~1s queued so
-                        # mix latency stays bounded.
-                        if len(loop_fifo) > sr:
-                            loop_fifo = loop_fifo[-sr:]
+                        # Clock-drift safety valve only - generous, because
+                        # dropping from this queue loses system audio.
+                        if len(loop_fifo) > sr * 10:
+                            loop_fifo = loop_fifo[-sr * 10:]
                     n = min(len(arr_mic), len(loop_fifo))
                     if n > 0:
                         mixed = arr_mic.copy()
@@ -1053,12 +1091,15 @@ class AudioRecorder:
                         loop_idle_sec = 0.0
                         data = loop_chunk.tobytes()
                 else:
-                    data = stream.read(cfg["chunk_size"], exception_on_overflow=False)
+                    data = self._read_input_draining(stream, sr)
 
                 read_errors = 0
 
                 arr = np.frombuffer(data, dtype=np.float32)
                 this_dur = (len(arr) / sr) if len(arr) > 0 else frame_dur
+                buffered_sec += this_dur
+                if len(arr) > 0:
+                    chunk_peak = max(chunk_peak, float(np.abs(arr).max()))
                 rms = float(np.sqrt(np.mean(arr ** 2))) if len(arr) > 0 else 0.0
 
                 noise_hist.append(rms)
@@ -1099,9 +1140,13 @@ class AudioRecorder:
                     silence_sec += this_dur
 
                 total_sec    = speech_sec + silence_sec
+                force_chunk = (meeting_cadence
+                               and buffered_sec >= MEETING_CHUNK_SEC
+                               and chunk_peak >= 0.01)
                 should_chunk = (
                     (silence_sec >= silence_trigger_sec and speech_sec >= min_speech_sec)
                     or total_sec >= max_speech_sec
+                    or force_chunk
                 )
 
                 # During background post-roll, accumulate everything into remaining frames
@@ -1109,7 +1154,7 @@ class AudioRecorder:
                 if post_roll_chunks > 0:
                     should_chunk = False
 
-                if should_chunk and speech_sec >= min_speech_sec:
+                if should_chunk and (speech_sec >= min_speech_sec or force_chunk):
                     with self._chunk_lock:
                         chunk_audio = np.frombuffer(
                             b"".join(vad_buf), dtype=np.float32).copy()
@@ -1117,9 +1162,11 @@ class AudioRecorder:
                         self._chunk_idx   += 1
                         self._chunk_frames = []
                         self._chunk_silence_before[idx] = float(silence_sec)
-                    vad_buf     = []
-                    speech_sec  = 0.0
-                    silence_sec = 0.0
+                    vad_buf      = []
+                    speech_sec   = 0.0
+                    silence_sec  = 0.0
+                    buffered_sec = 0.0
+                    chunk_peak   = 0.0
                     t = threading.Thread(target=self._transcribe_chunk,
                                          args=(chunk_audio, idx), daemon=True)
                     self._chunk_threads.append(t)
@@ -1219,7 +1266,10 @@ class AudioRecorder:
             padding_len = min_samples - len(remaining)
             remaining = np.concatenate([remaining, np.zeros(padding_len, dtype=np.float32)])
 
-        if len(remaining) >= min_samples:
+        # A tail at the noise floor would only make Whisper hallucinate (it
+        # tends to echo the custom-vocabulary prompt on near-silence), so the
+        # final blob must carry actual signal to be worth transcribing.
+        if len(remaining) >= min_samples and float(np.abs(remaining).max()) >= 0.004:
             if cfg["backend"] == "managed":
                 last_text, detected = self._run_managed(remaining)
             elif cfg["backend"] == "google" and cfg["google_api_key"]:

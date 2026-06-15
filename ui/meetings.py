@@ -111,10 +111,10 @@ class MeetingsWindow(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
-        from ui.winfit import fit_on_screen, size_to_screen
+        from ui.winfit import settle_on_screen, size_to_screen
         if not getattr(self, "_fit_positioned", False):
             size_to_screen(self, 0.44, 0.64, 680, 520, 900, 820)
-        fit_on_screen(self)
+        settle_on_screen(self)
 
     def _build_ui(self):
         self.main_layout = QVBoxLayout(self)
@@ -578,6 +578,14 @@ class MeetingsWindow(QDialog):
             # 1. Wait briefly to drain active audio queue and transcription threads
             text, detected_lang = self.app.recorder.transcribe()
             self._final_lang = detected_lang if not str(detected_lang).startswith("!") else ""
+
+            # A "!"-prefixed lang is the recorder reporting a real failure
+            # (device error, cloud error, transcription exception). Show THAT
+            # instead of letting it masquerade as an empty meeting.
+            if str(detected_lang).startswith("!"):
+                friendly = str(detected_lang).split(":", 1)[-1].strip() or "Audio capture failed."
+                self.proc_signals.finished.emit("", friendly)
+                return
             
             # Combine transcript chunk lists
             full_chunks_text = []
@@ -591,7 +599,20 @@ class MeetingsWindow(QDialog):
             self._final_transcript = "\n\n".join(full_chunks_text).strip()
             
             if not self._final_transcript:
-                self.proc_signals.finished.emit("", "No transcription recorded. The meeting is empty.")
+                msg = "No transcription recorded. The meeting is empty."
+                # In a system-audio mode, a dead-silent loopback means the
+                # sound the user heard was playing on a DIFFERENT output
+                # device than the Windows default - tell them exactly that.
+                mode = self.app.cfg.get("meeting_audio_mode", "")
+                loop_peak = float(getattr(self.app.recorder, "_loopback_peak", 0.0) or 0.0)
+                if mode in ("smart_meeting", "system_only") and loop_peak < 0.01:
+                    msg = ("No system audio reached the recorder - the sound you "
+                           "played is going to a different output device than the "
+                           "Windows default one (for example headphones).\n\n"
+                           "Make the device you actually listen on the default "
+                           "output in Windows sound settings, then start the "
+                           "meeting again.")
+                self.proc_signals.finished.emit("", msg)
                 return
 
             # Add custom note bullet context if present

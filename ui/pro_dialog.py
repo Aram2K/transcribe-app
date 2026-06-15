@@ -25,8 +25,8 @@ class ProDialog(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
-        from ui.winfit import fit_on_screen
-        fit_on_screen(self)
+        from ui.winfit import settle_on_screen
+        settle_on_screen(self)
 
     def _build(self, feature):
         root = QVBoxLayout(self)

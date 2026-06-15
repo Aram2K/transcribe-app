@@ -185,12 +185,14 @@ class Settings(QDialog):
         self._load_values_into_widgets()
 
     def _fit_on_screen(self):
-        from ui.winfit import fit_on_screen, size_to_screen
+        from ui.winfit import settle_on_screen, size_to_screen
         if not getattr(self, "_fit_positioned", False):
             # First open: ~38% of the work-area width, ~72% of its height -
             # comfortable on laptops, not a tower on big monitors.
             size_to_screen(self, 0.38, 0.72, 640, 540, 780, 880)
-        fit_on_screen(self)
+        # settle (not just fit): re-clamp on the next tick so a first open never
+        # lands with its top above the screen before the frame size is known.
+        settle_on_screen(self)
         for name in list(self.whisper_cards.keys()):
             self._update_whisper_card_ui(name)
         if hasattr(self, "mistral_cards"):
@@ -475,7 +477,18 @@ class Settings(QDialog):
     def _create_general_tab(self):
         from main import LANG_NAMES
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        # Like every other tab, General scrolls. Without this, shrinking the
+        # window compressed the fixed-height cards into each other (the
+        # meeting button painting over its dropdown) instead of scrolling.
+        scroll = QScrollArea(tab)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(14)
 
@@ -599,6 +612,8 @@ class Settings(QDialog):
         layout.addWidget(cloud_frame)
 
         layout.addStretch()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
         return tab
 
     def _set_pro_glow(self, frame, on):
