@@ -12,6 +12,39 @@ TRANSCRIBING = "transcribing"
 PROCESSING = "processing"   # smart action / LLM running after transcription
 DONE = "done"
 
+
+GOOGLE_STT_DEFAULT = "gemini-2.5-flash"
+MISTRAL_STT_DEFAULT = "voxtral-mini-latest"
+
+
+def _configured_model_name(cfg, key, fallback):
+    value = (cfg or {}).get(key, "")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return fallback
+
+
+def _transcription_ai_label(cfg):
+    cfg = cfg or {}
+    backend = cfg.get("backend", "local")
+
+    if backend == "google":
+        return f"{_configured_model_name(cfg, 'google_stt_model', GOOGLE_STT_DEFAULT)} AI"
+
+    if backend == "mistral":
+        return f"{_configured_model_name(cfg, 'mistral_stt_model', MISTRAL_STT_DEFAULT)} AI"
+
+    if backend == "managed":
+        provider = str(cfg.get("managed_provider", "gemini")).lower()
+        if provider == "mistral":
+            model = _configured_model_name(cfg, "mistral_stt_model", MISTRAL_STT_DEFAULT)
+        else:
+            model = _configured_model_name(cfg, "google_stt_model", GOOGLE_STT_DEFAULT)
+        return f"{model} AI"
+
+    return "Local AI"
+
+
 class Overlay(QWidget):
     W, H = 340, 96
 
@@ -258,8 +291,8 @@ class Overlay(QWidget):
         if self.overlay_state == PROCESSING:
             sub = "applying smart action  ·  almost there"
         else:
-            backend = "Google Cloud" if self.app and self.app.cfg.get("backend") == "google" else "Local AI"
-            sub = f"via {backend}  ·  pasting when ready"
+            cfg = self.app.cfg if self.app else {}
+            sub = f"via {_transcription_ai_label(cfg)}  ·  pasting when ready"
         painter.setPen(QColor(100, 116, 139))
         painter.setFont(QFont("Segoe UI", 8))
         painter.drawText(42, 39, sub)

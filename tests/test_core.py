@@ -112,6 +112,7 @@ from main import (
     _update_info_from_release,
 )
 import storage
+from ui.overlay import _transcription_ai_label
 
 
 def tearDownModule():
@@ -141,6 +142,79 @@ class TestParseVersion(unittest.TestCase):
 
     def test_no_update_needed(self):
         self.assertFalse(_parse_version("0.0.1") > _parse_version(APP_VERSION))
+
+
+class TestTranscriptionOverlayLabel(unittest.TestCase):
+    def test_local_backend_uses_local_ai_label(self):
+        self.assertEqual(_transcription_ai_label({"backend": "local"}), "Local AI")
+
+    def test_google_backend_uses_model_name(self):
+        self.assertEqual(
+            _transcription_ai_label({"backend": "google", "google_stt_model": "gemini-demo"}),
+            "gemini-demo AI",
+        )
+
+    def test_mistral_backend_uses_model_name(self):
+        self.assertEqual(
+            _transcription_ai_label({"backend": "mistral", "mistral_stt_model": "voxtral-mini-2602"}),
+            "voxtral-mini-2602 AI",
+        )
+
+    def test_managed_cloud_uses_provider_model_name(self):
+        self.assertEqual(
+            _transcription_ai_label({"backend": "managed", "managed_provider": "mistral"}),
+            "voxtral-mini-latest AI",
+        )
+        self.assertEqual(
+            _transcription_ai_label({"backend": "managed", "managed_provider": "gemini"}),
+            "gemini-2.5-flash AI",
+        )
+
+
+class TestDictationCancelUX(unittest.TestCase):
+    def test_escape_during_transcription_marks_processing_cancelled(self):
+        import main as m
+
+        app = MagicMock()
+        app.is_rec = False
+        app._busy = True
+        app._cancel_processing = False
+        app.overlay.hide_overlay = MagicMock()
+        app.overlay.call_soon = MagicMock()
+
+        m.AppController._on_escape(app)
+
+        self.assertTrue(app._cancel_processing)
+        app.overlay.call_soon.assert_called_once_with(app.overlay.hide_overlay)
+
+    def test_cancelled_busy_hotkey_does_not_show_previous_dictation_popup(self):
+        import main as m
+
+        app = MagicMock()
+        app.is_rec = False
+        app._busy = True
+        app._cancel_processing = True
+        app.show_tray_hint = MagicMock()
+
+        m.AppController._on_hotkey(app)
+
+        app.show_tray_hint.assert_not_called()
+
+    def test_uncancelled_busy_hotkey_still_warns(self):
+        import main as m
+
+        app = MagicMock()
+        app.is_rec = False
+        app._busy = True
+        app._cancel_processing = False
+        app.show_tray_hint = MagicMock()
+
+        m.AppController._on_hotkey(app)
+
+        app.show_tray_hint.assert_called_once_with(
+            "One moment",
+            "Finishing your previous dictation - try again in a second.",
+        )
 
 
 class TestConfig(unittest.TestCase):
@@ -623,6 +697,144 @@ class TestMistral(unittest.TestCase):
             self.assertEqual(kwargs["headers"]["Authorization"], "Bearer fake-key")
             self.assertEqual(kwargs["data"]["model"], "voxtral-mini-latest")
             self.assertEqual(kwargs["data"]["language"], "en")
+
+
+class TestTranscriptionBackendFallbacks(unittest.TestCase):
+    @patch("requests.post")
+    def test_managed_cloud_error_uses_local_fallback_when_available(self, mock_post):
+        import main
+        from main import AudioRecorder
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.text = "server down"
+        mock_post.return_value = mock_resp
+
+        recorder = AudioRecorder()
+        recorder.get_auth_token = lambda: "token"
+        recorder._float_to_wav = MagicMock(return_value=b"fake-wav")
+        recorder._run_local = MagicMock(return_value=("local fallback text", "en"))
+
+        with patch.dict(main.cfg, {
+            "sample_rate": 16000,
+            "language": "en",
+            "managed_provider": "gemini",
+        }):
+            text, lang = recorder._run_managed(MagicMock())
+
+        self.assertEqual(text, "local fallback text")
+        self.assertEqual(lang, "en")
+        recorder._run_local.assert_called_once()
+
+    @patch("requests.post")
+    def test_managed_cloud_error_reports_broken_local_fallback(self, mock_post):
+        import main
+        from main import AudioRecorder
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.text = "server down"
+        mock_post.return_value = mock_resp
+
+        recorder = AudioRecorder()
+        recorder.get_auth_token = lambda: "token"
+        recorder._float_to_wav = MagicMock(return_value=b"fake-wav")
+        recorder._run_local = MagicMock(
+            side_effect=RuntimeError("Unable to open file 'model.bin' in model 'cache'")
+        )
+
+        with patch.dict(main.cfg, {
+            "sample_rate": 16000,
+            "language": "en",
+            "managed_provider": "gemini",
+        }):
+            text, lang = recorder._run_managed(MagicMock())
+
+        self.assertEqual(text, "")
+        self.assertTrue(lang.startswith("!managed:"))
+        self.assertIn("Local fallback is unavailable", lang)
+        self.assertIn("redownload the selected Whisper model", lang)
+
+    @patch("requests.post")
+    def test_google_api_key_error_uses_local_fallback_when_available(self, mock_post):
+        import main
+        from main import AudioRecorder
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 400
+        mock_resp.text = '{"error":{"message":"API key not valid. Please pass a valid API key."}}'
+        mock_post.return_value = mock_resp
+
+        recorder = AudioRecorder()
+        recorder._float_to_wav = MagicMock(return_value=b"fake-wav")
+        recorder._run_local = MagicMock(return_value=("local text", "en"))
+
+        with patch.dict(main.cfg, {
+            "sample_rate": 16000,
+            "language": "en",
+            "google_api_key": "bad-key",
+            "google_stt_model": "gemini-2.5-flash",
+        }):
+            text, lang = recorder._run_google(MagicMock())
+
+        self.assertEqual(text, "local text")
+        self.assertEqual(lang, "en")
+        recorder._run_local.assert_called_once()
+
+    @patch("requests.post")
+    def test_google_api_key_error_reports_broken_local_fallback(self, mock_post):
+        import main
+        from main import AudioRecorder
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 400
+        mock_resp.text = '{"error":{"message":"API key not valid. Please pass a valid API key."}}'
+        mock_post.return_value = mock_resp
+
+        recorder = AudioRecorder()
+        recorder._float_to_wav = MagicMock(return_value=b"fake-wav")
+        recorder._run_local = MagicMock(
+            side_effect=RuntimeError("Unable to open file 'model.bin' in model 'cache'")
+        )
+
+        with patch.dict(main.cfg, {
+            "sample_rate": 16000,
+            "language": "en",
+            "google_api_key": "bad-key",
+            "google_stt_model": "gemini-2.5-flash",
+        }):
+            text, lang = recorder._run_google(MagicMock())
+
+        self.assertEqual(text, "")
+        self.assertTrue(lang.startswith("!google:"))
+        self.assertIn("Google API key is invalid", lang)
+        self.assertIn("Local fallback is unavailable", lang)
+
+    @patch("requests.post")
+    def test_mistral_api_error_uses_local_fallback_when_available(self, mock_post):
+        import main
+        from main import AudioRecorder
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_resp.text = "unauthorized"
+        mock_post.return_value = mock_resp
+
+        recorder = AudioRecorder()
+        recorder._float_to_wav = MagicMock(return_value=b"fake-wav")
+        recorder._run_local = MagicMock(return_value=("local text", "en"))
+
+        with patch.dict(main.cfg, {
+            "sample_rate": 16000,
+            "language": "en",
+            "mistral_api_key": "bad-key",
+            "mistral_stt_model": "voxtral-mini-latest",
+        }):
+            text, lang = recorder._run_mistral(MagicMock())
+
+        self.assertEqual(text, "local text")
+        self.assertEqual(lang, "en")
+        recorder._run_local.assert_called_once()
 
 
 class TestSettingsValidation(unittest.TestCase):

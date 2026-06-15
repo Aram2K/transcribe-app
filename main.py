@@ -40,7 +40,7 @@ import auth
 import entitlements
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.6.13"
+APP_VERSION = "1.6.14"
 
 # ── Managed cloud transcription (Pro moat) ────────────────────────────────────
 MANAGED_PROXY_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-proxy"
@@ -370,7 +370,14 @@ def cloud_error_message(provider, status, body_text):
         msg = ""
     msg = (msg or (body_text or "")).strip()
     low = msg.lower()
-    if status in (401, 403) or "unauthorized" in low or "invalid api key" in low or "api key not valid" in low:
+    if (
+        status in (401, 403)
+        or "unauthorized" in low
+        or "invalid api key" in low
+        or "api key not valid" in low
+        or ("api key" in low and "not valid" in low)
+        or ("api key" in low and "invalid" in low)
+    ):
         return f"{provider} API key is invalid or unauthorized. Check it in Settings."
     if status == 402 or "insufficient" in low or "out of credit" in low or "no credit" in low or "billing" in low:
         return f"Your {provider} account is out of credits. Add billing/credits to keep using it."
@@ -386,11 +393,73 @@ def cloud_error_message(provider, status, body_text):
 def model_ok(name):
     return RAM_GB >= MODELS[name]["min_ram"]
 
+def _looks_like_whisper_cache_error(err):
+    low = str(err).lower()
+    return (
+        "model.bin" in low
+        or ("unable to open file" in low and "model" in low)
+        or ("no such file" in low and "model" in low)
+    )
+
+def _friendly_transcription_error(err):
+    if _looks_like_whisper_cache_error(err):
+        return (
+            "Local Whisper model files are incomplete. Open Settings > Models "
+            "and redownload the selected Whisper model."
+        )
+    return str(err)
+
+def _materialize_hf_snapshot_links(model_dir):
+    """Replace HF snapshot symlinks with real files when possible.
+
+    Some Windows installs leave a snapshot that resolves through symlinks which
+    CTranslate2 then fails to open as model.bin. Copying the blob into the
+    snapshot makes the local model usable without deleting the whole cache.
+    """
+    try:
+        model_dir = Path(model_dir)
+        if not model_dir.exists():
+            return False
+        changed = False
+        for item in model_dir.iterdir():
+            if not item.is_symlink():
+                continue
+            try:
+                raw_target = os.readlink(item)
+                target = Path(raw_target)
+                if not target.is_absolute():
+                    target = (item.parent / target).resolve()
+                if not target.exists() or not target.is_file():
+                    continue
+                tmp = item.with_name(f".{item.name}.materializing")
+                shutil.copy2(target, tmp)
+                item.unlink()
+                os.replace(tmp, item)
+                changed = True
+            except Exception as e:
+                logger.debug("Could not materialize HF cache link %s: %s", item, e)
+        return changed
+    except Exception as e:
+        logger.debug("HF cache materialization failed for %s: %s", model_dir, e)
+        return False
+
+def _repair_whisper_model_cache(name):
+    try:
+        from faster_whisper.utils import download_model
+        path = Path(download_model(name, local_files_only=False))
+        _materialize_hf_snapshot_links(path)
+        model_bin = path / "model.bin"
+        return model_bin.exists() and model_bin.stat().st_size > 1024
+    except Exception as e:
+        logger.warning("Could not repair Whisper model cache for %s: %s", name, e)
+        return False
+
 def model_downloaded(name):
     try:
         from faster_whisper.utils import download_model
-        download_model(name, local_files_only=True)
-        return True
+        path = Path(download_model(name, local_files_only=True))
+        model_bin = path / "model.bin"
+        return model_bin.exists() and model_bin.stat().st_size > 1024
     except Exception:
         return False
 
@@ -656,6 +725,7 @@ class AudioRecorder:
                     attempts += [("cuda", ct, False), ("cuda", ct, True)]
                 attempts += [("cpu", "int8", False), ("cpu", "int8", True)]
                 last_err = None
+                repaired_cache = False
                 for d, c, local_only in attempts:
                     try:
                         m = WhisperModel(
@@ -682,6 +752,11 @@ class AudioRecorder:
                             self._cuda_usable = False  # remember: skip GPU next time
                         logger.warning("Whisper load failed on %s/%s (offline=%s): %s",
                                        d, c, local_only, e)
+                        if not repaired_cache and _looks_like_whisper_cache_error(e):
+                            if _repair_whisper_model_cache(name):
+                                repaired_cache = True
+                                logger.info("Repaired Whisper cache for %s; retrying load", name)
+                                continue
                 if last_err:
                     raise last_err
 
@@ -1214,7 +1289,7 @@ class AudioRecorder:
                 logger.warning("on_chunk_complete failed: %s", e)
         except Exception as e:
             with self._chunk_lock:
-                self._chunk_errors.append(f"!transcribe:{e}")
+                self._chunk_errors.append(f"!transcribe:{_friendly_transcription_error(e)}")
 
     def stop_recording(self):
         self.stop_requested = True
@@ -1318,6 +1393,17 @@ class AudioRecorder:
                 return self._run_local_once(audio)
             raise
 
+    def _fallback_to_local_or_error(self, audio, backend, reason):
+        try:
+            return self._run_local(audio)
+        except Exception as e:
+            friendly = _friendly_transcription_error(e)
+            logger.warning(
+                "%s cloud failed (%s), and local fallback also failed: %s",
+                backend, reason, friendly,
+            )
+            return "", f"!{backend}:{reason} Local fallback is unavailable: {friendly}"
+
     def _run_local_once(self, audio):
         self.load_model()
         sr = cfg["sample_rate"]
@@ -1399,7 +1485,8 @@ class AudioRecorder:
             }
             resp = requests.post(url, json=payload, timeout=30)
             if resp.status_code != 200:
-                return "", "!google:" + cloud_error_message("Google", resp.status_code, resp.text)
+                reason = cloud_error_message("Google", resp.status_code, resp.text)
+                return self._fallback_to_local_or_error(audio, "google", reason)
 
             data = resp.json()
             cands = data.get("candidates", [])
@@ -1409,7 +1496,8 @@ class AudioRecorder:
             text = "".join(p.get("text", "") for p in parts).strip()
             return text, (lang_setting if lang_setting != "auto" else "en")
         except Exception as e:
-            return "", f"!google:{e}"
+            return self._fallback_to_local_or_error(
+                audio, "google", f"Google request failed: {e}")
 
     def _run_managed(self, audio):
         """Pro managed cloud transcription. Sends audio + the user's access token
@@ -1450,20 +1538,24 @@ class AudioRecorder:
                 # local model so the user keeps working. Flag it so the UI can
                 # notify once.
                 self._cloud_capped = True
-                return self._run_local(audio)
+                return self._fallback_to_local_or_error(
+                    audio, "managed", "Cloud limit reached.")
             if resp.status_code == 403:
                 # Not entitled to managed cloud - fall back to local.
-                return self._run_local(audio)
+                return self._fallback_to_local_or_error(
+                    audio, "managed", "Managed cloud access was denied.")
             if resp.status_code == 401:
                 return "", "!managed:Session expired - sign in again."
             if resp.status_code != 200:
                 # Any cloud error: don't fail the dictation, use local instead.
-                return self._run_local(audio)
+                reason = cloud_error_message("Managed cloud", resp.status_code, resp.text)
+                return self._fallback_to_local_or_error(audio, "managed", reason)
             data = resp.json()
             return data.get("text", ""), data.get("lang", "en")
-        except Exception:
+        except Exception as e:
             # Network/other failure - fall back to local rather than erroring.
-            return self._run_local(audio)
+            return self._fallback_to_local_or_error(
+                audio, "managed", f"Managed cloud request failed: {e}")
 
     def _run_mistral(self, audio):
         try:
@@ -1492,7 +1584,8 @@ class AudioRecorder:
 
             resp = requests.post(url, headers=headers, files=files, data=data, timeout=20)
             if resp.status_code != 200:
-                return "", "!mistral:" + cloud_error_message("Mistral", resp.status_code, resp.text)
+                reason = cloud_error_message("Mistral", resp.status_code, resp.text)
+                return self._fallback_to_local_or_error(audio, "mistral", reason)
 
             resp_data = resp.json()
             text = resp_data.get("text", "").strip()
@@ -1500,7 +1593,8 @@ class AudioRecorder:
 
             return text, detected_lang
         except Exception as e:
-            return "", f"!mistral:{e}"
+            return self._fallback_to_local_or_error(
+                audio, "mistral", f"Mistral request failed: {e}")
 
     def _float_to_wav(self, audio_float):
         int_data = (audio_float * 32767).astype(np.int16)
@@ -2376,6 +2470,11 @@ class AppController(QObject):
         # A previous dictation is still transcribing/processing - ignore the
         # hotkey so we never re-enter the shared recorder mid-flight (crash).
         if getattr(self, "_busy", False):
+            # If Esc already cancelled the transcribe/process phase, the worker
+            # may still be unwinding. Stay quiet so the user doesn't see a stale
+            # "previous dictation" warning for something they just cancelled.
+            if getattr(self, "_cancel_processing", False):
+                return
             if not self.is_rec:
                 self.show_tray_hint(
                     "One moment",
@@ -2615,7 +2714,10 @@ class AppController(QObject):
             return
             
         if "exc" in _result:
-            self.overlay.call_soon(self.overlay.show_error, str(_result["exc"])[:80])
+            self.overlay.call_soon(
+                self.overlay.show_error,
+                _friendly_transcription_error(_result["exc"])[:120],
+            )
             return
 
         # Esc pressed while the transcription was finishing - discard it.
