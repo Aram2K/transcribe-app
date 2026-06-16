@@ -320,9 +320,8 @@ class Settings(QDialog):
             self.rb_smart.blockSignals(False)
             self.rb_transcribe.blockSignals(False)
             self._refresh_mode_card_styles()
-            if hasattr(self, "engine_section"):
-                self.engine_section.setEnabled(True)  # always selectable, even in transcribe-only
-        
+            self._sync_engine_section_enabled()
+
         # 2. Spoken Language
         idx = self.combo_lang.findData(self.cfg_working.get("language", "auto"))
         if idx >= 0:
@@ -1931,8 +1930,7 @@ class Settings(QDialog):
 
         self._refresh_mode_cards_layout()
         # Initial enabled state: engine controls active only in Smart mode.
-        if hasattr(self, "engine_section"):
-            self.engine_section.setEnabled(True)  # always selectable, even in transcribe-only
+        self._sync_engine_section_enabled()
         return tab
 
     def _is_pro(self):
@@ -1963,10 +1961,9 @@ class Settings(QDialog):
                 self.app._pro_upsell("Smart Actions")
 
         # Engine controls stay visible at all times; they're just disabled
-        # (grayed out) when Transcribe-only is selected. No hide/expand so the
-        # layout never shifts.
-        if hasattr(self, "engine_section"):
-            self.engine_section.setEnabled(True)
+        # (grayed out, not clickable) when Transcribe-only is selected. No
+        # hide/expand so the layout never shifts.
+        self._sync_engine_section_enabled()
         new_mode = actions.ACTION_SMART_AUTO if is_smart else actions.ACTION_TRANSCRIBE_ONLY
         self.cfg_working["output_action"] = new_mode
         for card, sel in (
@@ -2105,6 +2102,15 @@ class Settings(QDialog):
         ):
             if card is not None and rb is not None:
                 card.setStyleSheet(self._mode_card_style(rb.isChecked()))
+
+    def _sync_engine_section_enabled(self):
+        """The Smart-actions engine picker (dropdown + model cards + managed
+        panel) is only meaningful when Smart actions is the output mode. In
+        Transcribe-only mode it's greyed out and not clickable."""
+        if not hasattr(self, "engine_section"):
+            return
+        is_smart = bool(getattr(self, "rb_smart", None) and self.rb_smart.isChecked())
+        self.engine_section.setEnabled(is_smart)
 
     def _build_llm_card(self, name, info):
         card = QFrame()
