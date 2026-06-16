@@ -160,6 +160,15 @@ class Settings(QDialog):
         self._set_backend_layout(_init_engine or (self.cfg_working.get("action_api_provider", "api_openai_compatible") if self.app else "api_openai_compatible"))
         self._load_values_into_widgets()
 
+        # Footer "unsaved changes" reminder. Every editable control already
+        # stages cfg_working live, so a cheap periodic diff against the saved
+        # config reflects reality without wiring every signal by hand.
+        self._dirty = False
+        self._capture_clean_baseline()
+        self._dirty_timer = QTimer(self)
+        self._dirty_timer.setInterval(500)
+        self._dirty_timer.timeout.connect(self._refresh_dirty)
+
     # Config keys owned by live controls that write app.cfg directly the moment
     # they change (never staged through Save). They must not ride along in the
     # cfg_working snapshot: Save does app.cfg.update(cfg_working), so a stale
@@ -176,6 +185,108 @@ class Settings(QDialog):
             cfg.pop(key, None)
         return cfg
 
+    # User-editable settings staged in cfg_working and committed to app.cfg only
+    # on Save (Save does app.cfg.update(cfg_working)). The unsaved-changes guard
+    # diffs exactly these keys, so background-mutated keys (secrets, update
+    # flags, auth) never count as "unsaved". Keys applied immediately
+    # (privacy_mode, save_history) stay in sync in both dicts, so they never
+    # show as dirty here either.
+    _DIRTY_KEYS = (
+        "hotkey", "language", "initial_prompt", "meeting_audio_mode",
+        "output_action", "backend", "managed_provider", "mistral_stt_model",
+        "whisper_model", "action_model", "analytics_enabled",
+        "action_api_provider", "action_api_base_url", "action_api_model",
+        "google_api_key", "mistral_api_key", "action_api_key",
+        "privacy_mode", "save_history",
+    )
+
+    def _capture_clean_baseline(self):
+        """Record the editable state right after a load/save - the 'no unsaved
+        edits' reference. Comparing against this (instead of app.cfg directly)
+        means load-time normalization of a widget value never reads as a user
+        edit; only changes the user makes afterwards count."""
+        import copy
+        self._clean_baseline = {
+            k: copy.deepcopy(self.cfg_working.get(k))
+            for k in self._DIRTY_KEYS if k in self.cfg_working
+        }
+
+    def _unsaved_keys(self):
+        """The editable keys whose staged value differs from the clean baseline."""
+        if not self.app:
+            return []
+        base = getattr(self, "_clean_baseline", None)
+        if base is None:
+            return []
+        return [k for k in self._DIRTY_KEYS
+                if k in self.cfg_working and self.cfg_working.get(k) != base.get(k)]
+
+    def _refresh_dirty(self):
+        """Show/hide the footer 'unsaved changes' reminder to match state."""
+        if not hasattr(self, "_dirty_label"):
+            return
+        dirty = bool(self._unsaved_keys())
+        self._dirty = dirty
+        # Don't fight the brief green "Saved" toast - it shares the footer slot.
+        if dirty and not (hasattr(self, "_saved_toast") and self._saved_toast.isVisible()):
+            self._dirty_label.setVisible(True)
+        elif not dirty:
+            self._dirty_label.setVisible(False)
+
+    def _discard_changes(self):
+        """Drop staged edits: re-snapshot from the saved config so the footer
+        clears. Widgets reload from the saved values on the next show."""
+        self.cfg_working = self._snapshot_cfg()
+        self._capture_clean_baseline()
+        self._refresh_dirty()
+
+    def _confirm_discard_or_save(self):
+        """Guard closing when there are unsaved changes. Returns True if it's
+        OK to close now, False to keep the window open."""
+        if not self._unsaved_keys():
+            return True
+        from PySide6.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setWindowTitle("Unsaved changes")
+        box.setIcon(QMessageBox.Warning)
+        box.setText("You have unsaved changes.")
+        box.setInformativeText("Do you want to save them before closing?")
+        save_btn = box.addButton("Save", QMessageBox.AcceptRole)
+        discard_btn = box.addButton("Discard", QMessageBox.DestructiveRole)
+        cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(save_btn)
+        if hasattr(self, "style_content"):
+            box.setStyleSheet(self.style_content)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is cancel_btn:
+            return False
+        if clicked is save_btn:
+            # Save may refuse (e.g. a cloud backend with no key) - if it does,
+            # keep the window open so the user can fix it.
+            return bool(self._on_save_clicked())
+        if clicked is discard_btn:
+            self._discard_changes()
+            return True
+        return False
+
+    def reject(self):
+        # The Close button and the Esc key both route here; guard them.
+        if self._confirm_discard_or_save():
+            super().reject()
+
+    def closeEvent(self, event):
+        # The window's X button routes here.
+        if self._confirm_discard_or_save():
+            event.accept()
+        else:
+            event.ignore()
+
+    def hideEvent(self, event):
+        if hasattr(self, "_dirty_timer"):
+            self._dirty_timer.stop()
+        super().hideEvent(event)
+
     def showEvent(self, event):
         super().showEvent(event)
         self._fit_on_screen()
@@ -183,6 +294,11 @@ class Settings(QDialog):
             self.cfg_working = self._snapshot_cfg()
         self._scan_model_statuses()
         self._load_values_into_widgets()
+        # Baseline = the just-loaded state; then poll for edits while visible.
+        self._capture_clean_baseline()
+        self._refresh_dirty()
+        if hasattr(self, "_dirty_timer"):
+            self._dirty_timer.start()
 
     def _fit_on_screen(self):
         from ui.winfit import settle_on_screen, size_to_screen
@@ -205,8 +321,11 @@ class Settings(QDialog):
         self._populate_history_list()
 
     def _on_save_clicked(self):
+        """Persist staged settings. Returns True on success, False when a
+        validation check blocked the save (so callers like the close guard can
+        keep the window open)."""
         self._sync_action_settings_from_widgets()
-        
+
         backend = self.cfg_working.get("backend", "local")
         if backend == "mistral":
             mistral_key = self.cfg_working.get("mistral_api_key", "").strip()
@@ -223,7 +342,7 @@ class Settings(QDialog):
                     "API Key Required",
                     "Mistral STT requires a valid Mistral API Key. Please enter it below before saving."
                 )
-                return
+                return False
             if getattr(self, "_mistral_key_verified", False) is False:
                 self.tabs.setCurrentIndex(1)
                 if hasattr(self, "mistral_key_input"):
@@ -235,7 +354,7 @@ class Settings(QDialog):
                     "Invalid API Key",
                     "The provided Mistral API Key failed connection tests. Please test a valid API key before saving."
                 )
-                return
+                return False
         elif backend == "google":
             google_key = self.cfg_working.get("google_api_key", "").strip()
             if hasattr(self, "google_key_input"):
@@ -251,7 +370,7 @@ class Settings(QDialog):
                     "API Key Required",
                     "Google Gemini Speech requires a valid Google AI Studio (Gemini) API key. Please enter it below before saving."
                 )
-                return
+                return False
             if getattr(self, "_google_key_verified", False) is False:
                 self.tabs.setCurrentIndex(1)
                 if hasattr(self, "google_key_input"):
@@ -263,7 +382,7 @@ class Settings(QDialog):
                     "Invalid API Key",
                     "The provided Google AI Studio (Gemini) API key failed connection tests. Please test a valid key before saving."
                 )
-                return
+                return False
 
         if self.app:
             self.app.cfg.update(self.cfg_working)
@@ -271,6 +390,9 @@ class Settings(QDialog):
             self.app.apply_tray_bindings()
         # Save no longer closes the window - just confirm with a small toast.
         self._show_saved_toast()
+        self._capture_clean_baseline()  # this is the new clean state
+        self._refresh_dirty()           # clears the footer reminder
+        return True
 
     def _show_saved_toast(self, text="✓  Settings saved"):
         self._saved_toast.setText(text)
@@ -455,6 +577,12 @@ class Settings(QDialog):
         self.chk_privacy.stateChanged.connect(self._on_privacy_toggled)
         bottom_layout.addWidget(self.chk_privacy)
         bottom_layout.addStretch()
+
+        # Extra reminder that edits aren't persisted yet (hidden until dirty).
+        self._dirty_label = QLabel("●  Unsaved changes", self)
+        self._dirty_label.setStyleSheet("color: #d97706; font-weight: 700;")
+        self._dirty_label.setVisible(False)
+        bottom_layout.addWidget(self._dirty_label)
 
         self._saved_toast = QLabel("", self)
         self._saved_toast.setStyleSheet("color: #16a34a; font-weight: 700;")
