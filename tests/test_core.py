@@ -1127,5 +1127,56 @@ class TestGoogleKeyTest(unittest.TestCase):
         self.assertFalse(emit.call_args[0][0])
 
 
+class TestInferenceSerialization(unittest.TestCase):
+    def test_concurrent_local_transcriptions_never_overlap(self):
+        # The chunked pipeline runs several chunk threads; a WhisperModel is not
+        # concurrency-safe (CUDA hangs). _run_local_once must serialize all
+        # inference so transcribe() is never entered by two threads at once.
+        import main as m
+        import threading
+        import time
+
+        rec = m.AudioRecorder.__new__(m.AudioRecorder)  # skip pyaudio __init__
+        rec._model_lock = threading.Lock()
+        rec._infer_lock = threading.Lock()
+        rec._session_lang = "en"
+        rec.load_model = lambda *a, **k: None
+        rec._lang_setting = lambda: "en"  # skip language-detection branch
+
+        state = {"cur": 0, "max": 0}
+        guard = threading.Lock()
+
+        class _Seg:
+            text = "x"
+
+        class _Info:
+            language = "en"
+
+        class _Model:
+            def transcribe(self, audio, **kw):
+                with guard:
+                    state["cur"] += 1
+                    state["max"] = max(state["max"], state["cur"])
+                time.sleep(0.02)
+                with guard:
+                    state["cur"] -= 1
+                return iter([_Seg()]), _Info()
+
+        rec._model = _Model()
+        audio = [0.0] * 16000
+
+        with patch.dict(m.cfg, {"sample_rate": 16000, "initial_prompt": ""}):
+            threads = [
+                threading.Thread(target=m.AudioRecorder._run_local_once, args=(rec, audio))
+                for _ in range(5)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        self.assertEqual(state["max"], 1)  # never two inferences at once
+
+
 if __name__ == "__main__":
     unittest.main()

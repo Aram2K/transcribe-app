@@ -40,7 +40,7 @@ import auth
 import entitlements
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.6.14"
+APP_VERSION = "1.6.15"
 
 # ── Managed cloud transcription (Pro moat) ────────────────────────────────────
 MANAGED_PROXY_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-proxy"
@@ -622,6 +622,11 @@ class AudioRecorder:
         self._model           = None
         self._model_name      = None
         self._model_lock      = threading.Lock()
+        # Serializes actual transcribe() inference. A single WhisperModel is NOT
+        # safe for concurrent calls; the chunked pipeline runs several chunk
+        # threads at once, which hangs/crashes on CUDA (CPU only tolerated it by
+        # luck). One global inference lock fixes the GPU hang.
+        self._infer_lock      = threading.Lock()
         
         self.on_levels        = lambda lvls: None
         self.on_finalising    = lambda done, total: None
@@ -1427,37 +1432,44 @@ class AudioRecorder:
             model = self._model
 
         lang_setting = self._lang_setting()
-        if lang_setting not in ("auto", "multi"):
-            lang_arg = lang_setting
-        elif lang_setting == "auto" and self._session_lang is not None:
-            lang_arg = self._session_lang
-        else:
-            sample = audio[:sr * 8]
-            segs_detect, detect_info = model.transcribe(
-                sample, language=None, beam_size=1,
-                vad_filter=False, without_timestamps=True
-            )
-            list(segs_detect)
-            lang_arg = detect_info.language
-            if lang_setting == "auto":
-                self._session_lang = lang_arg
-
         prompt = cfg.get("initial_prompt", "").strip() or None
-        
-        # Transcribe locally
-        segs, info = model.transcribe(
-            audio,
-            language=lang_arg,
-            initial_prompt=prompt,
-            beam_size=4,
-            vad_filter=False,
-            compression_ratio_threshold=None,
-            log_prob_threshold=None,
-            repetition_penalty=1.3,
-            no_repeat_ngram_size=5,
-            temperature=[0.0, 0.2, 0.4, 0.6, 0.8],
-        )
-        text = " ".join(s.text for s in segs)
+
+        # Serialize ALL inference on this model: faster-whisper/ctranslate2 is
+        # not safe for concurrent transcribe() calls, and the chunked pipeline
+        # fires several chunk threads at once. Without this, GPU/CUDA hangs (the
+        # "works on the no-GPU laptop, stuck on the GPU PC" bug). The lock must
+        # also span the generator consumption below - transcribe() is lazy and
+        # does the real work while the segments are iterated.
+        with self._infer_lock:
+            if lang_setting not in ("auto", "multi"):
+                lang_arg = lang_setting
+            elif lang_setting == "auto" and self._session_lang is not None:
+                lang_arg = self._session_lang
+            else:
+                sample = audio[:sr * 8]
+                segs_detect, detect_info = model.transcribe(
+                    sample, language=None, beam_size=1,
+                    vad_filter=False, without_timestamps=True
+                )
+                list(segs_detect)
+                lang_arg = detect_info.language
+                if lang_setting == "auto":
+                    self._session_lang = lang_arg
+
+            # Transcribe locally
+            segs, info = model.transcribe(
+                audio,
+                language=lang_arg,
+                initial_prompt=prompt,
+                beam_size=4,
+                vad_filter=False,
+                compression_ratio_threshold=None,
+                log_prob_threshold=None,
+                repetition_penalty=1.3,
+                no_repeat_ngram_size=5,
+                temperature=[0.0, 0.2, 0.4, 0.6, 0.8],
+            )
+            text = " ".join(s.text for s in segs)
         return text, lang_arg
 
     def _run_google(self, audio):
