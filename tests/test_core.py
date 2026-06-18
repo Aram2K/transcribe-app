@@ -172,19 +172,27 @@ class TestTranscriptionOverlayLabel(unittest.TestCase):
 
 
 class TestDictationCancelUX(unittest.TestCase):
-    def test_escape_during_transcription_marks_processing_cancelled(self):
+    def test_escape_aborts_and_frees_for_next_recording(self):
+        # Esc = full stop: it orphans the in-flight job, tells the recorder to
+        # bail, and clears is_rec/_busy IMMEDIATELY so the next hotkey starts a
+        # fresh recording instead of "still finishing your previous dictation".
         import main as m
 
         app = MagicMock()
-        app.is_rec = False
+        app.is_rec = True
         app._busy = True
         app._cancel_processing = False
+        app._job_seq = 7
         app.overlay.hide_overlay = MagicMock()
         app.overlay.call_soon = MagicMock()
 
-        m.AppController._on_escape(app)
+        m.AppController._abort_everything(app)
 
         self.assertTrue(app._cancel_processing)
+        self.assertFalse(app._busy)            # freed for the next recording
+        self.assertFalse(app.is_rec)
+        self.assertEqual(app._job_seq, 8)       # in-flight job orphaned
+        app.recorder.request_abort.assert_called_once()
         app.overlay.call_soon.assert_called_once_with(app.overlay.hide_overlay)
 
     def test_cancelled_busy_hotkey_does_not_show_previous_dictation_popup(self):

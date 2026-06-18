@@ -642,6 +642,7 @@ class AudioRecorder:
         self._chunk_errors    = []
         self._chunk_silence_before = {}
         self._record_error    = ""
+        self._abort           = False   # cooperative cancel: transcribe() bails fast when set (Esc)
         self._cloud_capped    = False   # set when managed cloud hit its cap and we fell back to local
         # Rolling peak amplitude for adaptive bar normalization. Decays slowly
         # so bars stay calibrated to recent mic activity (handles mics with
@@ -944,6 +945,7 @@ class AudioRecorder:
         self._session_lang  = None
         self._chunk_threads = []
         self._record_error  = ""
+        self._abort         = False
         self._cloud_capped  = False
         self._level_peak    = 0.05
         
@@ -1291,6 +1293,13 @@ class AudioRecorder:
             with self._chunk_lock:
                 self._chunk_errors.append(f"!transcribe:{_friendly_transcription_error(e)}")
 
+    def request_abort(self):
+        """Cooperative cancel for an in-flight transcribe(): stop waiting on
+        chunk threads and return immediately, so Esc frees the app fast instead
+        of blocking on a slow/stuck local transcription."""
+        self._abort = True
+        self.stop_requested = True
+
     def stop_recording(self):
         self.stop_requested = True
 
@@ -1312,9 +1321,14 @@ class AudioRecorder:
         budget = max(30, min(180, 5 * len(pending)))
         deadline = time.time() + budget
         for t in pending:
-            wait = max(0.0, deadline - time.time())
-            if wait > 0:
-                t.join(timeout=wait)
+            # Poll in short slices so Esc (request_abort) is honored within
+            # ~0.15s instead of blocking up to the full budget on a slow chunk.
+            while t.is_alive():
+                if self._abort:
+                    return "", "!aborted:Cancelled."
+                if time.time() > deadline:
+                    break
+                t.join(timeout=0.15)
             try:
                 with self._chunk_lock:
                     done = sum(1 for i in range(self._chunk_idx) if i in self._chunk_results)
@@ -1323,6 +1337,8 @@ class AudioRecorder:
             except Exception:
                 pass
 
+        if self._abort:
+            return "", "!aborted:Cancelled."
         if self._record_error:
             return "", self._record_error
         with self._chunk_lock:
@@ -2530,14 +2546,33 @@ class AppController(QObject):
 
     def _on_escape(self):
         logger.info("[main] _on_escape fired (is_rec=%s, busy=%s)", self.is_rec, getattr(self, "_busy", False))
-        if self.is_rec:
-            threading.Thread(target=self._cancel, daemon=True).start()
-        elif getattr(self, "_busy", False):
-            # Esc during the "Transcribing…/Thinking…" phase: abort and discard
-            # the in-flight result so nothing gets pasted. The worker thread
-            # can't be killed (Python), but its output is ignored.
-            self._cancel_processing = True
-            self.overlay.call_soon(self.overlay.hide_overlay)
+        # One Esc handler for both phases: stop everything and free the app for
+        # the next recording immediately - whether we're still recording or
+        # already transcribing/processing.
+        threading.Thread(target=self._abort_everything, daemon=True).start()
+
+    def _abort_everything(self):
+        """Esc = full stop. Invalidate any in-flight transcription job (so its
+        result is discarded and can't paste), tell the recorder to bail, stop
+        recording, and clear the busy/recording state right away so the very
+        next hotkey starts a fresh recording with no 'still finishing' wait."""
+        # Bumping the job sequence orphans whatever _stop_impl is doing: its
+        # result is dropped and it won't re-clear _busy from under a new job.
+        self._job_seq = getattr(self, "_job_seq", 0) + 1
+        self._cancel_processing = True
+        self.is_rec = False
+        try:
+            self.recorder.request_abort()   # make transcribe() return fast
+        except Exception:
+            pass
+        try:
+            self.recorder.stop_recording()  # safe/idempotent if already stopped
+        except Exception:
+            pass
+        self._busy = False                  # immediately ready for the next take
+        self._account_recording_time()
+        self._unregister_transient_keys()
+        self.overlay.call_soon(self.overlay.hide_overlay)
 
     def _cloud_preflight_warn(self):
         """Immediate, friendly warning if a cloud backend is selected but clearly
@@ -2648,19 +2683,26 @@ class AppController(QObject):
     def _stop(self):
         # _busy spans the whole transcribe→action→paste pipeline so a second
         # hotkey press can't re-enter and clobber the shared recorder mid-flight
-        # (a real crash source). Cleared in finally on every exit path.
+        # (a real crash source). Each run gets a job id; Esc bumps it to orphan
+        # this run, and only the still-current job is allowed to clear _busy.
+        self._job_seq = getattr(self, "_job_seq", 0) + 1
+        job = self._job_seq
         self._busy = True
         self._cancel_processing = False
         try:
-            self._stop_impl()
+            self._stop_impl(job)
         finally:
-            self._busy = False
-            # The Esc listener is kept alive through the transcribe/process
-            # phase (so it can abort it); tear it down once the pipeline ends.
-            self._unregister_transient_keys()
+            if job == self._job_seq:  # not superseded by an Esc/new recording
+                self._busy = False
+                self._unregister_transient_keys()
 
-    def _stop_impl(self):
+    def _stop_impl(self, job):
         self.recorder.stop_recording()
+        # Recording is finished now - flip is_rec immediately so Esc during the
+        # transcription below is treated as "cancel processing", and a stale
+        # is_rec can't make the next hotkey think we're still recording.
+        self.is_rec = False
+        self._account_recording_time()
         # NOTE: the Esc/Enter listener is intentionally left running here so Esc
         # can abort the transcription below; it's torn down in _stop's finally.
         from ui.overlay import TRANSCRIBING
@@ -2679,17 +2721,13 @@ class AppController(QObject):
         # Poll instead of a blocking join so Esc can cancel mid-transcription.
         waited = 0.0
         while t.is_alive() and waited < TRANSCRIBE_TIMEOUT_SEC:
-            if getattr(self, "_cancel_processing", False):
-                self.is_rec = False
-                self._account_recording_time()
-                self.overlay.call_soon(self.overlay.hide_overlay)
-                logger.info("[main] transcription cancelled by Esc")
+            if job != self._job_seq:
+                # Esc/new recording superseded this run - drop it silently
+                # (_abort_everything already reset state + hid the overlay).
+                logger.info("[main] transcription job %s cancelled", job)
                 return
             t.join(timeout=0.1)
             waited += 0.1
-
-        self.is_rec = False
-        self._account_recording_time()
 
         # If managed cloud hit its monthly cap, we transparently used the local
         # model - tell the user once so the switch isn't a mystery.
@@ -2721,8 +2759,7 @@ class AppController(QObject):
             return
 
         # Esc pressed while the transcription was finishing - discard it.
-        if getattr(self, "_cancel_processing", False):
-            self.overlay.call_soon(self.overlay.hide_overlay)
+        if job != self._job_seq:
             return
 
         text = _result.get("text", "")
@@ -2823,8 +2860,7 @@ class AppController(QObject):
                 return
 
         # Esc during the Smart Action / "Thinking…" phase: don't paste or save.
-        if getattr(self, "_cancel_processing", False):
-            self.overlay.call_soon(self.overlay.hide_overlay)
+        if job != self._job_seq:
             return
 
         if self.cfg.get("save_history", True) and not self.cfg.get("privacy_mode", False):
