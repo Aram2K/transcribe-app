@@ -6,6 +6,10 @@ pyaudio; sys_platform != "win32"
 # working everywhere — main.py prefers `pyaudiowpatch` when available.
 pyaudiowpatch; sys_platform == "win32"
 numpy
+# sherpa-onnx powers local, offline speaker diarization (Apache-2.0). Models are
+# downloaded on first meeting use; the app degrades to an unlabeled transcript
+# if it's missing, so it's a soft dependency.
+sherpa-onnx>=1.10.28
 keyboard
 pyperclip
 pynput
