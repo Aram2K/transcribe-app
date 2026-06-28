@@ -733,6 +733,13 @@ class AudioRecorder:
                 last_err = None
                 repaired_cache = False
                 for d, c, local_only in attempts:
+                    # GPU already proven unusable earlier in THIS load (its warm-up
+                    # raised) - skip the remaining CUDA attempt. Building a second
+                    # CUDA model would skip the warm-up below and hand back a broken
+                    # GPU model that hangs on real inference - the "stuck on
+                    # Finalising" bug on machines where cuBLAS/cuDNN are missing.
+                    if d == "cuda" and getattr(self, "_cuda_usable", None) is False:
+                        continue
                     try:
                         m = WhisperModel(
                             name, device=d, compute_type=c, local_files_only=local_only,
@@ -740,11 +747,11 @@ class AudioRecorder:
                         if d == "cuda":
                             # A CUDA model constructs even when the CUDA runtime libs
                             # (cuBLAS/cuDNN, e.g. cublas64_12.dll) are missing - it
-                            # only fails when it actually computes. The first time
-                            # only, force a tiny warm-up so we catch that here and
-                            # fall back to CPU instead of erroring on a real dictation.
-                            # After we know GPU works, skip the warm-up on later loads.
-                            if getattr(self, "_cuda_usable", None) is None:
+                            # only fails when it actually computes. Force a tiny
+                            # warm-up (unless the GPU is already proven good) so we
+                            # catch that here and fall back to CPU instead of handing
+                            # back a model that hangs on a real dictation.
+                            if getattr(self, "_cuda_usable", None) is not True:
                                 seg, _ = m.transcribe(np.zeros(16000, dtype=np.float32), beam_size=1)
                                 list(seg)
                             self._cuda_usable = True
@@ -953,7 +960,14 @@ class AudioRecorder:
         self._abort         = False
         self._cloud_capped  = False
         self._level_peak    = 0.05
-        
+        # Full wall-clock recording retained for post-meeting speaker
+        # diarization + a clean speaker-attributed re-transcription. Capped so a
+        # marathon meeting can't grow memory without bound (~0.23 GB/hour).
+        self._full_audio_frames = []
+        self._full_audio_len = 0
+        self._full_audio_truncated = False
+        self._full_audio_max = cfg["sample_rate"] * 60 * 120  # ~2 hours
+
         open_args = {
             "format": pyaudio.paFloat32,
             "channels": 1,
@@ -1214,6 +1228,13 @@ class AudioRecorder:
                 vad_buf.append(data)
                 with self._chunk_lock:
                     self._chunk_frames.append(data)
+                    # Retain the full wall-clock track (post-meeting diarization)
+                    # until the memory cap, then stop growing it.
+                    if not self._full_audio_truncated:
+                        self._full_audio_frames.append(data)
+                        self._full_audio_len += len(arr)
+                        if self._full_audio_len > self._full_audio_max:
+                            self._full_audio_truncated = True
 
                 if is_speech:
                     speech_sec  += this_dur
@@ -1392,6 +1413,63 @@ class AudioRecorder:
             self.on_lang_detected(detected, LANG_NAMES.get(detected, detected.upper()))
         return full_text.strip(), detected or "en"
 
+    def get_full_audio(self):
+        """The full retained wall-clock recording as 16 kHz mono float32 (empty
+        array if nothing was retained). Used post-meeting for diarization + a
+        clean speaker-attributed re-transcription."""
+        with self._chunk_lock:
+            frames = b"".join(self._full_audio_frames)
+        if not frames:
+            return np.zeros(0, dtype=np.float32)
+        return np.frombuffer(frames, dtype=np.float32).copy()
+
+    def transcribe_segments(self, audio, language=None):
+        """Transcribe a full audio array into timestamped segments using the
+        LOCAL Whisper model: a list of {"start", "end", "text"} in seconds, for
+        the post-meeting speaker-attributed transcript. Returns [] on failure or
+        very short audio. Holds the shared inference lock (safe after the live
+        chunk threads have drained)."""
+        try:
+            audio = np.asarray(audio, dtype=np.float32)
+        except Exception:
+            return []
+        sr = cfg["sample_rate"]
+        if len(audio) < sr // 2:
+            return []
+        try:
+            self.load_model()
+        except Exception as e:
+            logger.warning("transcribe_segments: model load failed: %s", e)
+            return []
+        with self._model_lock:
+            model = self._model
+        if model is None:
+            return []
+        lang_setting = language or self._lang_setting()
+        lang_arg = None if lang_setting in ("auto", "multi", "", None) else lang_setting
+        prompt = cfg.get("initial_prompt", "").strip() or None
+        try:
+            with self._infer_lock:
+                segs, _info = model.transcribe(
+                    audio, language=lang_arg, initial_prompt=prompt,
+                    beam_size=4,
+                    # Anti-hallucination (meeting re-transcription): VAD + restored
+                    # confidence/no-speech thresholds + no carry-over context, so
+                    # silent/music gaps aren't captioned with invented filler.
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500),
+                    condition_on_previous_text=False,
+                    compression_ratio_threshold=2.4,
+                    log_prob_threshold=-1.0,
+                    no_speech_threshold=0.6,
+                    repetition_penalty=1.3, no_repeat_ngram_size=5,
+                    temperature=[0.0, 0.2, 0.4, 0.6, 0.8])
+                return [{"start": float(s.start), "end": float(s.end),
+                         "text": s.text.strip()} for s in segs if s.text.strip()]
+        except Exception as e:
+            logger.warning("transcribe_segments failed: %s", e)
+            return []
+
     def _lang_setting(self):
         """The language for THIS recording session: an explicit per-session
         override (the meeting window's selector) wins over the global default."""
@@ -1456,15 +1534,26 @@ class AudioRecorder:
                 if lang_setting == "auto":
                     self._session_lang = lang_arg
 
-            # Transcribe locally
+            # Anti-hallucination. Whisper invents filler ("Thank you.", "I'll
+            # see you next time.") and loops it on silence/non-speech; the old
+            # config disabled its safeguards. condition_on_previous_text=False
+            # breaks the repetition loop, and the restored confidence + no-speech
+            # thresholds make it drop silence instead of captioning it. VAD is
+            # enabled for meetings (long silent stretches) but left OFF for
+            # push-to-talk dictation, where the user is deliberately speaking and
+            # VAD could clip a short utterance.
+            is_meeting = getattr(self, "_capture_mode", None) is not None
             segs, info = model.transcribe(
                 audio,
                 language=lang_arg,
                 initial_prompt=prompt,
                 beam_size=4,
-                vad_filter=False,
-                compression_ratio_threshold=None,
-                log_prob_threshold=None,
+                vad_filter=is_meeting,
+                vad_parameters=dict(min_silence_duration_ms=500),
+                condition_on_previous_text=False,
+                compression_ratio_threshold=2.4,
+                log_prob_threshold=-1.0,
+                no_speech_threshold=0.6,
                 repetition_penalty=1.3,
                 no_repeat_ngram_size=5,
                 temperature=[0.0, 0.2, 0.4, 0.6, 0.8],
@@ -2692,6 +2781,32 @@ class AppController(QObject):
                 pass
         self._transient_kbd_handles = []
 
+    def _resolve_action_engine(self, action_model=None):
+        """Resolve (model, config) for a Smart Action / meeting-notes run,
+        applying Pro routing: a signed-in Pro user runs through the managed cloud
+        (our key, no BYO key needed) unless they deliberately picked a local LLM
+        or a cloud engine with their OWN key. Shared by dictation and meetings so
+        both honor a Pro subscription identically (meetings used to skip this,
+        which is why Pro users were wrongly asked for an action API key)."""
+        action_model = actions.normalize_action_model(
+            action_model if action_model is not None
+            else self.cfg.get("action_model", actions.RULE_BASED_ID))
+        action_config = self.cfg
+        if self.is_pro():
+            token = None
+            try:
+                token = self.auth.get_access_token()
+            except Exception:
+                token = None
+            if token:
+                action_config = {**self.cfg, "_managed_token": token}
+                m_kind = actions.ACTION_MODELS.get(action_model, {}).get("kind")
+                has_own_cloud_key = bool(
+                    ((self.cfg.get("action_api_key") or "") or (self.cfg.get("google_api_key") or "")).strip())
+                if m_kind in ("rules", "managed") or (m_kind == "cloud" and not has_own_cloud_key):
+                    action_model = actions.API_MANAGED_ID
+        return action_model, action_config
+
     def _stop(self):
         # _busy spans the whole transcribe→action→paste pipeline so a second
         # hotkey press can't re-enter and clobber the shared recorder mid-flight
@@ -2823,24 +2938,7 @@ class AppController(QObject):
             from ui.overlay import PROCESSING
             self.overlay.call_soon(self.overlay.set_state, PROCESSING)
             # Pick the engine + inject the auth token for Pro managed actions.
-            action_model = actions.normalize_action_model(self.cfg.get("action_model", actions.RULE_BASED_ID))
-            action_config = self.cfg
-            if self.is_pro():
-                token = None
-                try:
-                    token = self.auth.get_access_token()
-                except Exception:
-                    token = None
-                if token:
-                    action_config = {**self.cfg, "_managed_token": token}
-                    # Default Pro Smart Actions to the managed cloud (our Mistral
-                    # key, no BYO key). Respect a deliberate local-LLM choice, or a
-                    # cloud engine the user configured with their OWN key.
-                    m_kind = actions.ACTION_MODELS.get(action_model, {}).get("kind")
-                    has_own_cloud_key = bool(
-                        ((self.cfg.get("action_api_key") or "") or (self.cfg.get("google_api_key") or "")).strip())
-                    if m_kind in ("rules", "managed") or (m_kind == "cloud" and not has_own_cloud_key):
-                        action_model = actions.API_MANAGED_ID
+            action_model, action_config = self._resolve_action_engine()
             try:
                 output_text = actions.process(
                     text,

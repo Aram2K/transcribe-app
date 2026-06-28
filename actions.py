@@ -230,6 +230,20 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
             return routed
         return _clean_transcript(text)
 
+    # Managed (Pro) cloud for any non-smart action - meeting notes, summarize,
+    # translate, etc. The auth token is injected into config by the caller
+    # (AppController._resolve_action_engine). Without a token (not Pro / signed
+    # out) fall through to the local extractive fallbacks below rather than
+    # erroring - this is why Pro meeting notes used to silently go extractive.
+    if ACTION_MODELS[model].get("kind") == "managed":
+        token = (config or {}).get("_managed_token")
+        if token:
+            try:
+                return action_api.run_managed_action(
+                    text, mode, token, source_lang=source_lang, target_lang=target_lang)
+            except action_api.ActionAPIError as e:
+                raise ActionError(str(e)) from e
+
     if ACTION_MODELS[model].get("kind") == "cloud":
         if not config:
             raise ActionError("Add your action API settings before using this action engine.")
