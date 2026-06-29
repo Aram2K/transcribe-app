@@ -134,12 +134,15 @@ jobs:
             --hidden-import llama_cpp `
             --hidden-import tokenizers `
             --hidden-import pyaudiowpatch `
+            --hidden-import sherpa_onnx `
+            --hidden-import sherpa_onnx.lib._sherpa_onnx `
             --collect-all faster_whisper `
             --collect-all ctranslate2 `
             --collect-all llama_cpp `
             --collect-all pystray `
             --collect-all pynput `
             --collect-all pyaudiowpatch `
+            --collect-all sherpa_onnx `
             --exclude-module torch `
             --exclude-module openai `
             --exclude-module numba `
@@ -227,11 +230,14 @@ jobs:
             --hidden-import huggingface_hub \
             --hidden-import llama_cpp \
             --hidden-import tokenizers \
+            --hidden-import sherpa_onnx \
+            --hidden-import sherpa_onnx.lib._sherpa_onnx \
             --collect-all faster_whisper \
             --collect-all ctranslate2 \
             --collect-all llama_cpp \
             --collect-all pystray \
             --collect-all pynput \
+            --collect-all sherpa_onnx \
             --exclude-module torch \
             --exclude-module openai \
             --exclude-module numba \
