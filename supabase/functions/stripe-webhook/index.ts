@@ -52,6 +52,15 @@ async function upsertSubscription(sub: Stripe.Subscription, userId: string) {
   const item = sub.items.data[0];
   const priceId = item?.price?.id ?? null;
   const interval = item?.price?.recurring?.interval ?? null;
+  // Recent Stripe API versions ("flexible" billing mode) moved the period
+  // boundaries from the subscription object onto its first item; the
+  // top-level sub.current_period_end is undefined there, which turned into
+  // NaN -> "Invalid time value" and made this handler 500 on every real
+  // subscription event. Read the item first, fall back to the legacy
+  // top-level field for older API versions/accounts.
+  const periodEndUnix = (item as { current_period_end?: number } | undefined)?.current_period_end
+    ?? (sub as unknown as { current_period_end?: number }).current_period_end
+    ?? null;
 
   await supabase.from("subscriptions").upsert({
     id: sub.id,
@@ -59,7 +68,7 @@ async function upsertSubscription(sub: Stripe.Subscription, userId: string) {
     status: sub.status,
     price_id: priceId,
     plan: planForPrice(priceId, interval),
-    current_period_end: new Date(sub.current_period_end * 1000).toISOString(),
+    current_period_end: periodEndUnix ? new Date(periodEndUnix * 1000).toISOString() : null,
     cancel_at_period_end: sub.cancel_at_period_end,
     updated_at: new Date().toISOString(),
   });
