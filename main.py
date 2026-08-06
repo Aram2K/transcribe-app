@@ -3156,6 +3156,14 @@ def main():
     qapp = QApplication(sys.argv)
     qapp.setQuitOnLastWindowClosed(False) # Tray-resident background app constraint!
 
+    # Scrolling the page must never silently rewrite a dropdown/spin-box the
+    # cursor happens to pass over (Qt's default wheel behaviour).
+    try:
+        from ui.wheelguard import install as install_wheel_guard
+        install_wheel_guard(qapp)
+    except Exception as e:
+        logging.warning("Could not install wheel guard: %s", e)
+
     # Set premium global application window icon (circular Armenian Flag + Microphone)
     try:
         qapp.setWindowIcon(make_qicon())
