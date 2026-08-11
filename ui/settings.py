@@ -728,8 +728,19 @@ class Settings(QDialog):
         self.tbl_replacements = QTableWidget(0, 2, fix_frame)
         self.tbl_replacements.setHorizontalHeaderLabels(["Heard", "Replace with"])
         self.tbl_replacements.horizontalHeader().setStretchLastSection(True)
+        self.tbl_replacements.setColumnWidth(0, 200)
         self.tbl_replacements.verticalHeader().setVisible(False)
-        self.tbl_replacements.setMaximumHeight(140)
+        self.tbl_replacements.setMaximumHeight(160)
+        # The app-wide QLineEdit rule adds 8px padding + a rounded border. The
+        # cell editor is a QLineEdit, so without this it is taller than the row
+        # and the text you are typing gets clipped. Give rows room AND slim the
+        # editor down to fit inside one.
+        self.tbl_replacements.verticalHeader().setDefaultSectionSize(34)
+        self.tbl_replacements.setWordWrap(False)   # elide, never wrap into a clipped 2nd line
+        self.tbl_replacements.setStyleSheet(
+            "QTableWidget::item { padding: 2px 6px; }"
+            "QTableWidget QLineEdit { padding: 1px 5px; border-radius: 4px;"
+            " min-height: 0px; margin: 0px; }")
         self._load_replacements_table()
         self.tbl_replacements.itemChanged.connect(self._save_general_configs)
         fix_lay.addWidget(self.tbl_replacements)
