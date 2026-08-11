@@ -140,6 +140,46 @@ class TestFillers(unittest.TestCase):
         self.assertEqual(clean("I like it", remove_fillers=True), "I like it")
 
 
+class TestPromptEcho(unittest.TestCase):
+    """Whisper treats initial_prompt as preceding context and continues it on
+    quiet audio, spraying the user's vocabulary into the transcript. These are
+    the verbatim outputs the real model produced on low-signal input."""
+
+    TERMS = ("Aram", "Aibuben", "PySide6", "Adamyan")
+
+    def clean(self, text):
+        return tc.clean(text, options=tc.CleanupOptions(vocabulary_terms=self.TERMS))
+
+    def test_real_echoes_are_removed(self):
+        for observed in ("Aibuben, PySide6, Adamyan.",
+                         "Aibuben, PySide6",
+                         "Glossary, Adamyan.",
+                         "Aram, Aibuben, PySide6, Adamyan."):
+            self.assertEqual(self.clean(observed), "", f"not stripped: {observed!r}")
+
+    def test_single_term_is_real_dictation(self):
+        # Saying one vocabulary word is normal speech - never drop it.
+        self.assertEqual(self.clean("PySide6"), "PySide6")
+        self.assertEqual(self.clean("Aibuben."), "Aibuben.")
+
+    def test_terms_inside_a_sentence_survive(self):
+        for text in ("I use PySide6 and Aibuben every day.",
+                     "Aram and Adamyan reviewed the PySide6 migration."):
+            self.assertEqual(self.clean(text), text)
+
+    def test_echo_removed_but_real_speech_kept(self):
+        out = self.clean("Aibuben, PySide6, Adamyan. Let's ship on Friday.")
+        self.assertEqual(out, "Let's ship on Friday.")
+
+    def test_no_terms_configured_is_a_noop(self):
+        text = "Aibuben, PySide6, Adamyan."
+        self.assertEqual(tc.clean(text, options=tc.CleanupOptions()), text)
+
+    def test_unrelated_lists_are_untouched(self):
+        text = "Apples, oranges, bananas."
+        self.assertEqual(self.clean(text), text)
+
+
 class TestLayoutAndSafety(unittest.TestCase):
     def test_preserve_layout_keeps_newlines(self):
         out = clean("Speaker 1: hi\nSpeaker 2: hello", preserve_layout=True)

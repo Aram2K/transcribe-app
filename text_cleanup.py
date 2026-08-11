@@ -126,6 +126,7 @@ class CleanupOptions:
     remove_fillers: bool = False          # OFF by default - it changes the user's words
     replacements: tuple = ()              # ((from, to), ...)
     extra_hallucination_phrases: tuple = ()
+    vocabulary_terms: tuple = ()          # for prompt-echo detection
     preserve_layout: bool = False         # True keeps newlines (meeting transcripts)
 
 
@@ -168,12 +169,20 @@ def options_from_config(cfg, *, preserve_layout=False):
     extra = tuple(
         fold(p) for p in (cfg.get("cleanup_custom_hallucinations") or []) if fold(p)
     )
+    # Imported lazily and defensively: vocabulary is a pure-stdlib leaf module,
+    # but cleanup must still work if it is ever unavailable.
+    try:
+        import vocabulary
+        terms = tuple(vocabulary.load_terms(cfg))
+    except Exception:
+        terms = ()
     return CleanupOptions(
         strip_hallucinations=bool(cfg.get("cleanup_strip_hallucinations", True)),
         strip_artifacts=bool(cfg.get("cleanup_strip_artifacts", True)),
         remove_fillers=bool(cfg.get("cleanup_remove_fillers", False)),
         replacements=tuple(pairs),
         extra_hallucination_phrases=extra,
+        vocabulary_terms=terms,
         preserve_layout=bool(preserve_layout),
     )
 
@@ -281,6 +290,54 @@ def _strip_hallucinations(text, phrases):
     return _join_utterances(kept)
 
 
+# Scaffolding words our own glossary prompt is built from - if the decoder
+# echoes the prompt, these come back with the terms.
+_PROMPT_BOILERPLATE = frozenset(("glossary", "vocabulary", "terms", "spell",
+                                 "spelling", "and"))
+
+
+def _strip_prompt_echo(text, terms):
+    """Drop utterances that are just the custom-vocabulary prompt read back.
+
+    Whisper treats ``initial_prompt`` as preceding context, so on quiet or
+    ambiguous audio it happily *continues* it - emitting "Aibuben, PySide6,
+    Adamyan." when nobody said anything. Verified to happen well above any
+    sensible energy gate, so it has to be caught here rather than avoided.
+
+    An utterance is an echo when it contains **two or more** vocabulary terms
+    and no other content words. The two-term floor is what protects real
+    dictation: saying a single term ("PySide6") is normal speech and is kept.
+    """
+    if not terms:
+        return text
+    folded_terms = sorted({fold(t) for t in terms if fold(t)}, key=len, reverse=True)
+    if not folded_terms:
+        return text
+
+    kept = []
+    for body, delim in _split_utterances(text):
+        key = fold(body)
+        if not key:
+            kept.append((body, delim))
+            continue
+        remainder = key
+        hits = 0
+        for term in folded_terms:
+            pattern = r"(?<!\w)%s(?!\w)" % re.escape(term)
+            remainder, n = re.subn(pattern, " ", remainder)
+            hits += n
+        words = remainder.split()
+        leftovers = [w for w in words if w not in _PROMPT_BOILERPLATE]
+        saw_boilerplate = len(words) != len(leftovers)
+        # Two or more terms is an echo. One term is too, if it arrived wearing
+        # our own prompt scaffolding ("Glossary, Adamyan.") - nobody dictates
+        # that. A bare single term stays: it is ordinary speech.
+        if not leftovers and (hits >= 2 or (hits >= 1 and saw_boilerplate)):
+            continue
+        kept.append((body, delim))
+    return _join_utterances(kept)
+
+
 def _preserve_case(matched, replacement):
     """Apply the matched text's case shape - but only when the replacement has
     no case of its own. A replacement like "PySide6" is a canonical spelling and
@@ -335,7 +392,8 @@ def clean_with_report(text, *, options=None):
     log or send anywhere.
     """
     opts = options or CleanupOptions()
-    report = {"artifacts": 0, "repeats": 0, "hallucinations": 0, "replacements": 0}
+    report = {"artifacts": 0, "repeats": 0, "hallucinations": 0,
+              "prompt_echo": 0, "replacements": 0}
     if not text or not text.strip():
         return "", report
 
@@ -359,6 +417,12 @@ def clean_with_report(text, *, options=None):
         out = _strip_hallucinations(out, phrases)
         report["hallucinations"] = int(before != out)
 
+        # Must run before replacements, or a replacement could rewrite an echoed
+        # term and hide it from this check.
+        before = out
+        out = _strip_prompt_echo(out, opts.vocabulary_terms)
+        report["prompt_echo"] = int(before != out)
+
     if opts.replacements:
         before = out
         out = _apply_replacements(out, opts.replacements)
@@ -372,7 +436,8 @@ def clean_with_report(text, *, options=None):
     # Safety valve: if every stage combined ate a transcript that started with
     # real content and nothing was flagged as a hallucination or artifact, hand
     # back the original rather than silently losing the user's words.
-    if not out and original.strip() and not (report["hallucinations"] or report["artifacts"]):
+    if not out and original.strip() and not (
+            report["hallucinations"] or report["artifacts"] or report["prompt_echo"]):
         return _final_tidy(_normalize_whitespace(original, opts.preserve_layout),
                            opts.preserve_layout), report
     return out, report
