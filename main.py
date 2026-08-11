@@ -38,6 +38,8 @@ import local_llm
 import telemetry
 import auth
 import entitlements
+import text_cleanup
+import vocabulary
 
 # ── Version ───────────────────────────────────────────────────────────────────
 APP_VERSION = "1.7.0"
@@ -113,6 +115,23 @@ DEFAULT = {
     "tray_hint_shown": False,
     "meeting_consent_ack": False,  # one-time recording-consent notice
     "macos_perms_guide_shown": False,  # one-time macOS permission walkthrough
+    # Output-quality pass (text_cleanup.py). Runs on every dictation - the only
+    # safety net between a Whisper hallucination and the user's cursor.
+    "cleanup_enabled": True,
+    "cleanup_strip_hallucinations": True,
+    "cleanup_strip_artifacts": True,
+    "cleanup_remove_fillers": False,   # OFF: it changes the user's words
+    "cleanup_replacements": [],        # [{"from": "pyside 6", "to": "PySide6"}]
+    "cleanup_custom_hallucinations": [],
+    # Custom vocabulary (vocabulary.py). "initial_prompt" above is kept as a
+    # derived mirror of this list so the local decode path needs no changes.
+    "vocabulary": [],
+    "vocabulary_share_with_cloud": True,
+    # Put the user's clipboard back after we paste.
+    "restore_clipboard": True,
+    "clipboard_restore_delay_ms": 400,
+    # Bumped when the config shape changes in a way that needs migration.
+    "config_schema_version": 1,
 }
 
 storage.migrate_legacy_file(LEGACY_CONFIG_PATH, CONFIG_PATH)
@@ -164,6 +183,9 @@ def load_config():
     if not isinstance(data, dict):
         data = {}
     loaded = {**DEFAULT, **data}
+    # Keep initial_prompt in step with the structured vocabulary list, so a
+    # hand-edited or older config self-heals on load.
+    vocabulary.sync_config(loaded)
 
     key = (loaded.get("google_api_key") or "").strip()
     if key:
@@ -1586,6 +1608,11 @@ class AudioRecorder:
                 lang_hint = (f" The speaker is speaking {nm}. Transcribe in {nm} using its"
                              f" native script and return only {nm} text.")
 
+            # The user's custom vocabulary used to be dropped on every cloud
+            # backend - configure it, upgrade to cloud, and it silently stopped
+            # working. Gemini is prompt-driven, so the terms go straight in.
+            vocab_hint = vocabulary.cloud_transcription_hint(cfg)
+
             model_name = cfg.get("google_stt_model", "gemini-2.5-flash")
             url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
                    f"{model_name}:generateContent?key={key}")
@@ -1594,7 +1621,7 @@ class AudioRecorder:
                     "parts": [
                         {"text": ("Transcribe this audio verbatim. Output only the exact "
                                   "spoken words with correct punctuation and capitalization, "
-                                  "and nothing else." + lang_hint)},
+                                  "and nothing else." + lang_hint + vocab_hint)},
                         {"inline_data": {"mime_type": "audio/wav", "data": b64_data}},
                     ]
                 }],
@@ -1637,14 +1664,21 @@ class AudioRecorder:
             # Pro users pick which managed provider to use (server keys): Gemini
             # (default) or Mistral. No BYO key is involved here.
             provider = cfg.get("managed_provider", "gemini")
+            # Custom vocabulary for the proxy to fold into its prompt. Older
+            # proxy deployments ignore unknown fields, so this is a no-op until
+            # the server side ships - never an error.
+            body = {
+                "audio": b64_data,
+                "sample_rate": cfg["sample_rate"],
+                "language": self._lang_setting(),
+                "provider": provider,
+            }
+            vocab_terms = vocabulary.cloud_terms(cfg)
+            if vocab_terms:
+                body["vocabulary"] = vocab_terms
             resp = requests.post(
                 MANAGED_PROXY_URL,
-                json={
-                    "audio": b64_data,
-                    "sample_rate": cfg["sample_rate"],
-                    "language": self._lang_setting(),
-                    "provider": provider,
-                },
+                json=body,
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=30,
             )
@@ -2781,6 +2815,94 @@ class AppController(QObject):
                 pass
         self._transient_kbd_handles = []
 
+    def _effective_cfg(self):
+        """The config governing THIS dictation.
+
+        Today simply the global config. It exists as a single interception point
+        so a future per-app profile system can override settings in one place
+        rather than having to find every self.cfg read in the dictation path.
+        """
+        return self.cfg
+
+    def _postprocess_transcript(self, text):
+        """Output-quality pass (see text_cleanup). Extracted so it can be tested
+        without standing up the recorder, overlay and telemetry."""
+        if not text:
+            return ""
+        cfg = self._effective_cfg()
+        if not cfg.get("cleanup_enabled", True):
+            return text
+        try:
+            cleaned, report = text_cleanup.clean_with_report(
+                text, options=text_cleanup.options_from_config(cfg))
+            if any(report.values()):
+                # Counts only - never transcript text.
+                logger.debug("text cleanup: %s", report)
+            return cleaned
+        except Exception:
+            # A regex bug must never cost the user a dictation.
+            logger.debug("text cleanup failed; using raw transcript", exc_info=True)
+            return text
+
+    @staticmethod
+    def should_restore_clipboard(pasted, restore_enabled, prev_was_text, still_ours):
+        """Whether to put the user's previous clipboard back after a paste.
+
+        Pure so the rules are testable:
+        - only when the feature is on,
+        - only if we actually pasted (otherwise the text is intentionally left
+          on the clipboard for the user to paste by hand),
+        - only if the previous content was text (never clear an image/file
+          clipboard to an empty string - worse than leaving our text),
+        - only if nothing else has changed the clipboard since.
+        """
+        return bool(restore_enabled and pasted and prev_was_text and still_ours)
+
+    def _paste_via_clipboard(self, text, restore=True):
+        """Copy `text`, send the paste chord, then restore the prior clipboard.
+
+        Returns True if the paste chord was sent. The restore is deliberately
+        delayed: the target app reads the clipboard asynchronously after Ctrl+V,
+        so restoring immediately would race and paste the OLD content.
+        """
+        cfg = self._effective_cfg()
+        prev, prev_was_text = None, False
+        if restore and cfg.get("restore_clipboard", True):
+            try:
+                prev = pyperclip.paste()
+                prev_was_text = isinstance(prev, str) and prev != ""
+            except Exception:
+                prev, prev_was_text = None, False
+
+        pyperclip.copy(text)
+
+        pasted = False
+        try:
+            from pynput.keyboard import Key
+            mod = Key.cmd if sys.platform == "darwin" else Key.ctrl
+            self.kbd.press(mod); self.kbd.press("v")
+            self.kbd.release("v"); self.kbd.release(mod)
+            pasted = True
+        except Exception as e:
+            logger.warning("[Paste] %s", e)
+
+        if self.should_restore_clipboard(
+                pasted, cfg.get("restore_clipboard", True), prev_was_text, True):
+            def _restore():
+                try:
+                    delay = int(cfg.get("clipboard_restore_delay_ms", 400))
+                except (TypeError, ValueError):
+                    delay = 400
+                time.sleep(max(0, min(delay, 5000)) / 1000.0)
+                try:
+                    # Someone else may have taken the clipboard meanwhile.
+                    if pyperclip.paste() == text:
+                        pyperclip.copy(prev)
+                except Exception:
+                    pass
+            threading.Thread(target=_restore, daemon=True).start()
+        return pasted
+
     def _resolve_action_engine(self, action_model=None):
         """Resolve (model, config) for a Smart Action / meeting-notes run,
         applying Pro routing: a signed-in Pro user runs through the managed cloud
@@ -2889,8 +3011,20 @@ class AppController(QObject):
         if job != self._job_seq:
             return
 
-        text = _result.get("text", "")
+        raw_text = _result.get("text", "")
         lang = _result.get("lang", "")
+
+        # Output-quality pass. Deliberately here and nowhere else: this is the
+        # dictation-only path (meetings call the recorder directly), so cleanup
+        # can never perturb the meeting/diarization pipeline.
+        text = self._postprocess_transcript(raw_text)
+
+        if raw_text and not text:
+            # Cleanup consumed the whole transcript, i.e. it was pure
+            # hallucination/noise. Say so rather than vanishing silently.
+            self.overlay.call_soon(
+                self.overlay.show_error, "Only background noise was detected.")
+            return
 
         if not text:
             if lang and lang.startswith("!"):
@@ -2990,18 +3124,7 @@ class AppController(QObject):
         )
 
         time.sleep(0.35)
-        pyperclip.copy(output_text)
-        
-        # Global hotkey paste
-        pasted = False
-        try:
-            from pynput.keyboard import Key
-            mod = Key.cmd if sys.platform == "darwin" else Key.ctrl
-            self.kbd.press(mod); self.kbd.press("v")
-            self.kbd.release("v"); self.kbd.release(mod)
-            pasted = True
-        except Exception as e:
-            print(f"[Paste] Error: {e}")
+        pasted = self._paste_via_clipboard(output_text)
 
         self.overlay.call_soon(self.overlay.show_done, pasted)
 
@@ -3014,14 +3137,7 @@ class AppController(QObject):
 
     def paste_text(self, text):
         # Triggers cursor paste for clicked history logs
-        pyperclip.copy(text)
-        try:
-            from pynput.keyboard import Key
-            mod = Key.cmd if sys.platform == "darwin" else Key.ctrl
-            self.kbd.press(mod); self.kbd.press("v")
-            self.kbd.release("v"); self.kbd.release(mod)
-        except Exception:
-            pass
+        self._paste_via_clipboard(text)
 
     def quit_app(self):
         # Graceful shutdown of system hooks

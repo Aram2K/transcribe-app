@@ -58,10 +58,10 @@ def defaults(provider):
     return PROVIDERS[normalize_provider(provider)]
 
 
-def build_messages(text, mode, source_lang="auto", target_lang="en"):
+def build_messages(text, mode, source_lang="auto", target_lang="en", vocab_block=""):
     text = (text or "").strip()
     if mode == "smart_auto":
-        return smart_prompt.build_messages(text)
+        return smart_prompt.build_messages(text, vocab_block=vocab_block)
     if mode == "write_email":
         instruction = "Turn this dictated text into a concise email draft. Output only the email."
     elif mode == "make_todo_list":
@@ -115,8 +115,11 @@ def build_messages(text, mode, source_lang="auto", target_lang="en"):
         )
     else:
         instruction = "Rewrite this text clearly while preserving meaning. Output only the result."
+    system = "You are a concise assistant. Never add commentary."
+    if vocab_block:
+        system = f"{system}\n\n{vocab_block}"
     return [
-        {"role": "system", "content": "You are a concise assistant. Never add commentary."},
+        {"role": "system", "content": system},
         {"role": "user", "content": f"{instruction}\n\nText:\n{text}"},
     ]
 
@@ -124,12 +127,14 @@ def build_messages(text, mode, source_lang="auto", target_lang="en"):
 SMART_ACTION_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/smart-action"
 
 
-def run_managed_action(text, mode, token, source_lang="auto", target_lang="en"):
+def run_managed_action(text, mode, token, source_lang="auto", target_lang="en",
+                       vocab_block=""):
     """Pro Smart Actions via the server (no BYO key): we build the messages here
     and the edge function runs them through the founder's Mistral key."""
     if not token:
         raise ActionAPIError("Sign in with Pro to use managed Smart Actions.")
-    messages = build_messages(text, mode, source_lang, target_lang)
+    messages = build_messages(text, mode, source_lang, target_lang,
+                              vocab_block=vocab_block)
     try:
         resp = requests.post(
             SMART_ACTION_URL,
@@ -170,7 +175,8 @@ def _run_openai_compatible(text, mode, config, source_lang, target_lang, key):
     model = (config.get("action_api_model") or provider_defaults["default_model"]).strip()
     payload = {
         "model": model,
-        "messages": build_messages(text, mode, source_lang, target_lang),
+        "messages": build_messages(text, mode, source_lang, target_lang,
+                                   vocab_block=config.get("_vocab_block", "")),
         "temperature": 0.1,
         "max_tokens": _max_tokens_for(mode),
     }
@@ -188,7 +194,8 @@ def _run_gemini(text, mode, config, source_lang, target_lang, key):
     provider_defaults = defaults(PROVIDER_GEMINI)
     base_url = (config.get("action_api_base_url") or provider_defaults["default_base_url"]).rstrip("/")
     model = (config.get("action_api_model") or provider_defaults["default_model"]).strip()
-    messages = build_messages(text, mode, source_lang, target_lang)
+    messages = build_messages(text, mode, source_lang, target_lang,
+                              vocab_block=config.get("_vocab_block", ""))
     prompt = "\n\n".join(m["content"] for m in messages)
     resp = requests.post(
         f"{base_url}/models/{model}:generateContent",
@@ -205,9 +212,16 @@ def _run_anthropic(text, mode, config, source_lang, target_lang, key):
     provider_defaults = defaults(PROVIDER_ANTHROPIC)
     base_url = (config.get("action_api_base_url") or provider_defaults["default_base_url"]).rstrip("/")
     model = (config.get("action_api_model") or provider_defaults["default_model"]).strip()
-    messages = build_messages(text, mode, source_lang, target_lang)
+    messages = build_messages(text, mode, source_lang, target_lang,
+                              vocab_block=config.get("_vocab_block", ""))
+    # messages is [system, *few-shot turns, user]. Taking messages[1] as the
+    # user turn silently sent the FIRST FEW-SHOT EXAMPLE instead of what the
+    # user actually dictated - so Anthropic transcribed a canned sample. Keep
+    # the system turn and forward every remaining turn, few-shots included.
     system = messages[0]["content"]
-    user = messages[1]["content"]
+    convo = [m for m in messages[1:] if m.get("role") in ("user", "assistant")]
+    if not convo:
+        convo = [{"role": "user", "content": text}]
     resp = requests.post(
         f"{base_url}/messages",
         headers={
@@ -218,7 +232,7 @@ def _run_anthropic(text, mode, config, source_lang, target_lang, key):
         json={
             "model": model,
             "system": system,
-            "messages": [{"role": "user", "content": user}],
+            "messages": convo,
             "temperature": 0.1,
             "max_tokens": _max_tokens_for(mode),
         },

@@ -275,13 +275,20 @@ def load_examples():
         return DEFAULT_EXAMPLES
 
 
-def build_messages(transcript):
+def build_messages(transcript, vocab_block=""):
     """Return chat-format messages: system + few-shot example pairs + user.
 
     Works for any chat-completions API (OpenAI, Anthropic via adapter,
     llama-cpp-python create_chat_completion).
+
+    `vocab_block` carries the user's custom vocabulary so the model can repair
+    proper nouns the decoder mangled. Optional - callers that don't have one
+    behave exactly as before.
     """
-    messages = [{"role": "system", "content": SMART_SYSTEM_PROMPT}]
+    system = SMART_SYSTEM_PROMPT
+    if vocab_block:
+        system = f"{system}\n\n{vocab_block}"
+    messages = [{"role": "system", "content": system}]
     for user_in, assistant_out in load_examples():
         messages.append({"role": "user", "content": user_in})
         messages.append({"role": "assistant", "content": assistant_out})

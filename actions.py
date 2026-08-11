@@ -3,6 +3,7 @@ import re
 import action_api
 import local_llm
 import smart_prompt
+import vocabulary
 
 
 ACTION_TRANSCRIBE_ONLY = "transcribe_only"
@@ -163,6 +164,14 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
     if mode == ACTION_TRANSCRIBE_ONLY:
         return text
 
+    # The user's custom vocabulary, so the LLM can repair proper nouns the
+    # decoder mangled. Injected as an ephemeral config key (same convention as
+    # _managed_token) so the BYO-key engines pick it up without new signatures.
+    # vocabulary.py returns "" when privacy mode or the opt-out is set.
+    vocab_block = vocabulary.spelling_authority_block(config or {})
+    if vocab_block and config is not None:
+        config = {**config, "_vocab_block": vocab_block}
+
     if mode == ACTION_SMART_AUTO:
 
         kind = ACTION_MODELS[model].get("kind")
@@ -179,6 +188,7 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
                 return action_api.run_managed_action(
                     text, ACTION_SMART_AUTO, token,
                     source_lang=source_lang, target_lang=target_lang,
+                    vocab_block=vocab_block,
                 )
             except action_api.ActionAPIError as e:
                 raise ActionError(str(e)) from e
@@ -220,6 +230,7 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
                     text, ACTION_SMART_AUTO,
                     source_lang=source_lang,
                     target_lang=target_lang, model_id=model,
+                    vocab_block=vocab_block,
                 )
             except local_llm.LocalLLMError as e:
                 raise ActionError(str(e)) from e
@@ -240,7 +251,8 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
         if token:
             try:
                 return action_api.run_managed_action(
-                    text, mode, token, source_lang=source_lang, target_lang=target_lang)
+                    text, mode, token, source_lang=source_lang, target_lang=target_lang,
+                    vocab_block=vocab_block)
             except action_api.ActionAPIError as e:
                 raise ActionError(str(e)) from e
 
@@ -255,7 +267,9 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
 
     if ACTION_MODELS[model].get("kind") == "local_llm" and local_llm.model_downloaded(model):
         try:
-            return local_llm.run_action(text, mode, source_lang=source_lang, target_lang=target_lang, model_id=model)
+            return local_llm.run_action(text, mode, source_lang=source_lang,
+                                        target_lang=target_lang, model_id=model,
+                                        vocab_block=vocab_block)
         except local_llm.LocalLLMError as e:
             if mode == ACTION_TRANSLATE:
                 raise ActionError(str(e)) from e

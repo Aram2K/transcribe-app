@@ -70,5 +70,52 @@ class TestActionAPI(unittest.TestCase):
         self.assertIn("Pro", str(ctx.exception))
 
 
+class TestAnthropicPayload(unittest.TestCase):
+    """Regression: the Anthropic path used to send messages[1] as the user turn.
+    For smart_auto that index is the FIRST FEW-SHOT EXAMPLE, so the user's real
+    dictation never reached the model."""
+
+    def _post(self, mode, text):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"content": [{"text": "OK"}]}
+        cfg = {"action_api_key": "k", "action_api_provider": action_api.PROVIDER_ANTHROPIC}
+        with patch.object(action_api.requests, "post", return_value=response) as post:
+            action_api.run_action(text, mode, cfg)
+        return post.call_args[1]["json"]
+
+    def test_user_dictation_reaches_the_model(self):
+        body = self._post("smart_auto", "translate to russian I will meet you at 5pm")
+        last = body["messages"][-1]
+        self.assertEqual(last["role"], "user")
+        self.assertIn("5pm", last["content"])
+
+    def test_few_shot_turns_are_preserved(self):
+        body = self._post("smart_auto", "hello world")
+        roles = [m["role"] for m in body["messages"]]
+        self.assertGreater(len(roles), 1, "few-shot turns should be forwarded")
+        self.assertTrue(all(r in ("user", "assistant") for r in roles))
+        self.assertNotIn("system", roles)   # system goes in its own field
+
+    def test_simple_mode_still_works(self):
+        body = self._post("summarize", "some long text to summarize")
+        self.assertEqual(len(body["messages"]), 1)
+        self.assertIn("some long text", body["messages"][0]["content"])
+        self.assertTrue(body["system"])
+
+
+class TestVocabularyInPrompts(unittest.TestCase):
+    def test_vocab_block_reaches_system_message(self):
+        msgs = action_api.build_messages("hi", "summarize", vocab_block="SPELLING: Aibuben")
+        self.assertIn("Aibuben", msgs[0]["content"])
+
+    def test_absent_by_default(self):
+        msgs = action_api.build_messages("hi", "summarize")
+        self.assertNotIn("SPELLING", msgs[0]["content"])
+
+    def test_smart_auto_receives_it_too(self):
+        msgs = action_api.build_messages("hi", "smart_auto", vocab_block="SPELLING: Aibuben")
+        self.assertIn("Aibuben", msgs[0]["content"])
+
+
 if __name__ == "__main__":
     unittest.main()

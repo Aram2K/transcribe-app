@@ -174,12 +174,13 @@ _MAX_TOKENS_BY_MODE = {
 }
 
 
-def run_action(text, mode, source_lang="auto", target_lang="en", model_id=QWEN_TINY_ID):
+def run_action(text, mode, source_lang="auto", target_lang="en", model_id=QWEN_TINY_ID,
+               vocab_block=""):
     text = (text or "").strip()
     if not text:
         return ""
     llm = _load_model(model_id)
-    messages = _messages_for(mode, text, source_lang, target_lang)
+    messages = _messages_for(mode, text, source_lang, target_lang, vocab_block)
     result = llm.create_chat_completion(
         messages=messages,
         temperature=0.1,
@@ -235,9 +236,9 @@ def _load_model(model_id):
         return llm
 
 
-def _messages_for(mode, text, source_lang, target_lang):
+def _messages_for(mode, text, source_lang, target_lang, vocab_block=""):
     if mode == "smart_auto":
-        return smart_prompt.build_messages(text)
+        return smart_prompt.build_messages(text, vocab_block=vocab_block)
     if mode == "write_email":
         instruction = (
             "Turn the user's dictated text into a concise email draft. "
@@ -273,8 +274,11 @@ def _messages_for(mode, text, source_lang, target_lang):
         )
     else:
         instruction = "Rewrite the user's text clearly while preserving meaning. Output only the result."
+    system = "You are a private local desktop assistant. Never add commentary."
+    if vocab_block:
+        system = f"{system}\n\n{vocab_block}"
     return [
-        {"role": "system", "content": "You are a private local desktop assistant. Never add commentary."},
+        {"role": "system", "content": system},
         {"role": "user", "content": f"{instruction}\n\nUser text:\n{text}"},
     ]
 

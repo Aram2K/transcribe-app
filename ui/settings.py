@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QTabWidget, QWidget, QLineEdit, QTextEdit, QFrame, QScrollArea,
     QMessageBox, QGridLayout, QProgressBar, QStackedWidget, QRadioButton,
     QButtonGroup, QSizePolicy, QStyledItemDelegate, QStyle,
+    QTableWidget, QTableWidgetItem,
 )
 from PySide6.QtGui import QFont, QColor, QIcon
 import local_llm
@@ -16,6 +17,7 @@ import telemetry
 import action_api
 import actions
 import entitlements
+import vocabulary
 
 
 class _PillItemDelegate(QStyledItemDelegate):
@@ -198,6 +200,10 @@ class Settings(QDialog):
         "action_api_provider", "action_api_base_url", "action_api_model",
         "google_api_key", "mistral_api_key", "action_api_key",
         "privacy_mode", "save_history",
+        "vocabulary", "vocabulary_share_with_cloud",
+        "cleanup_enabled", "cleanup_remove_fillers", "cleanup_replacements",
+        "cleanup_strip_hallucinations", "cleanup_strip_artifacts",
+        "restore_clipboard",
     )
 
     def _capture_clean_baseline(self):
@@ -451,10 +457,22 @@ class Settings(QDialog):
             self.combo_lang.setCurrentIndex(idx)
             self.combo_lang.blockSignals(False)
             
-        # 3. Custom Vocab
+        # 3. Custom Vocab - the structured term list, falling back to a legacy
+        # free-text prompt from an older build.
         self.vocab_input.blockSignals(True)
-        self.vocab_input.setPlainText(self.cfg_working.get("initial_prompt", ""))
+        terms = vocabulary.load_terms(self.cfg_working)
+        self.vocab_input.setPlainText(
+            ", ".join(terms) if terms else self.cfg_working.get("initial_prompt", ""))
         self.vocab_input.blockSignals(False)
+        self._update_vocab_scope_label()
+        if hasattr(self, "chk_cleanup"):
+            for widget, key, default in (
+                    (self.chk_cleanup, "cleanup_enabled", True),
+                    (self.chk_fillers, "cleanup_remove_fillers", False)):
+                widget.blockSignals(True)
+                widget.setChecked(bool(self.cfg_working.get(key, default)))
+                widget.blockSignals(False)
+            self._load_replacements_table()
         
         # 4. Privacy Mode
         self.chk_privacy.blockSignals(True)
@@ -663,20 +681,69 @@ class Settings(QDialog):
         lang_lay.addWidget(self.combo_lang)
         layout.addWidget(lang_frame)
 
-        # Custom Vocabulary Prompt
+        # Custom Vocabulary - names/jargon the recognizer keeps getting wrong.
         vocab_frame = QFrame(tab)
         vocab_frame.setObjectName("cardFrame")
         vocab_lay = QVBoxLayout(vocab_frame)
-        vocab_lay.addWidget(QLabel("Custom Vocabulary (Prompt)", vocab_frame))
-        
+        vocab_lay.addWidget(QLabel("Custom Vocabulary", vocab_frame))
+
         self.vocab_input = QTextEdit(vocab_frame)
-        self.vocab_input.setPlaceholderText("Add names or complex terms (e.g. Aram, Aibuben, PySide6) to guide Whisper's script.")
+        self.vocab_input.setPlaceholderText(
+            "Aram, Aibuben, PySide6\nOne term per line, or separated by commas.")
         self.vocab_input.setMaximumHeight(80)
         if self.app:
-            self.vocab_input.setPlainText(self.cfg_working.get("initial_prompt", ""))
+            terms = vocabulary.load_terms(self.cfg_working)
+            self.vocab_input.setPlainText(", ".join(terms))
         self.vocab_input.textChanged.connect(self._save_general_configs)
         vocab_lay.addWidget(self.vocab_input)
+
+        self.lbl_vocab_scope = QLabel("", vocab_frame)
+        self.lbl_vocab_scope.setObjectName("subtitleLabel")
+        self.lbl_vocab_scope.setWordWrap(True)
+        vocab_lay.addWidget(self.lbl_vocab_scope)
+        self._update_vocab_scope_label()
         layout.addWidget(vocab_frame)
+
+        # Corrections - the output-quality pass applied to every dictation.
+        fix_frame = QFrame(tab)
+        fix_frame.setObjectName("cardFrame")
+        fix_lay = QVBoxLayout(fix_frame)
+        fix_lay.addWidget(QLabel("Corrections", fix_frame))
+
+        self.chk_cleanup = QCheckBox("Clean up transcriptions", fix_frame)
+        self.chk_cleanup.setChecked(bool(self.cfg_working.get("cleanup_enabled", True)))
+        self.chk_cleanup.setToolTip(
+            "Removes captions like [BLANK_AUDIO] and the phantom phrases Whisper "
+            "invents on silence, such as a repeated \"Thank you.\"")
+        self.chk_cleanup.stateChanged.connect(self._save_general_configs)
+        fix_lay.addWidget(self.chk_cleanup)
+
+        self.chk_fillers = QCheckBox("Also remove filler words (um, uh, you know)", fix_frame)
+        self.chk_fillers.setChecked(bool(self.cfg_working.get("cleanup_remove_fillers", False)))
+        self.chk_fillers.setToolTip("Off by default - this edits your actual words.")
+        self.chk_fillers.stateChanged.connect(self._save_general_configs)
+        fix_lay.addWidget(self.chk_fillers)
+
+        fix_lay.addWidget(QLabel("Always replace these words:", fix_frame))
+        self.tbl_replacements = QTableWidget(0, 2, fix_frame)
+        self.tbl_replacements.setHorizontalHeaderLabels(["Heard", "Replace with"])
+        self.tbl_replacements.horizontalHeader().setStretchLastSection(True)
+        self.tbl_replacements.verticalHeader().setVisible(False)
+        self.tbl_replacements.setMaximumHeight(140)
+        self._load_replacements_table()
+        self.tbl_replacements.itemChanged.connect(self._save_general_configs)
+        fix_lay.addWidget(self.tbl_replacements)
+
+        row = QHBoxLayout()
+        btn_add_rep = QPushButton("Add", fix_frame)
+        btn_add_rep.clicked.connect(self._add_replacement_row)
+        row.addWidget(btn_add_rep)
+        btn_del_rep = QPushButton("Remove selected", fix_frame)
+        btn_del_rep.clicked.connect(self._remove_replacement_row)
+        row.addWidget(btn_del_rep)
+        row.addStretch()
+        fix_lay.addLayout(row)
+        layout.addWidget(fix_frame)
 
         # Meeting Audio Device
         dev_frame = QFrame(tab)
@@ -2572,11 +2639,81 @@ class Settings(QDialog):
         if self.app and hasattr(self.app, "set_privacy_mode"):
             self.app.set_privacy_mode(self.chk_privacy.isChecked(), notify=False)
 
+    def _update_vocab_scope_label(self):
+        """Say honestly which backends the vocabulary actually reaches - it is
+        applied at the recognizer for local/Google/Pro cloud, but Mistral's
+        transcription API accepts no vocabulary hint, so there it only takes
+        effect via the Corrections table below."""
+        if not hasattr(self, "lbl_vocab_scope"):
+            return
+        backend = (self.cfg_working or {}).get("backend", "local")
+        if backend == "mistral":
+            msg = ("Mistral transcription can't take vocabulary hints - use the "
+                   "Corrections table below to fix these terms after the fact.")
+        else:
+            msg = "Guides the recognizer, and the AI uses it as the correct spelling."
+        self.lbl_vocab_scope.setText(msg)
+
+    def _load_replacements_table(self):
+        rows = self.cfg_working.get("cleanup_replacements") or []
+        self.tbl_replacements.blockSignals(True)
+        self.tbl_replacements.setRowCount(0)
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            r = self.tbl_replacements.rowCount()
+            self.tbl_replacements.insertRow(r)
+            self.tbl_replacements.setItem(r, 0, QTableWidgetItem(str(item.get("from", ""))))
+            self.tbl_replacements.setItem(r, 1, QTableWidgetItem(str(item.get("to", ""))))
+        self.tbl_replacements.blockSignals(False)
+
+    def _add_replacement_row(self):
+        r = self.tbl_replacements.rowCount()
+        self.tbl_replacements.insertRow(r)
+        self.tbl_replacements.setItem(r, 0, QTableWidgetItem(""))
+        self.tbl_replacements.setItem(r, 1, QTableWidgetItem(""))
+        self.tbl_replacements.editItem(self.tbl_replacements.item(r, 0))
+
+    def _remove_replacement_row(self):
+        rows = sorted({i.row() for i in self.tbl_replacements.selectedIndexes()},
+                      reverse=True)
+        if not rows and self.tbl_replacements.rowCount():
+            rows = [self.tbl_replacements.rowCount() - 1]
+        for r in rows:
+            self.tbl_replacements.removeRow(r)
+        self._save_general_configs()
+
+    def _collect_replacements(self):
+        out = []
+        for r in range(self.tbl_replacements.rowCount()):
+            src_item = self.tbl_replacements.item(r, 0)
+            dst_item = self.tbl_replacements.item(r, 1)
+            src = (src_item.text() if src_item else "").strip()
+            dst = (dst_item.text() if dst_item else "").strip()
+            if src:
+                out.append({"from": src, "to": dst})
+        return out
+
     def _save_general_configs(self):
         if not self.app:
             return
         self.cfg_working["language"] = self.combo_lang.currentData()
-        self.cfg_working["initial_prompt"] = self.vocab_input.toPlainText().strip()
+        # The box holds a term list; keep initial_prompt as its derived mirror
+        # so the local decode path keeps reading exactly what it always did.
+        raw_vocab = self.vocab_input.toPlainText()
+        if vocabulary.looks_like_term_list(raw_vocab):
+            self.cfg_working["vocabulary"] = vocabulary.normalize_terms(raw_vocab)
+            vocabulary.sync_config(self.cfg_working)
+        else:
+            # A hand-written prose prompt from an older build - pass it through
+            # untouched rather than mangling it into a one-item glossary.
+            self.cfg_working["vocabulary"] = []
+            self.cfg_working["initial_prompt"] = raw_vocab.strip()
+        self._update_vocab_scope_label()
+        if hasattr(self, "chk_cleanup"):
+            self.cfg_working["cleanup_enabled"] = self.chk_cleanup.isChecked()
+            self.cfg_working["cleanup_remove_fillers"] = self.chk_fillers.isChecked()
+            self.cfg_working["cleanup_replacements"] = self._collect_replacements()
         self.cfg_working["privacy_mode"] = self.chk_privacy.isChecked()
         # Privacy Mode and Cloud transcription are mutually exclusive.
         if self.chk_privacy.isChecked() and hasattr(self, "chk_managed") and self.chk_managed.isChecked():
