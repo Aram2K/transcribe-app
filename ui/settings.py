@@ -713,8 +713,13 @@ class Settings(QDialog):
         self.chk_cleanup = QCheckBox("Clean up transcriptions", fix_frame)
         self.chk_cleanup.setChecked(bool(self.cfg_working.get("cleanup_enabled", True)))
         self.chk_cleanup.setToolTip(
-            "Removes captions like [BLANK_AUDIO] and the phantom phrases Whisper "
-            "invents on silence, such as a repeated \"Thank you.\"")
+            "Removes text you didn't say. On silence or background noise the "
+            "recognizer invents sign-off phrases and repeats them - a run of "
+            "\"Thank you.\" or \"Thanks for watching!\". Those are dropped only "
+            "when they are a whole sentence on their own, so a real \"Thank you "
+            "for the update.\" is never touched. Also strips non-speech captions "
+            "like [Applause] if they ever appear.\n\n"
+            "Your word replacements below run as part of this too.")
         self.chk_cleanup.stateChanged.connect(self._save_general_configs)
         fix_lay.addWidget(self.chk_cleanup)
 

@@ -122,6 +122,7 @@ _MUSIC_NOTES = re.compile(r"[♪♫♬�]+")
 class CleanupOptions:
     strip_hallucinations: bool = True
     strip_artifacts: bool = True
+    collapse_repeats: bool = True
     remove_fillers: bool = False          # OFF by default - it changes the user's words
     replacements: tuple = ()              # ((from, to), ...)
     extra_hallucination_phrases: tuple = ()
@@ -346,9 +347,10 @@ def clean_with_report(text, *, options=None):
         out = _strip_artifacts(out)
         report["artifacts"] = int(before != out)
 
-    before = out
-    out = _collapse_repeats(out)
-    report["repeats"] = int(before != out)
+    if opts.collapse_repeats:
+        before = out
+        out = _collapse_repeats(out)
+        report["repeats"] = int(before != out)
 
     if opts.strip_hallucinations:
         phrases = frozenset(DEFAULT_HALLUCINATION_PHRASES) | frozenset(

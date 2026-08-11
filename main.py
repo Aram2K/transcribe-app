@@ -2830,11 +2830,18 @@ class AppController(QObject):
         if not text:
             return ""
         cfg = self._effective_cfg()
-        if not cfg.get("cleanup_enabled", True):
-            return text
         try:
-            cleaned, report = text_cleanup.clean_with_report(
-                text, options=text_cleanup.options_from_config(cfg))
+            opts = text_cleanup.options_from_config(cfg)
+            if not cfg.get("cleanup_enabled", True):
+                # Master switch off: nothing is second-guessed about what the
+                # recognizer heard. The user's own replacement dictionary still
+                # applies - the UI calls it "always replace these words", and a
+                # deliberate correction isn't a cleanup heuristic.
+                opts = text_cleanup.CleanupOptions(
+                    strip_hallucinations=False, strip_artifacts=False,
+                    collapse_repeats=False, remove_fillers=False,
+                    replacements=opts.replacements)
+            cleaned, report = text_cleanup.clean_with_report(text, options=opts)
             if any(report.values()):
                 # Counts only - never transcript text.
                 logger.debug("text cleanup: %s", report)

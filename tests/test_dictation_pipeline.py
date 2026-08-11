@@ -38,10 +38,22 @@ class TestPostprocessTranscript(unittest.TestCase):
         c = controller(cleanup_replacements=[{"from": "pyside 6", "to": "PySide6"}])
         self.assertEqual(c._postprocess_transcript("i use pyside 6"), "i use PySide6")
 
-    def test_master_switch_off_is_passthrough(self):
+    def test_master_switch_off_stops_second_guessing_the_recognizer(self):
         c = controller(cleanup_enabled=False)
         text = "Thank you. Thank you. Thank you."
         self.assertEqual(c._postprocess_transcript(text), text)
+
+    def test_master_switch_off_still_applies_replacements(self):
+        # The UI labels these "always replace these words" - a deliberate
+        # correction is not a cleanup heuristic, so it must survive the switch.
+        c = controller(cleanup_enabled=False,
+                       cleanup_replacements=[{"from": "gorge", "to": "George"}])
+        self.assertEqual(c._postprocess_transcript("hi gorge"), "hi George")
+
+    def test_master_switch_off_leaves_artifacts_alone(self):
+        c = controller(cleanup_enabled=False)
+        self.assertEqual(c._postprocess_transcript("[Applause] hello"),
+                         "[Applause] hello")
 
     def test_empty_input(self):
         self.assertEqual(controller()._postprocess_transcript(""), "")
