@@ -4,12 +4,24 @@ Painted with QPainter (not font glyphs) so they render identically on every
 Windows install - same reasoning as the feedback thumbnails' remove badge.
 """
 
-from PySide6.QtCore import Qt, QPointF, QRectF
+from PySide6.QtCore import Qt, QPointF, QRectF, QSize
 from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 
 _ICON_CACHE = {}
 
 _SLATE = QColor("#475569")
+
+# Qt draws a combo-box item's icon hard against its text. There is no styleable
+# icon-to-text gap, so the space is baked into the pixmap as a transparent
+# gutter on the right - and the widget's iconSize must match that padded aspect
+# or Qt scales the whole thing down and the gap disappears with it.
+MEETING_ICON_H = 22
+_MEETING_GUTTER = 0.40
+
+
+def meeting_icon_qsize():
+    """The iconSize to pair with :func:`meeting_mode_icon`."""
+    return QSize(int(MEETING_ICON_H * (1 + _MEETING_GUTTER)), MEETING_ICON_H)
 
 
 def _painter(pm):
@@ -157,7 +169,9 @@ def meeting_mode_icon(mode, size=32):
     key = (mode, size)
     if key in _ICON_CACHE:
         return _ICON_CACHE[key]
-    pm = QPixmap(size, size)
+    # Wider than tall: the glyphs occupy the leading square, the remainder is a
+    # transparent gutter that keeps the icon off the label text.
+    pm = QPixmap(int(size * (1 + _MEETING_GUTTER)), size)
     pm.fill(Qt.transparent)
     p = _painter(pm)
     full = QRectF(0, 0, size, size)
@@ -165,9 +179,11 @@ def meeting_mode_icon(mode, size=32):
         _draw_mic(p, full.adjusted(size * 0.14, size * 0.06, -size * 0.14, -size * 0.06))
     elif mode == "system_only":
         _draw_speaker(p, full.adjusted(size * 0.10, size * 0.12, -size * 0.10, -size * 0.12))
-    else:  # smart_meeting: mic left + speaker right
-        _draw_mic(p, QRectF(size * 0.02, size * 0.10, size * 0.46, size * 0.84))
-        _draw_speaker(p, QRectF(size * 0.50, size * 0.22, size * 0.48, size * 0.60))
+    else:
+        # smart_meeting reads "System sound + Microphone", so the speaker comes
+        # first and the mic second - matching the words left to right.
+        _draw_speaker(p, QRectF(size * 0.00, size * 0.22, size * 0.48, size * 0.60))
+        _draw_mic(p, QRectF(size * 0.54, size * 0.10, size * 0.46, size * 0.84))
     p.end()
     icon = QIcon(pm)
     _ICON_CACHE[key] = icon

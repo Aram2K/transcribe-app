@@ -405,7 +405,10 @@ class MeetingsWindow(QDialog):
 
     # ── Audio Device Scan ──
     def _populate_audio_devices(self):
-        from ui.icons import meeting_mode_icon
+        from ui.icons import meeting_mode_icon, meeting_icon_qsize
+        # Match the padded pixmap's aspect, else Qt scales it down and the
+        # icon-to-text gap baked into it shrinks away.
+        self.combo_device.setIconSize(meeting_icon_qsize())
         # Only offer system-audio capture where loopback genuinely exists
         # (Windows/WASAPI). Elsewhere - notably macOS - those modes would
         # silently record the mic anyway, so they're hidden.
