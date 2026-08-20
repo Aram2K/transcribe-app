@@ -106,6 +106,7 @@ class MeetingsWindow(QDialog):
         self._final_transcript = ""
         self._meeting_title = ""
         self._meeting_attendees = ""
+        self._summary_downgraded = False
 
         # Live-transcript + rolling-summary state.
         self._live_text = ""
@@ -618,6 +619,7 @@ class MeetingsWindow(QDialog):
         self._chunks = []
         self._final_transcript = ""
         self._final_notes = ""
+        self._summary_downgraded = False
         self._live_text = ""
         self._live_summary_text = ""
         self._last_summary_at = time.time()
@@ -941,11 +943,22 @@ class MeetingsWindow(QDialog):
             # auth token couldn't be fetched, or a cloud engine picked in the
             # meeting box without a key), fall back to the local extractive
             # summarizer. A properly-authenticated Pro user keeps managed cloud.
-            kind = actions.ACTION_MODELS.get(engine, {}).get("kind")
-            has_key = bool(((self.app.cfg.get("action_api_key") or "")
-                            or (self.app.cfg.get("google_api_key") or "")).strip())
+            info = actions.ACTION_MODELS.get(engine, {})
+            kind = info.get("kind")
+            # Key check is PROVIDER-aware: a Google key only counts for the
+            # Gemini engine (matching actions.process's own fallback) - it must
+            # not let an Anthropic/OpenAI pick sail through and fail later.
+            has_key = bool((self.app.cfg.get("action_api_key") or "").strip())
+            if (not has_key
+                    and info.get("provider") == getattr(action_api, "PROVIDER_GEMINI", None)):
+                has_key = bool((self.app.cfg.get("google_api_key") or "").strip())
             has_token = bool((engine_config or {}).get("_managed_token"))
+            downgraded_from = ""
             if (kind == "cloud" and not has_key) or (kind == "managed" and not has_token):
+                # Degrading keeps the notes alive - but NEVER silently: the
+                # banner below says what happened, and Retry stays visible so
+                # the user can pick an engine that is actually set up.
+                downgraded_from = info.get("label", engine)
                 engine = actions.RULE_BASED_ID
 
             self._emit_status("Writing summary…")
@@ -957,20 +970,33 @@ class MeetingsWindow(QDialog):
                 model=engine,
                 config=engine_config,
             )
+            self._summary_downgraded = bool(downgraded_from)
+            if downgraded_from:
+                reason = ("sign in with a Pro account to use it"
+                          if kind == "managed"
+                          else "add its API key on the meeting setup page")
+                notes = (f"> ⚠️ **{downgraded_from}** isn't set up - {reason}. "
+                         "These notes come from the built-in formatter instead; "
+                         "pick another engine above and Retry Summary for AI notes."
+                         "\n\n" + notes)
 
-            # Save finalized artifacts to the timestamp directory.
+            # Save finalized artifacts to the timestamp directory. Best-effort:
+            # a failure to WRITE the sidecar files must never turn a finished
+            # summary into an error emit (except OSError alone missed e.g. the
+            # TypeError from an unset _meeting_dir and did exactly that).
             try:
-                with open(self._meeting_dir / "notes.md", "w", encoding="utf-8") as f:
-                    f.write(notes)
-                with open(self._meeting_dir / "meta.json", "w", encoding="utf-8") as f:
-                    json.dump({
-                        "title": self._meeting_title,
-                        "attendees": self._meeting_attendees,
-                        "duration_sec": int(time.time() - self._record_started_at) if self._record_started_at else 0,
-                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-                    }, f)
-            except OSError:
-                pass
+                if self._meeting_dir:
+                    with open(self._meeting_dir / "notes.md", "w", encoding="utf-8") as f:
+                        f.write(notes)
+                    with open(self._meeting_dir / "meta.json", "w", encoding="utf-8") as f:
+                        json.dump({
+                            "title": self._meeting_title,
+                            "attendees": self._meeting_attendees,
+                            "duration_sec": int(time.time() - self._record_started_at) if self._record_started_at else 0,
+                            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                        }, f)
+            except Exception:
+                logger.warning("Could not save meeting artifacts", exc_info=True)
 
             self.proc_signals.finished.emit(notes, "")
         except Exception as e:
@@ -1005,7 +1031,10 @@ class MeetingsWindow(QDialog):
 
         self.state = self.STATE_DONE
         self._final_notes = notes
-        self._show_retry_summary(False)
+        # Keep Retry (and its engine picker) visible when the notes were
+        # produced by the downgrade fallback - "success" via the built-in
+        # formatter is exactly the case the picker exists for.
+        self._show_retry_summary(bool(getattr(self, "_summary_downgraded", False)))
 
         self.lbl_done_title.setText(self._meeting_title or "Meeting Notes")
         # The notes are markdown - render them as such (headings, bullets,
@@ -1203,12 +1232,29 @@ class MeetingsWindow(QDialog):
                    if self.app else actions.API_MANAGED_ID)
             idx = combo.findData(cur)
             if idx < 0:
-                idx = combo.findData(actions.API_MANAGED_ID)
+                idx = combo.findData(self._default_engine_id())
             combo.setCurrentIndex(max(idx, 0))
             combo.blockSignals(False)
             tag_engine_combo(combo)
         except Exception as e:
             logger.debug("engine combo populate failed: %s", e)
+
+    def _default_engine_id(self):
+        """Engine to preselect when none is configured: managed cloud for Pro
+        (it just works), otherwise a local model that is actually downloaded.
+        Never default to an engine that would immediately hit the downgrade
+        banner - that made low-quality fallback notes the default experience
+        for every free user."""
+        try:
+            if self.app and self.app.is_pro():
+                return actions.API_MANAGED_ID
+            import local_llm
+            for mid in local_llm.MODEL_CATALOG:
+                if local_llm.model_downloaded(mid):
+                    return mid
+        except Exception:
+            pass
+        return actions.API_MANAGED_ID
 
     def _retry_summary(self):
         # Re-run only the summary step on the saved transcript - no re-record,

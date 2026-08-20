@@ -31,6 +31,13 @@ class TestExtractPageId(unittest.TestCase):
                "Page-0123456789abcdef0123456789abcdef")
         self.assertEqual(ne.extract_page_id(url), self.DASHED)
 
+    def test_fragment_block_anchor_resolves_to_page_id(self):
+        # A URL copied after following an anchor carries the BLOCK id in the
+        # fragment; the page id (before the #) must win.
+        url = ("https://www.notion.so/My-Meetings-0123456789abcdef0123456789abcdef"
+               "#a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
+        self.assertEqual(ne.extract_page_id(url), self.DASHED)
+
     def test_garbage(self):
         self.assertIsNone(ne.extract_page_id("not a notion link"))
         self.assertIsNone(ne.extract_page_id(""))

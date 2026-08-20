@@ -62,6 +62,13 @@ LEGACY_MODEL_IDS = {
 
 _llms = {}
 _llm_lock = threading.Lock()
+# One inference lock per model: llama-cpp's Llama shares a single native
+# context, so two concurrent create_chat_completion calls corrupt state or
+# crash the whole process (an access violation Python cannot catch). Dictation
+# smart actions and meeting summaries run on different worker threads and
+# default to the same model - same reasoning as the Whisper _infer_lock in
+# main.py, which fixed the equivalent CUDA hang.
+_infer_locks = {}
 
 
 class LocalLLMError(RuntimeError):
@@ -262,31 +269,63 @@ def _condense_to_fit(llm, text, target_tokens):
         return text[: target_tokens * 3]
 
 
+_TRANSLATE_CHUNK_TOKENS = 1600
+
+
+def _infer_lock_for(model_id):
+    with _llm_lock:
+        return _infer_locks.setdefault(normalize_model_id(model_id),
+                                       threading.Lock())
+
+
 def run_action(text, mode, source_lang="auto", target_lang="en", model_id=QWEN_TINY_ID,
                vocab_block=""):
     text = (text or "").strip()
     if not text:
         return ""
     llm = _load_model(model_id)
-    max_out = _MAX_TOKENS_BY_MODE.get(mode, 240)
-    messages = _messages_for(mode, text, source_lang, target_lang, vocab_block)
+    # Serialize ALL inference on this model (tokenize included) - see
+    # _infer_locks. The map-reduce path below can hold a model busy for
+    # minutes, which is exactly when a dictation smart action would otherwise
+    # land on the same Llama from another thread.
+    with _infer_lock_for(model_id):
+        return _run_action_locked(llm, text, mode, source_lang, target_lang,
+                                  vocab_block)
 
+
+def _run_action_locked(llm, text, mode, source_lang, target_lang, vocab_block):
+    messages = _messages_for(mode, text, source_lang, target_lang, vocab_block)
+    overhead = _messages_tokens(
+        llm, _messages_for(mode, "", source_lang, target_lang, vocab_block))
+
+    if mode == "translate":
+        # A translation is roughly the size of its input, so the output budget
+        # must SCALE with the input. A flat cap silently truncates: llama-cpp
+        # just stops at max_tokens with finish_reason="length" and no error,
+        # so the user would get a plausible-looking fragment.
+        in_toks = _count_tokens(llm, text)
+        wanted_out = max(600, in_toks * 2 + 64)
+        if overhead + in_toks + wanted_out + 64 > _N_CTX:
+            # Chunks sized so chunk + its own doubled output always fit.
+            parts = []
+            for chunk in _split_by_tokens(llm, text, _TRANSLATE_CHUNK_TOKENS):
+                ch_toks = _count_tokens(llm, chunk)
+                mt = min(_N_CTX - overhead - ch_toks - 64,
+                         max(600, ch_toks * 2 + 64))
+                parts.append(_chat(
+                    llm,
+                    _messages_for(mode, chunk, source_lang, target_lang, vocab_block),
+                    mt))
+            return "\n\n".join(p.strip() for p in parts if p.strip())
+        return _chat(llm, messages, wanted_out)
+
+    max_out = _MAX_TOKENS_BY_MODE.get(mode, 240)
     budget = _N_CTX - max_out - 128
     if _messages_tokens(llm, messages) > budget:
         # Input outgrew the context window (long meetings did this even at 8k,
         # and at the old 2048 a ten-minute meeting was enough to fail with
         # "Requested tokens exceed context window").
-        overhead = _messages_tokens(
-            llm, _messages_for(mode, "", source_lang, target_lang, vocab_block))
         room = max(512, budget - overhead)
-        if mode == "translate":
-            # Translation must not be lossy - translate chunk by chunk instead.
-            out = [
-                _chat(llm, _messages_for(mode, chunk, source_lang, target_lang,
-                                         vocab_block), max_out)
-                for chunk in _split_by_tokens(llm, text, room)
-            ]
-            return "\n\n".join(o.strip() for o in out if o.strip())
         text = _condense_to_fit(llm, text, room)
         messages = _messages_for(mode, text, source_lang, target_lang, vocab_block)
 

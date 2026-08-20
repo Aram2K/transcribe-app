@@ -38,7 +38,10 @@ def extract_page_id(raw):
     """
     if not raw:
         return None
-    text = raw.strip().split("?", 1)[0].rstrip("/")
+    # Drop query AND fragment: a URL copied after following an anchor looks
+    # like .../Slug-<pageid>#<blockid>, and the block id would otherwise win
+    # the last-match rule below.
+    text = raw.strip().split("#", 1)[0].split("?", 1)[0].rstrip("/")
     candidates = re.findall(
         r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
         r"|[0-9a-fA-F]{32}",
