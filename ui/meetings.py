@@ -1,5 +1,6 @@
 # Modern Meeting Dictation Workspace in PySide6
 
+import html as html_mod
 import os
 import time
 import json
@@ -16,6 +17,8 @@ from PySide6.QtGui import QFont, QColor
 import logging
 import storage
 import actions
+import action_api
+import notion_export
 import telemetry
 import diarization
 
@@ -72,6 +75,8 @@ class MeetingsWindow(QDialog):
     # Stage messages from the processing worker thread ("Identifying speakers…")
     # so the user sees progress instead of a frozen-looking window.
     sig_status = Signal(str)
+    # Result of a background Notion upload: (url, error) - one of them empty.
+    sig_notion = Signal(str, str)
 
     def __init__(self, parent=None, main_app=None):
         super().__init__(parent)
@@ -99,6 +104,8 @@ class MeetingsWindow(QDialog):
         self._chunks_path = None
         self._final_notes = ""
         self._final_transcript = ""
+        self._meeting_title = ""
+        self._meeting_attendees = ""
 
         # Live-transcript + rolling-summary state.
         self._live_text = ""
@@ -117,6 +124,7 @@ class MeetingsWindow(QDialog):
         self.sig_chunk.connect(self._append_live_line)
         self.sig_summary.connect(self._set_live_summary)
         self.sig_status.connect(self._set_proc_status)
+        self.sig_notion.connect(self._on_notion_done)
         
         # Timer for duration and visualizer ticking
         self.timer = QTimer(self)
@@ -206,7 +214,8 @@ class MeetingsWindow(QDialog):
         d_lay.setSpacing(12)
         
         d_lay.addWidget(QLabel("Meeting Recording Mode", dev_frame))
-        self.combo_device = QComboBox(dev_frame)
+        from ui.mode_combo import MeetingModeComboBox
+        self.combo_device = MeetingModeComboBox(dev_frame)
         d_lay.addWidget(self.combo_device)
 
         d_lay.addWidget(QLabel("Spoken Language", dev_frame))
@@ -224,10 +233,32 @@ class MeetingsWindow(QDialog):
         self.combo_whisper = QComboBox(dev_frame)
         d_lay.addWidget(self.combo_whisper)
 
-        # Summary & notes AI - rule-based (local), a local LLM, or cloud.
+        # Summary & notes AI - rule-based (local), a local LLM, or cloud. Rows
+        # carry a PRO / LOCAL / CLOUD pill so the cost and privacy of each
+        # choice is visible before picking it.
         d_lay.addWidget(QLabel("Summary & notes AI", dev_frame))
         self.combo_action = QComboBox(dev_frame)
+        self.combo_action.currentIndexChanged.connect(self._on_action_engine_changed)
         d_lay.addWidget(self.combo_action)
+
+        # Shown only for bring-your-own-key cloud engines.
+        self.key_row = QWidget(dev_frame)
+        k_lay = QVBoxLayout(self.key_row)
+        k_lay.setContentsMargins(0, 4, 0, 0)
+        k_lay.setSpacing(6)
+        self.lbl_key = QLabel("API key", self.key_row)
+        k_lay.addWidget(self.lbl_key)
+        self.input_action_key = QLineEdit(self.key_row)
+        self.input_action_key.setEchoMode(QLineEdit.Password)
+        self.input_action_key.setPlaceholderText("Paste your API key")
+        self.input_action_key.textChanged.connect(self._on_action_key_changed)
+        k_lay.addWidget(self.input_action_key)
+        self.lbl_key_hint = QLabel("", self.key_row)
+        self.lbl_key_hint.setObjectName("subtitleLabel")
+        self.lbl_key_hint.setWordWrap(True)
+        k_lay.addWidget(self.lbl_key_hint)
+        self.key_row.hide()
+        d_lay.addWidget(self.key_row)
 
         lay.addWidget(dev_frame)
 
@@ -355,12 +386,23 @@ class MeetingsWindow(QDialog):
         title_row.addStretch()
 
         # Shown only when the AI summary failed but the transcript was saved -
-        # lets the user re-run the summary without re-recording.
+        # lets the user re-run the summary without re-recording. The engine
+        # picker beside it is the point: retrying the SAME engine on the same
+        # transcript fails identically, so a retry must be able to switch.
+        self.combo_retry_engine = QComboBox(self.page_done)
+        self.combo_retry_engine.setMinimumWidth(190)
+        self.combo_retry_engine.hide()
+        title_row.addWidget(self.combo_retry_engine)
+
         self.btn_retry_summary = QPushButton("Retry Summary", self.page_done)
         self.btn_retry_summary.setObjectName("primaryButton")
         self.btn_retry_summary.clicked.connect(self._retry_summary)
         self.btn_retry_summary.hide()
         title_row.addWidget(self.btn_retry_summary)
+
+        self.btn_notion = QPushButton("Send to Notion", self.page_done)
+        self.btn_notion.clicked.connect(self._send_to_notion)
+        title_row.addWidget(self.btn_notion)
 
         btn_copy = QPushButton("Copy Markdown", self.page_done)
         btn_copy.clicked.connect(self._copy_markdown)
@@ -405,10 +447,8 @@ class MeetingsWindow(QDialog):
 
     # ── Audio Device Scan ──
     def _populate_audio_devices(self):
-        from ui.icons import meeting_mode_icon, meeting_icon_qsize
-        # Match the padded pixmap's aspect, else Qt scales it down and the
-        # icon-to-text gap baked into it shrinks away.
-        self.combo_device.setIconSize(meeting_icon_qsize())
+        # Labels carry no icon: MeetingModeComboBox paints a slate glyph inline
+        # beside each word it describes (see ui/mode_combo.py).
         # Only offer system-audio capture where loopback genuinely exists
         # (Windows/WASAPI). Elsewhere - notably macOS - those modes would
         # silently record the mic anyway, so they're hidden.
@@ -419,16 +459,11 @@ class MeetingsWindow(QDialog):
             has_loopback = False
         self.combo_device.clear()
         if has_loopback:
-            self.combo_device.addItem(
-                meeting_mode_icon("smart_meeting"),
-                "System sound + Microphone (best for meetings)", "smart_meeting")
-        self.combo_device.addItem(
-            meeting_mode_icon("default_mic"),
-            "Microphone only", "default_mic")
+            self.combo_device.addItem("System sound + Microphone (best for meetings)",
+                                      "smart_meeting")
+        self.combo_device.addItem("Microphone only", "default_mic")
         if has_loopback:
-            self.combo_device.addItem(
-                meeting_mode_icon("system_only"),
-                "System sound only (no microphone)", "system_only")
+            self.combo_device.addItem("System sound only (no microphone)", "system_only")
 
         # Get from active config (heal modes this system can't capture)
         valid = ("smart_meeting", "default_mic", "system_only") if has_loopback else ("default_mic",)
@@ -466,18 +501,53 @@ class MeetingsWindow(QDialog):
             except Exception:
                 pass
 
-        # Summary & notes AI engine.
+        # Summary & notes AI engine, each row tagged PRO / LOCAL / CLOUD.
+        # Rule-based isn't offered: it's the internal safety net used when a
+        # chosen engine can't run, not something to pick for meeting notes.
         if hasattr(self, "combo_action"):
-            try:
-                self.combo_action.clear()
-                for mid, info in actions.ACTION_MODELS.items():
-                    self.combo_action.addItem(info.get("label", mid), mid)
-                cur = (actions.normalize_action_model(self.app.cfg.get("action_model"))
-                       if self.app else actions.RULE_BASED_ID)
-                ai = self.combo_action.findData(cur)
-                self.combo_action.setCurrentIndex(ai if ai >= 0 else 0)
-            except Exception:
-                pass
+            self._populate_engine_combo(self.combo_action)
+            self._on_action_engine_changed()
+
+    def _on_action_engine_changed(self, *_):
+        """Reveal the API-key field only for bring-your-own-key cloud engines,
+        and prefill it from whatever is already configured."""
+        if not hasattr(self, "key_row"):
+            return
+        model_id = self.combo_action.currentData()
+        info = actions.ACTION_MODELS.get(model_id, {})
+        if info.get("kind") != "cloud":
+            self.key_row.hide()
+            return
+        cfg = self.app.cfg if self.app else {}
+        provider = info.get("provider", "")
+        label = info.get("label", "this engine")
+        # Gemini actions fall back to the Google speech key when no dedicated
+        # action key is set, so show that one rather than an empty box.
+        existing = (cfg.get("action_api_key") or "").strip()
+        if not existing and provider == getattr(action_api, "PROVIDER_GEMINI", None):
+            existing = (cfg.get("google_api_key") or "").strip()
+        self.input_action_key.blockSignals(True)
+        self.input_action_key.setText(existing)
+        self.input_action_key.blockSignals(False)
+        self.lbl_key.setText(f"{label} - API key")
+        self.lbl_key_hint.setText(
+            "Your own key, stored on this machine. Needed before this engine can "
+            "write the notes; without it the meeting falls back to a local summary.")
+        self.key_row.show()
+
+    def _on_action_key_changed(self, text):
+        """Stage the key straight onto the app config - the meeting window has
+        no Save button, matching how the device/language selectors behave."""
+        if not self.app:
+            return
+        model_id = self.combo_action.currentData()
+        info = actions.ACTION_MODELS.get(model_id, {})
+        if info.get("kind") != "cloud":
+            return
+        self.app.cfg["action_api_key"] = (text or "").strip()
+        if info.get("provider"):
+            self.app.cfg["action_api_provider"] = info["provider"]
+        self.app.save_config()
 
     # ── State Machine Triggers ──
     def _start_meeting(self):
@@ -924,7 +994,7 @@ class MeetingsWindow(QDialog):
                     f"saved to:\n{self._meeting_dir}\n\n"
                     'Click "Retry Summary" above to try again.'
                 )
-                self.txt_transcript.setPlainText(transcript)
+                self._render_transcript(transcript)
                 self._show_retry_summary(True)
                 self.container.setCurrentIndex(3)
             else:
@@ -938,8 +1008,13 @@ class MeetingsWindow(QDialog):
         self._show_retry_summary(False)
 
         self.lbl_done_title.setText(self._meeting_title or "Meeting Notes")
-        self.txt_summary.setPlainText(notes)
-        self.txt_transcript.setPlainText(transcript)
+        # The notes are markdown - render them as such (headings, bullets,
+        # checkboxes) instead of showing raw ## and - [ ] markers.
+        try:
+            self.txt_summary.setMarkdown(notes)
+        except Exception:
+            self.txt_summary.setPlainText(notes)
+        self._render_transcript(transcript)
 
         self.container.setCurrentIndex(3)
 
@@ -958,6 +1033,131 @@ class MeetingsWindow(QDialog):
 
         from main import APP_VERSION
         telemetry.track("meeting_notes_completed", {}, self.app.cfg, APP_VERSION)
+
+    def _render_transcript(self, transcript):
+        """Readable transcript: bold slate speaker labels and real line spacing
+        instead of an undifferentiated wall of text."""
+        rows = []
+        for line in (transcript or "").split("\n"):
+            esc = html_mod.escape(line)
+            m = re.match(r"^(Speaker (?:\d+|\?)|You):", esc)
+            if m:
+                esc = ("<span style='color:#334155; font-weight:600;'>"
+                       + m.group(1) + ":</span>" + esc[m.end():])
+            rows.append(esc)
+        self.txt_transcript.setHtml(
+            "<div style='line-height:140%; font-size:13px; color:#0f172a;'>"
+            + "<br>".join(rows) + "</div>")
+
+    # ── Notion export ──
+    def _notion_config_dialog(self):
+        """One-time Notion setup: integration secret + target page link.
+        Returns True once both are saved."""
+        from PySide6.QtWidgets import QDialogButtonBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Connect Notion")
+        dlg.setMinimumWidth(460)
+        lay = QVBoxLayout(dlg)
+        info = QLabel(
+            "1. Create an internal integration at "
+            "<a href='https://www.notion.so/my-integrations'>notion.so/my-integrations</a>"
+            " and copy its secret.<br>"
+            "2. In Notion, open the page the notes should land under &rarr; "
+            "<b>&#8943;</b> menu &rarr; <b>Connections</b> &rarr; add that "
+            "integration (without this Notion hides the page from it).<br>"
+            "3. Paste both below - saved on this machine only.", dlg)
+        info.setOpenExternalLinks(True)
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        lay.addWidget(QLabel("Integration secret", dlg))
+        token_in = QLineEdit(dlg)
+        token_in.setEchoMode(QLineEdit.Password)
+        token_in.setText(self.app.cfg.get("notion_api_key", "") if self.app else "")
+        lay.addWidget(token_in)
+        lay.addWidget(QLabel("Page link", dlg))
+        page_in = QLineEdit(dlg)
+        page_in.setPlaceholderText("https://www.notion.so/Your-Page-…")
+        page_in.setText(self.app.cfg.get("notion_parent_page", "") if self.app else "")
+        lay.addWidget(page_in)
+        btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, dlg)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+        if dlg.exec() != QDialog.Accepted:
+            return False
+        token = token_in.text().strip()
+        page = page_in.text().strip()
+        if not token or not notion_export.extract_page_id(page):
+            QMessageBox.warning(
+                self, "Notion",
+                "Both the integration secret and a valid Notion page link are needed.")
+            return False
+        self.app.cfg["notion_api_key"] = token
+        self.app.cfg["notion_parent_page"] = page
+        self.app.save_config()
+        return True
+
+    def _send_to_notion(self):
+        notes = (self._final_notes or "").strip()
+        transcript = (getattr(self, "_final_transcript", "") or "").strip()
+        if not (notes or transcript):
+            QMessageBox.information(
+                self, "Nothing to send",
+                "Record a meeting first - there are no notes or transcript yet.")
+            return
+        if not self.app:
+            return
+        cfg = self.app.cfg
+        if not ((cfg.get("notion_api_key") or "").strip()
+                and notion_export.extract_page_id(cfg.get("notion_parent_page"))):
+            if not self._notion_config_dialog():
+                return
+        if cfg.get("privacy_mode"):
+            # Privacy Mode promises nothing leaves the device; an explicit
+            # share is allowed, but never without saying so.
+            answer = QMessageBox.question(
+                self, "Privacy Mode is on",
+                "Privacy Mode keeps everything on this device. Send this "
+                "meeting to Notion anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+
+        self.btn_notion.setEnabled(False)
+        self.btn_notion.setText("Sending…")
+        token = cfg.get("notion_api_key", "")
+        parent = cfg.get("notion_parent_page", "")
+        title = self._meeting_title or "Meeting notes"
+        meta_line = time.strftime("Recorded %Y-%m-%d %H:%M · Transcribe App")
+
+        def _worker():
+            try:
+                url = notion_export.publish_meeting(
+                    token, parent, title, notes,
+                    transcript=transcript, meta_line=meta_line)
+                err = ""
+            except Exception as e:
+                url, err = "", str(e)
+            try:
+                self.sig_notion.emit(url, err)
+            except RuntimeError:
+                pass    # window already destroyed
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_notion_done(self, url, err):
+        self.btn_notion.setEnabled(True)
+        self.btn_notion.setText("Send to Notion")
+        if err:
+            QMessageBox.warning(self, "Notion",
+                                f"Couldn't send to Notion:\n\n{err}")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Sent to Notion")
+        box.setTextFormat(Qt.RichText)
+        box.setText("Meeting notes are in Notion:<br>"
+                    f"<a href='{url}'>{html_mod.escape(url)}</a>")
+        box.exec()
 
     def _copy_markdown(self):
         clipboard = QApplication.clipboard()
@@ -982,12 +1182,45 @@ class MeetingsWindow(QDialog):
         btn = getattr(self, "btn_retry_summary", None)
         if btn is not None:
             btn.setVisible(bool(show))
+        combo = getattr(self, "combo_retry_engine", None)
+        if combo is not None:
+            if show:
+                self._populate_engine_combo(combo)
+            combo.setVisible(bool(show))
+
+    def _populate_engine_combo(self, combo):
+        """Fill an engine combo (minus rule-based) with PRO/LOCAL/CLOUD pills,
+        preselecting the currently configured engine."""
+        try:
+            from ui.mode_combo import tag_engine_combo
+            combo.blockSignals(True)
+            combo.clear()
+            for mid, info in actions.ACTION_MODELS.items():
+                if mid == actions.RULE_BASED_ID:
+                    continue
+                combo.addItem(info.get("label", mid), mid)
+            cur = (actions.normalize_action_model(self.app.cfg.get("action_model"))
+                   if self.app else actions.API_MANAGED_ID)
+            idx = combo.findData(cur)
+            if idx < 0:
+                idx = combo.findData(actions.API_MANAGED_ID)
+            combo.setCurrentIndex(max(idx, 0))
+            combo.blockSignals(False)
+            tag_engine_combo(combo)
+        except Exception as e:
+            logger.debug("engine combo populate failed: %s", e)
 
     def _retry_summary(self):
         # Re-run only the summary step on the saved transcript - no re-record,
         # no re-transcribe. Used after a summary failure on the Done page.
         if not (self.app and getattr(self, "_final_transcript", "").strip()):
             return
+        # Apply the picker: a retry that can't change the engine would fail
+        # identically (same model, same transcript, same context limit).
+        picked = self.combo_retry_engine.currentData()
+        if picked:
+            self.app.cfg["action_model"] = picked
+            self.app.save_config()
         self._show_retry_summary(False)
         self.state = self.STATE_PROCESSING
         self.container.setCurrentIndex(2)

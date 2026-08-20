@@ -130,6 +130,10 @@ DEFAULT = {
     # Put the user's clipboard back after we paste.
     "restore_clipboard": True,
     "clipboard_restore_delay_ms": 400,
+    # Notion export (Record Meeting -> Send to Notion). Internal-integration
+    # token + the page the notes land under. Plain-config like mistral_api_key.
+    "notion_api_key": "",
+    "notion_parent_page": "",
     # Bumped when the config shape changes in a way that needs migration.
     "config_schema_version": 1,
 }

@@ -31,8 +31,11 @@ class _PillItemDelegate(QStyledItemDelegate):
         if not kind:
             return
         from ui.icons import pro_pill_icon, local_pill_icon
-        icon, w = (pro_pill_icon(), 36) if kind == "pro" else (local_pill_icon(), 42)
-        h = 18
+        # Sizes MUST match the icon factories' defaults - the pill is rendered
+        # at native resolution for exactly that size, and drawing it at any
+        # other size rescales it and makes the text soft.
+        icon, w = (pro_pill_icon(), 40) if kind == "pro" else (local_pill_icon(), 48)
+        h = 20
         r = option.rect
         mode = QIcon.Normal if (option.state & QStyle.State_Enabled) else QIcon.Disabled
         icon.paint(painter, r.right() - w - 12, r.top() + (r.height() - h) // 2,
@@ -777,7 +780,8 @@ class Settings(QDialog):
         dev_head.addWidget(self._meeting_pro_badge)
         dev_lay.addLayout(dev_head)
         
-        self.combo_device = QComboBox(dev_frame)
+        from ui.mode_combo import MeetingModeComboBox
+        self.combo_device = MeetingModeComboBox(dev_frame)
         self._populate_audio_devices()
         self.combo_device.currentIndexChanged.connect(self._save_general_configs)
         self._configure_dropdown(self.combo_device, show_all_items=True)
@@ -875,10 +879,8 @@ class Settings(QDialog):
         frame.setGraphicsEffect(glow)
 
     def _populate_audio_devices(self):
-        from ui.icons import meeting_mode_icon, meeting_icon_qsize
-        # Match the padded pixmap's aspect, else Qt scales it down and the
-        # icon-to-text gap baked into it shrinks away.
-        self.combo_device.setIconSize(meeting_icon_qsize())
+        # Labels carry no icon: MeetingModeComboBox paints a slate glyph inline
+        # beside each word it describes (see ui/mode_combo.py).
         # System-audio capture rides on WASAPI loopback (Windows). On macOS /
         # systems without it, offering those modes would silently record the
         # mic anyway - so only show what genuinely works here.
@@ -889,16 +891,11 @@ class Settings(QDialog):
             has_loopback = False
         self.combo_device.clear()
         if has_loopback:
-            self.combo_device.addItem(
-                meeting_mode_icon("smart_meeting"),
-                "System sound + Microphone (best for meetings)", "smart_meeting")
-        self.combo_device.addItem(
-            meeting_mode_icon("default_mic"),
-            "Microphone only", "default_mic")
+            self.combo_device.addItem("System sound + Microphone (best for meetings)",
+                                      "smart_meeting")
+        self.combo_device.addItem("Microphone only", "default_mic")
         if has_loopback:
-            self.combo_device.addItem(
-                meeting_mode_icon("system_only"),
-                "System sound only (no microphone)", "system_only")
+            self.combo_device.addItem("System sound only (no microphone)", "system_only")
 
         # Set to current saved meeting capture mode (heal modes that this
         # system can't capture).

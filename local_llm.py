@@ -166,6 +166,11 @@ def download_model(model_id=QWEN_TINY_ID, on_progress=None):
     return dest
 
 
+# Context window for every local model. All four catalog models support at
+# least 8k (Qwen2.5: 32k, Gemma 2: 8k); the old 2048 made any meeting longer
+# than ~10 minutes fail with "Requested tokens exceed context window".
+_N_CTX = 8192
+
 _MAX_TOKENS_BY_MODE = {
     "meeting_notes": 1200,
     "summarize": 400,
@@ -174,21 +179,118 @@ _MAX_TOKENS_BY_MODE = {
 }
 
 
+def _count_tokens(llm, text):
+    """Token count as the model sees it; falls back to a chars/3 estimate."""
+    if not text:
+        return 0
+    try:
+        return len(llm.tokenize(text.encode("utf-8"), add_bos=False, special=False))
+    except TypeError:
+        return len(llm.tokenize(text.encode("utf-8")))
+    except Exception:
+        return max(1, len(text) // 3)
+
+
+def _messages_tokens(llm, messages):
+    """Prompt-size estimate: content tokens plus per-message template overhead."""
+    return 16 + sum(24 + _count_tokens(llm, m.get("content") or "") for m in messages)
+
+
+def _chat(llm, messages, max_tokens):
+    result = llm.create_chat_completion(
+        messages=messages,
+        temperature=0.1,
+        top_p=0.9,
+        max_tokens=max_tokens,
+        repeat_penalty=1.08,
+    )
+    return _extract_text(result)
+
+
+def _split_by_tokens(llm, text, chunk_tokens):
+    """Split on line boundaries into pieces of at most ~chunk_tokens each.
+    Transcripts are line-oriented ("Speaker N: ..."), so lines are the natural
+    unit; a single monster line is split by characters as a last resort."""
+    chunks, cur, cur_tok = [], [], 0
+    for line in text.split("\n"):
+        t = _count_tokens(llm, line) + 1
+        if t > chunk_tokens:
+            if cur:
+                chunks.append("\n".join(cur)); cur, cur_tok = [], 0
+            step = max(400, len(line) * chunk_tokens // (t + 1))
+            chunks.extend(line[i:i + step] for i in range(0, len(line), step))
+            continue
+        if cur and cur_tok + t > chunk_tokens:
+            chunks.append("\n".join(cur)); cur, cur_tok = [], 0
+        cur.append(line); cur_tok += t
+    if cur:
+        chunks.append("\n".join(cur))
+    return [c for c in chunks if c.strip()]
+
+
+_CONDENSE_SYSTEM = "You condense transcripts precisely. Never invent facts."
+_CONDENSE_INSTRUCTION = (
+    "Condense this portion of a longer transcript. Keep every decision, action "
+    "item, owner name, number, date and technical term; drop filler and "
+    "repetition. Output only the condensed notes."
+)
+
+
+def _condense_to_fit(llm, text, target_tokens):
+    """Map-reduce a too-long text down to ~target_tokens: condense each chunk,
+    join, repeat if needed, and hard-truncate as the final safety net."""
+    chunk_budget = _N_CTX - 900 - 128   # room for instruction + condensed output
+    for _ in range(3):
+        if _count_tokens(llm, text) <= target_tokens:
+            return text
+        parts = []
+        for chunk in _split_by_tokens(llm, text, chunk_budget):
+            parts.append(_chat(llm, [
+                {"role": "system", "content": _CONDENSE_SYSTEM},
+                {"role": "user",
+                 "content": f"{_CONDENSE_INSTRUCTION}\n\nTranscript portion:\n{chunk}"},
+            ], max_tokens=700))
+        text = "\n\n".join(p.strip() for p in parts if p.strip())
+    toks = None
+    try:
+        toks = llm.tokenize(text.encode("utf-8"), add_bos=False, special=False)
+    except Exception:
+        return text[: target_tokens * 3]
+    try:
+        return llm.detokenize(toks[:target_tokens]).decode("utf-8", "replace")
+    except Exception:
+        return text[: target_tokens * 3]
+
+
 def run_action(text, mode, source_lang="auto", target_lang="en", model_id=QWEN_TINY_ID,
                vocab_block=""):
     text = (text or "").strip()
     if not text:
         return ""
     llm = _load_model(model_id)
+    max_out = _MAX_TOKENS_BY_MODE.get(mode, 240)
     messages = _messages_for(mode, text, source_lang, target_lang, vocab_block)
-    result = llm.create_chat_completion(
-        messages=messages,
-        temperature=0.1,
-        top_p=0.9,
-        max_tokens=_MAX_TOKENS_BY_MODE.get(mode, 240),
-        repeat_penalty=1.08,
-    )
-    return _extract_text(result)
+
+    budget = _N_CTX - max_out - 128
+    if _messages_tokens(llm, messages) > budget:
+        # Input outgrew the context window (long meetings did this even at 8k,
+        # and at the old 2048 a ten-minute meeting was enough to fail with
+        # "Requested tokens exceed context window").
+        overhead = _messages_tokens(
+            llm, _messages_for(mode, "", source_lang, target_lang, vocab_block))
+        room = max(512, budget - overhead)
+        if mode == "translate":
+            # Translation must not be lossy - translate chunk by chunk instead.
+            out = [
+                _chat(llm, _messages_for(mode, chunk, source_lang, target_lang,
+                                         vocab_block), max_out)
+                for chunk in _split_by_tokens(llm, text, room)
+            ]
+            return "\n\n".join(o.strip() for o in out if o.strip())
+        text = _condense_to_fit(llm, text, room)
+        messages = _messages_for(mode, text, source_lang, target_lang, vocab_block)
+
+    return _chat(llm, messages, max_out)
 
 
 def _has_cuda():
@@ -217,7 +319,7 @@ def _load_model(model_id):
         try:
             llm = Llama(
                 model_path=str(path),
-                n_ctx=2048,
+                n_ctx=_N_CTX,
                 n_threads=max(2, min(8, psutil.cpu_count(logical=True) or 4)),
                 n_gpu_layers=gpu_layers,
                 verbose=False,
@@ -227,7 +329,7 @@ def _load_model(model_id):
                 raise
             llm = Llama(
                 model_path=str(path),
-                n_ctx=2048,
+                n_ctx=_N_CTX,
                 n_threads=max(2, min(8, psutil.cpu_count(logical=True) or 4)),
                 n_gpu_layers=0,
                 verbose=False,
