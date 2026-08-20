@@ -95,18 +95,42 @@ def _glyph_pixmap(kind, size, color):
     return tinted
 
 
+def _painted_glyph_pixmap(kind, size, color):
+    """The painted glyph rendered ONCE at native device resolution and cached.
+
+    Painting the vectors straight into the widget every frame put thin strokes
+    on fractional coordinates, which antialiasing smears - the glyphs read as
+    blurry. Rendering into a DPR-tagged pixmap (same cure as the pills) draws
+    them at real screen resolution and blits 1:1.
+    """
+    key = ("painted-glyph", kind, size, color.name(), _dpr())
+    if key in _ICON_CACHE:
+        return _ICON_CACHE[key]
+    pm = _new_pixmap(size, size)
+    p = _painter(pm)
+    rect = QRectF(0, 0, size, size)
+    if kind == "mic":
+        _draw_mic(p, rect, color)
+    elif kind == "speaker":
+        _draw_speaker(p, rect, color)
+    p.end()
+    _ICON_CACHE[key] = pm
+    return pm
+
+
 def draw_mode_glyph(painter, kind, rect, color=_SLATE):
     """Paint one meeting-mode glyph into ``rect``. Unknown kinds draw nothing."""
-    pm = _glyph_pixmap(kind, int(round(max(rect.width(), rect.height()))), color)
-    if pm is not None:
-        x = rect.x() + (rect.width() - pm.width()) / 2.0
-        y = rect.y() + (rect.height() - pm.height()) / 2.0
-        painter.drawPixmap(int(round(x)), int(round(y)), pm)
+    size = int(round(max(rect.width(), rect.height())))
+    pm = _glyph_pixmap(kind, size, color)          # drop-in PNG, if present
+    if pm is None and kind in ("mic", "speaker"):
+        pm = _painted_glyph_pixmap(kind, size, color)
+    if pm is None:
         return
-    if kind == "mic":
-        _draw_mic(painter, rect, color)
-    elif kind == "speaker":
-        _draw_speaker(painter, rect, color)
+    logical_w = pm.width() / pm.devicePixelRatio()
+    logical_h = pm.height() / pm.devicePixelRatio()
+    x = rect.x() + (rect.width() - logical_w) / 2.0
+    y = rect.y() + (rect.height() - logical_h) / 2.0
+    painter.drawPixmap(int(round(x)), int(round(y)), pm)
 
 
 def _dpr():
@@ -144,36 +168,44 @@ def _painter(pm):
 
 
 def _draw_mic(p, rect, color=_SLATE):
-    """Classic studio mic: capsule + cradle arc + stand."""
-    w = rect.width()
+    """Classic mic: solid capsule, open U cradle, stem, base bar.
+
+    Geometry deliberately stops at 90% height with margins all round - at the
+    ~14-18 px this renders at, anything touching the box edge looks cut off,
+    and an over-round cradle hugging the capsule reads as a flower.
+    """
+    s = min(rect.width(), rect.height())
+    x0 = rect.x() + (rect.width() - s) / 2
+    y0 = rect.y() + (rect.height() - s) / 2
+    cx = x0 + s / 2
+
     pen = QPen(color)
-    pen.setWidthF(max(1.6, w * 0.07))
+    pen.setWidthF(max(1.8, s * 0.10))
     pen.setCapStyle(Qt.RoundCap)
 
-    h = rect.height()
-    cx = rect.x() + w / 2
-
-    # Capsule: tall and solid, filling most of the upper two thirds.
-    cap_w = w * 0.38
-    cap_h = h * 0.66
-    cap_x = cx - cap_w / 2
-    cap_y = rect.y() + h * 0.02
+    # Capsule: upper half, solid.
+    cap_w = s * 0.32
     p.setPen(Qt.NoPen)
     p.setBrush(color)
-    p.drawRoundedRect(QRectF(cap_x, cap_y, cap_w, cap_h), cap_w / 2, cap_w / 2)
+    p.drawRoundedRect(QRectF(cx - cap_w / 2, y0 + s * 0.06, cap_w, s * 0.50),
+                      cap_w / 2, cap_w / 2)
 
-    # Cradle: a wide U cupping the capsule's lower half.
+    # Cradle: bottom half of a wide ellipse, clearly wider than the capsule
+    # and ending high enough that the stem below it stays visible.
     p.setBrush(Qt.NoBrush)
     p.setPen(pen)
-    arc_w = w * 0.66
-    arc_h = h * 0.60
-    arc_y = rect.y() + h * 0.36
-    p.drawArc(QRectF(cx - arc_w / 2, arc_y, arc_w, arc_h), 180 * 16, 180 * 16)
+    arc_w = s * 0.58
+    arc_h = s * 0.42
+    p.drawArc(QRectF(cx - arc_w / 2, y0 + s * 0.28, arc_w, arc_h),
+              180 * 16, 180 * 16)
 
-    # Short stem down to a wide base bar.
-    base_y = rect.y() + h * 0.96
-    p.drawLine(QPointF(cx, arc_y + arc_h * 0.5), QPointF(cx, base_y))
-    p.drawLine(QPointF(cx - w * 0.19, base_y), QPointF(cx + w * 0.19, base_y))
+    # Stem + base bar. The 0.70 -> 0.85 stem is what separates the cradle from
+    # the base - without that gap the bottom collapses into one blob and the
+    # whole glyph reads as a flower. 0.85 also keeps the bar's antialiased
+    # edge off the last pixel row (which looked cut off).
+    base_y = y0 + s * 0.85
+    p.drawLine(QPointF(cx, y0 + s * 0.70), QPointF(cx, base_y))
+    p.drawLine(QPointF(cx - s * 0.16, base_y), QPointF(cx + s * 0.16, base_y))
 
 
 def _draw_speaker(p, rect, color=_SLATE):
@@ -183,17 +215,18 @@ def _draw_speaker(p, rect, color=_SLATE):
     x0 = rect.x()
     y0 = rect.y()
 
-    # Cone (driver box + flare) as one filled path.
+    # Cone (driver box + flare) as one filled path, with margins so nothing
+    # touches the box edge at small sizes.
     path = QPainterPath()
-    box_x = x0 + w * 0.04
+    box_x = x0 + w * 0.06
     box_w = w * 0.18
-    box_y = y0 + h * 0.32
-    box_h = h * 0.36
+    box_y = y0 + h * 0.34
+    box_h = h * 0.32
     flare_x = x0 + w * 0.46
     path.moveTo(box_x, box_y)
     path.lineTo(box_x + box_w, box_y)
-    path.lineTo(flare_x, y0 + h * 0.04)         # flare top
-    path.lineTo(flare_x, y0 + h * 0.96)         # flare bottom
+    path.lineTo(flare_x, y0 + h * 0.10)         # flare top
+    path.lineTo(flare_x, y0 + h * 0.90)         # flare bottom
     path.lineTo(box_x + box_w, box_y + box_h)
     path.lineTo(box_x, box_y + box_h)
     path.closeSubpath()
@@ -203,14 +236,14 @@ def _draw_speaker(p, rect, color=_SLATE):
 
     # Two open sound arcs to the right of the cone.
     pen = QPen(color)
-    pen.setWidthF(max(1.7, w * 0.085))
+    pen.setWidthF(max(1.8, w * 0.10))
     pen.setCapStyle(Qt.RoundCap)
     p.setBrush(Qt.NoBrush)
     p.setPen(pen)
     cx = flare_x
     cy = y0 + h / 2
-    for r in (w * 0.24, w * 0.44):
-        p.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), -55 * 16, 110 * 16)
+    for r in (w * 0.22, w * 0.38):
+        p.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), -50 * 16, 100 * 16)
 
 
 def _text_pill_icon(text, bg, fg="#ffffff", width=44, height=20):

@@ -30,8 +30,9 @@ SEGMENT_GAP = 7    # end of a word -> next glyph
 
 def _glyph_size(fm):
     """Glyph box, tied to the font so it scales with display DPI. Kept even so
-    the centred strokes land on whole pixels rather than half ones."""
-    size = max(14, int(fm.height() * 1.15))
+    the centred strokes land on whole pixels rather than half ones; the 16px
+    floor keeps the mic's cradle from collapsing into mush at small fonts."""
+    size = max(16, int(fm.height() * 1.15))
     return size + (size % 2)
 
 
