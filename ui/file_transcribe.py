@@ -42,12 +42,32 @@ _P_TRANSCRIBE_END_NO_SPK = 96
 _P_SPEAKERS_END = 96
 
 
-def pick_auto_model():
+def probe_duration(path):
+    """Container-metadata duration in seconds (fast, no decode), or None."""
+    try:
+        import av
+        with av.open(path) as c:
+            if c.duration:
+                return c.duration / 1_000_000.0
+            for s in c.streams:
+                if s.duration and s.time_base:
+                    return float(s.duration * s.time_base)
+    except Exception:
+        pass
+    return None
+
+
+def pick_auto_model(recorder=None):
     """Best model for THIS machine: quality-first on CUDA, speed-first on CPU,
     preferring what is already downloaded so Auto never surprises the user
     with a multi-GB download."""
     from main import model_downloaded, AudioRecorder
     dev = AudioRecorder._whisper_device()[0]
+    if recorder is not None and getattr(recorder, "_cuda_usable", None) is False:
+        # A CUDA device exists but its runtime libs are proven broken - the
+        # model WILL run on CPU, so choosing a large model here would turn a
+        # one-hour file into an hours-long job.
+        dev = "cpu"
     if dev == "cuda":
         order = ["large-v3-turbo", "large-v3", "medium", "small", "base", "tiny"]
         fallback = "large-v3-turbo"
@@ -253,26 +273,13 @@ class FileTranscribeTab(QWidget):
                          daemon=True).start()
 
     def _probe_duration(self, path, info):
-        """Container-metadata duration (fast, no decode) for instant feedback."""
+        """Show duration + plan fit right after picking, via the fast probe."""
         line = info
-        try:
-            import av
-            with av.open(path) as c:
-                dur = None
-                if c.duration:
-                    dur = c.duration / 1_000_000.0
-                else:
-                    for s in c.streams:
-                        if s.duration and s.time_base:
-                            dur = float(s.duration * s.time_base)
-                            break
-            if dur:
-                line = f"{info}  ·  {_fmt_dur(dur)}"
-                err = duration_error(dur, self._is_pro())
-                if err:
-                    line += "  ·  ⚠ over your plan limit"
-        except Exception:
-            pass
+        dur = probe_duration(path)
+        if dur:
+            line = f"{info}  ·  {_fmt_dur(dur)}"
+            if duration_error(dur, self._is_pro()):
+                line += "  ·  ⚠ over your plan limit"
         try:
             self.sig_file_info.emit(line)
         except RuntimeError:
@@ -323,6 +330,11 @@ class FileTranscribeTab(QWidget):
         self._running = True
         self._cancel = False
         self._result = None
+        # Two-way exclusion: dictation/meetings refuse to start while this flag
+        # is up (they'd otherwise block on the shared model's inference lock
+        # for the entire file - potentially an hour of "Finalising…").
+        if self.app is not None:
+            self.app._file_job_running = True
         self.result_box.hide()
         self.prog_box.show()
         self.btn_cancel.setEnabled(True)
@@ -349,6 +361,17 @@ class FileTranscribeTab(QWidget):
     # ── the worker (background thread; UI only via signals) ──
     def _run_job(self, path, model_choice, want_speakers, want_ts, is_pro):
         try:
+            # Cheap metadata gate BEFORE the expensive decode: a free user with
+            # a 6-hour file shouldn't wait for (or pay the RAM of) a full
+            # decode just to be told no. The decoded duration below stays the
+            # authoritative check for files with missing/lying metadata.
+            probed = probe_duration(path)
+            if probed:
+                err = duration_error(probed, is_pro)
+                if err:
+                    self.sig_finished.emit(None, "limit:" + err)
+                    return
+
             self._emit(1, "Reading audio file…")
             from faster_whisper import decode_audio
             import numpy as np
@@ -368,8 +391,12 @@ class FileTranscribeTab(QWidget):
             self._emit(_P_READ_END, f"Audio loaded ({_fmt_dur(duration)})")
 
             import main as _m
-            model = model_choice or pick_auto_model()
-            if not _m.model_downloaded(model):
+            recorder = self.app.recorder if self.app else _m.AudioRecorder()
+            model = model_choice or pick_auto_model(recorder)
+            # Decide the stage layout NOW - after the download the same check
+            # would always say "downloaded" and misplace the bar.
+            did_download = not _m.model_downloaded(model)
+            if did_download:
                 label = f"Downloading the {model} model (one time)…"
                 self._emit(_P_READ_END + 1, label)
 
@@ -383,10 +410,21 @@ class FileTranscribeTab(QWidget):
                 self.sig_finished.emit(None, "cancelled")
                 return
 
-            t_start = _P_DOWNLOAD_END if not _m.model_downloaded(model) else _P_READ_END
-            t_start = max(t_start, self.bar.value())
+            t_start = _P_DOWNLOAD_END if did_download else _P_READ_END
             t_end = (_P_TRANSCRIBE_END_WITH_SPK if want_speakers
                      else _P_TRANSCRIBE_END_NO_SPK)
+
+            # Load the model HERE with a real error message. Inside
+            # transcribe_segments a load failure comes back as [], which the
+            # code below would misreport as "no speech in this file".
+            self._emit(t_start, f"Loading the {model} model…")
+            try:
+                recorder.load_model(model)
+            except Exception as e:
+                self.sig_finished.emit(
+                    None, f"The {model} model couldn't be loaded: {str(e)[:200]}")
+                return
+
             stage_t0 = time.time()
 
             def on_tr_progress(done, total):
@@ -398,7 +436,6 @@ class FileTranscribeTab(QWidget):
                 self._emit(t_start + (t_end - t_start) * frac,
                            f"Transcribing with {model}…", eta)
 
-            recorder = self.app.recorder if self.app else _m.AudioRecorder()
             segments = recorder.transcribe_segments(
                 audio, model_name=model,
                 on_progress=on_tr_progress,
@@ -426,6 +463,12 @@ class FileTranscribeTab(QWidget):
                     if turns:
                         segments = diarization.attribute_segments(segments, turns)
 
+            # A cancel pressed during the speakers stage must not surface a
+            # result the user already walked away from.
+            if self._cancel:
+                self.sig_finished.emit(None, "cancelled")
+                return
+
             self._emit(97, "Building the document…")
             paragraphs = docx_export.group_segments(segments)
             speakers = sorted({p["speaker"] for p in paragraphs
@@ -450,6 +493,8 @@ class FileTranscribeTab(QWidget):
 
     def _on_finished(self, result, error):
         self._running = False
+        if self.app is not None:
+            self.app._file_job_running = False
         self.prog_box.hide()
         self.btn_go.setEnabled(bool(self._path))
         if error == "cancelled":

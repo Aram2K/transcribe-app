@@ -61,6 +61,28 @@ class TestBuildDocx(unittest.TestCase):
         minidom.parseString(parts["word/document.xml"])
         self.assertIn("No speech", parts["word/document.xml"])
 
+    def test_xml_illegal_control_chars_are_stripped(self):
+        # Regression: a raw backspace (0x08) from Whisper's byte-level
+        # decoder made Word refuse the whole document ("unreadable
+        # content"). Illegal-in-XML characters must be stripped and every
+        # part must still parse. Control chars are built with chr() so the
+        # test source itself contains none.
+        bad = "hello " + chr(8) + " world " + chr(0) + chr(31) + " end"
+        paras = [{"start": 0, "speaker": 0, "text": bad}]
+        parts = _parts(dx.build_docx("Bad " + chr(8) + " title", paras))
+        for xml in parts.values():
+            minidom.parseString(xml)
+        doc = parts["word/document.xml"]
+        self.assertIn("hello  world", doc)
+        for code in (0, 8, 31):
+            self.assertNotIn(chr(code), doc)
+
+    def test_legal_whitespace_survives(self):
+        # Tab is LEGAL XML - the sanitizer must not eat it.
+        paras = [{"start": 0, "speaker": None, "text": "a" + chr(9) + "b"}]
+        doc = _parts(dx.build_docx("T", paras))["word/document.xml"]
+        self.assertIn("a" + chr(9) + "b", doc)
+
     def test_unicode_survives(self):
         paras = [{"start": 0, "speaker": None, "text": "Բարեւ ձեզ — привет 你好"}]
         doc = _parts(dx.build_docx("Յakob", paras))["word/document.xml"]

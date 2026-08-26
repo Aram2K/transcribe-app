@@ -564,6 +564,16 @@ class MeetingsWindow(QDialog):
         # If one is running, stop it first (and tell the user) so the two don't
         # fight over the device - which crashes - or leak dictation audio into
         # the meeting recording.
+        # Same exclusion as dictation: a running file transcription owns the
+        # shared Whisper model, and a meeting would block on it for its length.
+        if getattr(self.app, "_file_job_running", False):
+            QMessageBox.information(
+                self, "File transcription running",
+                "A file is being transcribed right now. Wait for it to finish "
+                "(or cancel it in Transcribe Files) - meetings share the same "
+                "speech model.")
+            return
+
         dictation_was_running = False
         try:
             if getattr(self.app, "is_rec", False) and hasattr(self.app, "force_stop_dictation"):

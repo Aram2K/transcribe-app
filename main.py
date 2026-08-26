@@ -2746,6 +2746,15 @@ class AppController(QObject):
     def _start(self):
         if self.is_rec:
             return
+        # A file transcription owns the shared Whisper model right now -
+        # starting a dictation would just hang on the inference lock until the
+        # whole file is done (potentially an hour of "Finalising…").
+        if getattr(self, "_file_job_running", False):
+            self.show_tray_hint(
+                "File transcription running",
+                "Wait for it to finish (or cancel it in Transcribe Files) "
+                "before dictating - they share the speech model.")
+            return
         # Guests get a 10-minute free recording trial; block once it's spent.
         if not entitlements.can_record(self.auth, self.cfg):
             self._guest_limit_reached()

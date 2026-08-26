@@ -22,6 +22,18 @@ _META_COLOR = "64748B"
 _TS_COLOR = "94A3B8"
 _SPEAKER_COLOR = "334155"
 
+# XML 1.0 forbids C0 controls (except tab/LF/CR), lone surrogates and
+# U+FFFE/U+FFFF - EVEN escaped. Whisper's byte-level decoder can emit such
+# characters on noisy audio, and one of them makes Word refuse the whole
+# document ("unreadable content") after a potentially hours-long job. Strip
+# them from every string that enters an XML part.
+_XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff￾￿]")
+
+
+def _xml_text(text):
+    return escape(_XML_ILLEGAL.sub("", text or ""))
+
+
 _CONTENT_TYPES = (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
@@ -89,7 +101,7 @@ def _run(text, *, bold=False, color=None, size=_BODY_SIZE):
     if color:
         props.append(f'<w:color w:val="{color}"/>')
     return ('<w:r><w:rPr>' + "".join(props) + '</w:rPr>'
-            f'<w:t xml:space="preserve">{escape(text)}</w:t></w:r>')
+            f'<w:t xml:space="preserve">{_xml_text(text)}</w:t></w:r>')
 
 
 def _para(runs, *, space_after=160):
@@ -147,7 +159,7 @@ def build_docx(title, paragraphs, meta_line="", speaker_names=None,
         ' xmlns:dc="http://purl.org/dc/elements/1.1/"'
         ' xmlns:dcterms="http://purl.org/dc/terms/"'
         ' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
-        f'<dc:title>{escape(title or "Transcript")}</dc:title>'
+        f'<dc:title>{_xml_text(title or "Transcript")}</dc:title>'
         '<dc:creator>Transcribe App</dc:creator>'
         f'<dcterms:created xsi:type="dcterms:W3CDTF">{now}</dcterms:created>'
         f'<dcterms:modified xsi:type="dcterms:W3CDTF">{now}</dcterms:modified>'
