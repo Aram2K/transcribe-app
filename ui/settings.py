@@ -567,16 +567,18 @@ class Settings(QDialog):
         header_row.addWidget(self._header_cta, 0, Qt.AlignVCenter)
         layout.addLayout(header_row)
 
-        # Tabs Container
-        self.tabs = QTabWidget(self)
+        # Tabs Container. ShinyTabWidget paints one designated tab with a
+        # gradient pill - the "look here" treatment for a new feature.
+        from ui.shiny_tabs import ShinyTabWidget
+        self.tabs = ShinyTabWidget(self)
         self.tabs.addTab(self._create_general_tab(), "General")
-        # The attention-grabber: file -> Word transcription, tagged NEW so
-        # existing users notice it. Lazy import keeps startup unchanged.
+        # The attention-grabber: file -> Word transcription. Lazy import keeps
+        # startup unchanged even if the tab ever fails to load.
         try:
             from ui.file_transcribe import FileTranscribeTab
-            from ui.icons import new_pill_icon
             self.file_tab = FileTranscribeTab(main_app=self.app)
-            self.tabs.addTab(self.file_tab, new_pill_icon(), "Transcribe Files")
+            self.tabs.addTab(self.file_tab, "Transcribe Files")
+            self.tabs.set_shiny_tab("Transcribe Files")
         except Exception as e:
             import logging
             logging.getLogger("transcribe").warning("File tab unavailable: %s", e)
