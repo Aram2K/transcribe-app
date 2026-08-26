@@ -570,6 +570,16 @@ class Settings(QDialog):
         # Tabs Container
         self.tabs = QTabWidget(self)
         self.tabs.addTab(self._create_general_tab(), "General")
+        # The attention-grabber: file -> Word transcription, tagged NEW so
+        # existing users notice it. Lazy import keeps startup unchanged.
+        try:
+            from ui.file_transcribe import FileTranscribeTab
+            from ui.icons import new_pill_icon
+            self.file_tab = FileTranscribeTab(main_app=self.app)
+            self.tabs.addTab(self.file_tab, new_pill_icon(), "Transcribe Files")
+        except Exception as e:
+            import logging
+            logging.getLogger("transcribe").warning("File tab unavailable: %s", e)
         self.tabs.addTab(self._create_models_tab(), "Models")
         self.tabs.addTab(self._create_actions_tab(), "AI Actions")
         self.tabs.addTab(self._create_history_tab(), "History")

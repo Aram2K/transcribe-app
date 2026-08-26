@@ -1449,12 +1449,18 @@ class AudioRecorder:
             return np.zeros(0, dtype=np.float32)
         return np.frombuffer(frames, dtype=np.float32).copy()
 
-    def transcribe_segments(self, audio, language=None):
+    def transcribe_segments(self, audio, language=None, model_name=None,
+                            on_progress=None, should_cancel=None):
         """Transcribe a full audio array into timestamped segments using the
         LOCAL Whisper model: a list of {"start", "end", "text"} in seconds, for
-        the post-meeting speaker-attributed transcript. Returns [] on failure or
-        very short audio. Holds the shared inference lock (safe after the live
-        chunk threads have drained)."""
+        the post-meeting speaker-attributed transcript and the file-transcription
+        tab. Returns [] on failure or very short audio, and None when
+        ``should_cancel`` asked to stop mid-way. Holds the shared inference lock.
+
+        ``on_progress(done_seconds, total_seconds)`` fires as segments stream
+        out of the decoder - faster-whisper's segments are a lazy generator, so
+        consumption IS progress. ``model_name`` overrides the configured model
+        (the file tab lets the user pick per-job)."""
         try:
             audio = np.asarray(audio, dtype=np.float32)
         except Exception:
@@ -1463,7 +1469,7 @@ class AudioRecorder:
         if len(audio) < sr // 2:
             return []
         try:
-            self.load_model()
+            self.load_model(model_name)
         except Exception as e:
             logger.warning("transcribe_segments: model load failed: %s", e)
             return []
@@ -1490,8 +1496,20 @@ class AudioRecorder:
                     no_speech_threshold=0.6,
                     repetition_penalty=1.3, no_repeat_ngram_size=5,
                     temperature=[0.0, 0.2, 0.4, 0.6, 0.8])
-                return [{"start": float(s.start), "end": float(s.end),
-                         "text": s.text.strip()} for s in segs if s.text.strip()]
+                total = len(audio) / float(sr)
+                out = []
+                for s in segs:
+                    if should_cancel is not None and should_cancel():
+                        return None
+                    if s.text.strip():
+                        out.append({"start": float(s.start), "end": float(s.end),
+                                    "text": s.text.strip()})
+                    if on_progress is not None:
+                        try:
+                            on_progress(min(float(s.end), total), total)
+                        except Exception:
+                            pass
+                return out
         except Exception as e:
             logger.warning("transcribe_segments failed: %s", e)
             return []

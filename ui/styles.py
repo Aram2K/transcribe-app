@@ -383,4 +383,39 @@ QLabel#guestBadge {
     font-weight: bold;
     padding: 2px 10px;
 }
+
+/* Hero call-to-action: the one shiny button per screen (Transcribe Files). */
+QPushButton#heroButton {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #3b82f6, stop:1 #8b5cf6);
+    color: #ffffff;
+    font-size: 14px;
+    font-weight: bold;
+    border: none;
+    border-radius: 10px;
+    padding: 10px 22px;
+}
+QPushButton#heroButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #2563eb, stop:1 #7c3aed);
+}
+QPushButton#heroButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #1d4ed8, stop:1 #6d28d9);
+}
+QPushButton#heroButton:disabled {
+    background: #cbd5e1;
+    color: #f8fafc;
+}
+
+/* File drop zone on the Transcribe Files tab. */
+QFrame#dropZone {
+    background-color: rgba(59, 130, 246, 14);
+    border: 2px dashed #93c5fd;
+    border-radius: 12px;
+}
+QFrame#dropZone:hover {
+    background-color: rgba(59, 130, 246, 28);
+    border-color: #3b82f6;
+}
 """

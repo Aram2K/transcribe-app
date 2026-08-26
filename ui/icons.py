@@ -288,6 +288,11 @@ def cloud_pill_icon(width=50, height=20):
     return _text_pill_icon("CLOUD", "#0284c7", width=width, height=height)
 
 
+def new_pill_icon(width=42, height=20):
+    """Violet 'NEW' pill - draws the eye to a freshly shipped tab/feature."""
+    return _text_pill_icon("NEW", "#8b5cf6", width=width, height=height)
+
+
 def eye_icon(open_=True, size=22, color=_SLATE):
     """Eye for password fields: open (click to reveal) or slashed (click to hide)."""
     key = ("eye", open_, size)

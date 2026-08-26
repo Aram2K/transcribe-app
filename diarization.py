@@ -143,12 +143,13 @@ def _build_diarizer(num_speakers, threshold):
     return sherpa_onnx.OfflineSpeakerDiarization(config)
 
 
-def diarize(audio, num_speakers=None, threshold=0.7):
+def diarize(audio, num_speakers=None, threshold=0.7, on_progress=None):
     """Diarize 16 kHz mono float32 ``audio`` into speaker turns.
 
     Returns a list of ``(start_s, end_s, speaker_id)`` sorted by start time, or
     ``[]`` if diarization is unavailable, the audio is too short, or anything
-    fails. Never raises.
+    fails. Never raises. ``on_progress(done, total)`` receives sherpa's
+    chunk-level progress when the installed version supports a callback.
     """
     if not is_available():
         return []
@@ -164,11 +165,28 @@ def diarize(audio, num_speakers=None, threshold=0.7):
     global _diarizer, _diarizer_key
     key = (int(num_speakers) if num_speakers else 0, round(float(threshold), 3))
     try:
+        callback = None
+        if on_progress is not None:
+            def callback(*args):
+                # sherpa passes (num_processed_chunks, num_total_chunks[, arg]).
+                try:
+                    if len(args) >= 2:
+                        on_progress(int(args[0]), max(1, int(args[1])))
+                except Exception:
+                    pass
+                return 0
         with _lock:
             if _diarizer is None or _diarizer_key != key:
                 _diarizer = _build_diarizer(num_speakers, threshold)
                 _diarizer_key = key
-            result = _diarizer.process(audio).sort_by_start_time()
+            if callback is not None:
+                try:
+                    result = _diarizer.process(audio, callback=callback).sort_by_start_time()
+                except TypeError:
+                    # Older sherpa without the callback kwarg.
+                    result = _diarizer.process(audio).sort_by_start_time()
+            else:
+                result = _diarizer.process(audio).sort_by_start_time()
         return [(float(r.start), float(r.end), int(r.speaker)) for r in result]
     except Exception as e:
         logger.warning("Diarization failed: %s", e)
