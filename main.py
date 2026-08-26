@@ -42,7 +42,7 @@ import text_cleanup
 import vocabulary
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.8.0"
 
 # ── Managed cloud transcription (Pro moat) ────────────────────────────────────
 MANAGED_PROXY_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-proxy"
