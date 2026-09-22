@@ -86,6 +86,42 @@ class TestRollingContext(unittest.TestCase):
         self.assertIn("(nothing transcribed yet)", self.rc(""))
 
 
+@unittest.skipUnless(_real_qt(), "real PySide6 not importable (stubbed)")
+class TestOverlayHelpers(unittest.TestCase):
+    def setUp(self):
+        import ui.live_assist as la
+        self.la = la
+
+    def test_private_state_is_truthful(self):
+        ps = self.la.private_state
+        self.assertEqual(ps(True, True, False, True)[0], "on")
+        # Wanted but the OS did NOT confirm -> must say visible, never hidden.
+        self.assertEqual(ps(True, True, False, False)[0], "failed")
+        self.assertIn("visible", ps(True, True, False, False)[1].lower())
+        self.assertEqual(ps(True, False, False, False)[0], "unavailable")   # old Windows / macOS
+        self.assertEqual(ps(True, True, True, False)[0], "unavailable")    # remote session
+        self.assertEqual(ps(False, True, False, False)[0], "off")
+        for args in ((True, False, False, True), (True, True, True, True)):
+            self.assertNotIn("not in your screen share", ps(*args)[1])
+
+    def test_position_clamped_onto_a_live_screen(self):
+        rects = [(0, 0, 1920, 1080)]
+        # A position saved on a monitor that's gone must come back on-screen.
+        x, y = self.la.clamp_to_rects(2500, 300, 420, 560, rects)
+        self.assertTrue(0 <= x <= 1920 - 420 and 0 <= y <= 1080 - 560)
+        # A valid position is left alone.
+        self.assertEqual(self.la.clamp_to_rects(100, 100, 420, 560, rects), (100, 100))
+        # Second monitor counts as valid too.
+        rects2 = [(0, 0, 1920, 1080), (1920, 0, 3840, 1080)]
+        self.assertEqual(self.la.clamp_to_rects(2500, 300, 420, 560, rects2), (2500, 300))
+
+    def test_quick_actions_shape(self):
+        labels = [l for l, _ in self.la.QUICK_ACTIONS]
+        self.assertEqual(labels[0], "Say next")
+        self.assertEqual(self.la.QUICK_ACTIONS[0][1], "")     # default = plain Suggest
+        self.assertTrue(all(q for _, q in self.la.QUICK_ACTIONS[1:]))
+
+
 class TestGlassHelpers(unittest.TestCase):
     def test_noop_off_windows_or_without_window(self):
         from ui import glass

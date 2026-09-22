@@ -394,7 +394,11 @@ class Settings(QDialog):
                 return False
 
         if self.app:
-            self.app.cfg.update(self.cfg_working)
+            # Keys owned by live UI (the Live Prompter overlay writes them
+            # straight to app.cfg while this window is open) must not be
+            # reverted from this window's older snapshot on Save.
+            self.app.cfg.update({k: v for k, v in self.cfg_working.items()
+                                 if not k.startswith("live_assist_")})
             self.app.save_config()
             self.app.apply_tray_bindings()
         # Save no longer closes the window - just confirm with a small toast.
@@ -952,7 +956,11 @@ class Settings(QDialog):
             return
         self._save_general_configs()
         if self.app:
-            self.app.cfg.update(self.cfg_working)
+            # Keys owned by live UI (the Live Prompter overlay writes them
+            # straight to app.cfg while this window is open) must not be
+            # reverted from this window's older snapshot on Save.
+            self.app.cfg.update({k: v for k, v in self.cfg_working.items()
+                                 if not k.startswith("live_assist_")})
             self.app.save_config()
             self.app.apply_tray_bindings()
             # Settings stays open behind the meeting window - closing it here
@@ -1557,7 +1565,11 @@ class Settings(QDialog):
         by provider) immediately + confirm."""
         self._save_action_configs()
         if self.app:
-            self.app.cfg.update(self.cfg_working)
+            # Keys owned by live UI (the Live Prompter overlay writes them
+            # straight to app.cfg while this window is open) must not be
+            # reverted from this window's older snapshot on Save.
+            self.app.cfg.update({k: v for k, v in self.cfg_working.items()
+                                 if not k.startswith("live_assist_")})
             self._mark_secrets_owner()
             self.app.save_config()
         self._set_key_status(getattr(self, "_cloud_key_status", None), "Saved", "#16a34a")

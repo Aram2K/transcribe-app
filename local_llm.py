@@ -427,7 +427,8 @@ def _messages_for(mode, text, source_lang, target_lang, vocab_block=""):
             "Output plain text, under 100 words:\n"
             "They're asking: <one line>\n"
             "- 2-4 short concrete points\n"
-            "Do not invent facts or names."
+            "Use only the conversation. Do not invent facts or names, and never make "
+            "claims about the user's own background or experience."
         )
     else:
         instruction = "Rewrite the user's text clearly while preserving meaning. Output only the result."

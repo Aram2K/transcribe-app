@@ -45,8 +45,65 @@ WS_EX_TRANSPARENT = 0x00000020
 WS_EX_LAYERED = 0x00080000
 
 
+_bound = False
+
+
+def _bind():
+    """Declare ctypes signatures once. Without argtypes, ctypes passes a Python
+    int HWND as a 32-bit C int - fine in practice (handles stay 32-bit safe)
+    but wrong in principle - and reads HRESULTs as unsigned. Also picks the
+    *LongPtr* ex-style APIs on 64-bit."""
+    global _bound
+    if _bound or not IS_WINDOWS:
+        return
+    u, d = ctypes.windll.user32, ctypes.windll.dwmapi
+    u.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    u.SetWindowDisplayAffinity.restype = ctypes.c_int
+    u.GetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+    u.GetWindowDisplayAffinity.restype = ctypes.c_int
+    u.GetSystemMetrics.argtypes = [ctypes.c_int]
+    u.GetSystemMetrics.restype = ctypes.c_int
+    d.DwmSetWindowAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                        ctypes.c_void_p, ctypes.c_uint]
+    d.DwmSetWindowAttribute.restype = ctypes.c_long
+    for name in ("GetWindowLongPtrW", "SetWindowLongPtrW"):
+        if not hasattr(u, name):
+            continue
+    if hasattr(u, "GetWindowLongPtrW"):
+        u.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        u.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+        u.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+        u.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+    _bound = True
+
+
+def _get_exstyle(hwnd):
+    u = ctypes.windll.user32
+    fn = getattr(u, "GetWindowLongPtrW", None) or u.GetWindowLongW
+    return int(fn(hwnd, GWL_EXSTYLE))
+
+
+def _set_exstyle(hwnd, value):
+    u = ctypes.windll.user32
+    fn = getattr(u, "SetWindowLongPtrW", None) or u.SetWindowLongW
+    return fn(hwnd, GWL_EXSTYLE, value)
+
+
+def is_remote_session():
+    """True inside Remote Desktop / VDI: there the remote stream IS a capture
+    path, so an excluded window would vanish for the user themselves."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        _bind()
+        return bool(ctypes.windll.user32.GetSystemMetrics(0x1000))   # SM_REMOTESESSION
+    except Exception:
+        return False
+
+
 def _hwnd(widget):
     try:
+        _bind()
         return int(widget.winId())
     except Exception:
         return 0
@@ -66,6 +123,10 @@ def exclude_from_capture(widget, enabled=True):
     keeping it visible on the monitor. Returns True when the OS confirmed the
     new affinity via GetWindowDisplayAffinity."""
     if not IS_WINDOWS:
+        return False
+    # Never request exclusion below Win10 2004: there the same flag degrades to
+    # WDA_MONITOR - a BLACK RECTANGLE on the shared screen, worse than visible.
+    if enabled and not capture_exclusion_supported():
         return False
     hwnd = _hwnd(widget)
     if not hwnd:
@@ -194,14 +255,13 @@ def set_click_through(widget, enabled=True):
     if not hwnd:
         return False
     try:
-        user32 = ctypes.windll.user32
-        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        ex = _get_exstyle(hwnd)
         if enabled:
             ex |= WS_EX_TRANSPARENT | WS_EX_LAYERED
         else:
             ex &= ~WS_EX_TRANSPARENT
-        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex)
-        return bool(user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TRANSPARENT) == enabled
+        _set_exstyle(hwnd, ex)
+        return bool(_get_exstyle(hwnd) & WS_EX_TRANSPARENT) == enabled
     except Exception as e:
         logger.warning("set_click_through: %s", e)
         return False

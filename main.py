@@ -2041,9 +2041,11 @@ class AppController(QObject):
         action_rec_meet.triggered.connect(self.show_meeting)
         menu.addAction(action_rec_meet)
 
-        assist_key = (self.cfg.get("live_assist_hotkey") or "").strip()
+        # Label shows the hotkey only if it actually registered (it is skipped
+        # when it collides with the dictation hotkey).
+        assist_key = self._registered_assist_hotkey or ""
         action_assist = QAction(
-            "Live Assist overlay" + (f"   ({assist_key})" if assist_key else ""), self)
+            "Live Prompter overlay" + (f"   ({assist_key})" if assist_key else ""), self)
         action_assist.triggered.connect(self.toggle_live_assist)
         menu.addAction(action_assist)
 
@@ -2662,8 +2664,8 @@ class AppController(QObject):
                         self.live_assist.set_summary(getattr(mw, "_live_summary_text", ""))
             self.live_assist.toggle()
         except Exception as e:
-            logger.warning("Live Assist failed: %s", e, exc_info=True)
-            self.show_tray_hint("Live Assist", f"Couldn't open the overlay: {e}")
+            logger.warning("Live Prompter failed: %s", e, exc_info=True)
+            self.show_tray_hint("Live Prompter", f"Couldn't open the overlay: {e}")
 
     def _unregister_kbd_hotkey(self):
         if self._registered_kbd_hotkey is not None:
@@ -2708,6 +2710,10 @@ class AppController(QObject):
 
     def apply_tray_bindings(self):
         self._setup_hotkey(self.cfg["hotkey"])
+        # Re-evaluate the overlay hotkey too: if the dictation hotkey was just
+        # changed to the same combo, this drops the overlay binding instead
+        # of letting both fire on one keypress.
+        self._setup_assist_hotkey(self.cfg.get("live_assist_hotkey", ""))
 
     # ── Event Callbacks ──
     def _on_levels(self, levels):

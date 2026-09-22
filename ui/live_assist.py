@@ -36,8 +36,11 @@ from ui import glass
 
 logger = logging.getLogger("transcribe")
 
-EXPANDED_W, EXPANDED_H = 420, 560
-COMPACT_W, COMPACT_H = 420, 52
+# Width is shared by both states so collapse/expand never jumps sideways; it
+# must fit the header (title + privacy chip + 3 icon buttons) and the quick-
+# action row (section label + Say next / Follow-ups / Recap).
+EXPANDED_W, EXPANDED_H = 480, 560
+COMPACT_W, COMPACT_H = 480, 52
 TAIL_CHARS = 2600            # ~3-4 minutes of speech fed to the model
 AUTO_SUGGEST_EVERY_SEC = 25  # when Auto is on and new speech arrived
 
@@ -48,7 +51,7 @@ _THEMES = {
         "border": QColor(15, 23, 42, 34),
         "highlight": QColor(255, 255, 255, 190),
         "text": "#0f172a", "muted": "#475569", "faint": "#64748b",
-        "card": "rgba(255,255,255,0.55)", "card_border": "rgba(15,23,42,0.10)",
+        "card": "rgba(255,255,255,0.64)", "card_border": "rgba(15,23,42,0.10)",
         "accent": "#2563eb",
     },
     "dark": {
@@ -61,6 +64,43 @@ _THEMES = {
         "accent": "#60a5fa",
     },
 }
+
+
+QUICK_ACTIONS = (
+    ("Say next", ""),
+    ("Follow-ups", "Give me 3 sharp follow-up questions I could ask right now, "
+                   "one line each."),
+    ("Recap", "Recap the last few minutes of the conversation in 3 short bullets."),
+)
+
+
+def clamp_to_rects(x, y, w, h, rects, margin=8):
+    """Keep a saved window position reachable: if (x, y) isn't on any current
+    screen (monitor unplugged, resolution changed) pull it onto the first one.
+    ``rects`` are (left, top, right, bottom) tuples."""
+    if not rects:
+        return x, y
+    for l, t, r, b in rects:
+        if l <= x < r - 40 and t <= y < b - 40:
+            return x, y
+    l, t, r, b = rects[0]
+    return (max(l + margin, min(x, r - w - margin)),
+            max(t + margin, min(y, b - h - margin)))
+
+
+def private_state(wanted, supported, remote, excluded):
+    """(key, chip text) - always TRUTHFUL about what the OS actually did. The
+    badge is the whole privacy promise; it must never say hidden when the
+    window is in fact capturable (macOS, old Windows, RDP, API refusal)."""
+    if not wanted:
+        return "off", "VISIBLE in screen share"
+    if remote:
+        return "unavailable", "PRIVATE unavailable in a remote session"
+    if not supported:
+        return "unavailable", "PRIVATE unavailable on this system"
+    if excluded:
+        return "on", "PRIVATE · not in your screen share"
+    return "failed", "PRIVATE failed · visible in screen share"
 
 
 def rolling_context(live_text, question="", title="", attendees="", tail_chars=TAIL_CHARS):
@@ -146,8 +186,12 @@ class LiveAssistOverlay(QWidget):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        self.setWindowTitle("Live Assist")
-        self.resize(EXPANDED_W, EXPANDED_H)
+        # macOS hides Qt.Tool windows when the app loses focus - which is
+        # exactly when the user is in Zoom. No-op elsewhere.
+        self.setAttribute(Qt.WA_MacAlwaysShowToolWindow, True)
+        self.setWindowTitle("Live Prompter")
+        self.setFixedSize(EXPANDED_W, EXPANDED_H)
+        self._exclusion_ok = False
 
         self.sig_suggestion.connect(self._on_suggestion)
         self._build()
@@ -155,7 +199,11 @@ class LiveAssistOverlay(QWidget):
 
         pos = cfg.get("live_assist_pos")
         if isinstance(pos, (list, tuple)) and len(pos) == 2:
-            self.move(int(pos[0]), int(pos[1]))
+            rects = [(s.availableGeometry().left(), s.availableGeometry().top(),
+                      s.availableGeometry().right(), s.availableGeometry().bottom())
+                     for s in QApplication.screens()]
+            x, y = clamp_to_rects(int(pos[0]), int(pos[1]), EXPANDED_W, EXPANDED_H, rects)
+            self.move(x, y)
         else:
             self._default_position()
 
@@ -175,12 +223,9 @@ class LiveAssistOverlay(QWidget):
         bl.setSpacing(8)
         self.lbl_dot = QLabel("●", self.bar)
         bl.addWidget(self.lbl_dot)
-        self.lbl_title = QLabel("Live Assist", self.bar)
+        self.lbl_title = QLabel("Live Prompter", self.bar)
         bl.addWidget(self.lbl_title)
         self.lbl_private = QLabel("", self.bar)
-        self.lbl_private.setToolTip(
-            "Private: this overlay is hidden from screen sharing and recordings. "
-            "Click to toggle.")
         self.lbl_private.setCursor(Qt.PointingHandCursor)
         self.lbl_private.mousePressEvent = lambda e: self.set_private(not self._private)
         bl.addWidget(self.lbl_private)
@@ -224,9 +269,21 @@ class LiveAssistOverlay(QWidget):
         body.addWidget(self.txt_summary)
 
         head_row = QHBoxLayout()
-        self.lbl_sug_head = QLabel("SUGGESTION", self.body)
+        self.lbl_sug_head = QLabel("SUGGESTION · CHECK FACTS", self.body)
+        self.lbl_sug_head.setToolTip("AI suggestions can be wrong - treat them as notes, "
+                                     "not facts.")
         head_row.addWidget(self.lbl_sug_head)
         head_row.addStretch()
+        # One-tap actions (the part of Cluely's UX worth copying): each is just
+        # a canned question through the same suggestion path.
+        self.quick_buttons = []
+        for label, question in QUICK_ACTIONS:
+            b = QPushButton(label, self.body)
+            b.setFixedHeight(22)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda _=False, q=question: self.suggest(q))
+            head_row.addWidget(b)
+            self.quick_buttons.append(b)
         self.btn_auto = QPushButton("Auto", self.body)
         self.btn_auto.setCheckable(True)
         self.btn_auto.setChecked(self._auto)
@@ -281,7 +338,7 @@ class LiveAssistOverlay(QWidget):
             QLabel#laNow {{ font-size: 13px; color: {t['text']}; }}
             QTextEdit#laCard {{
                 background: {t['card']}; border: 1px solid {t['card_border']};
-                border-radius: 10px; color: {t['text']}; font-size: 12.5px; padding: 6px;
+                border-radius: 10px; color: {t['text']}; font-size: 13.5px; padding: 6px;
             }}
             QLineEdit {{
                 background: {t['card']}; border: 1px solid {t['card_border']};
@@ -332,11 +389,15 @@ class LiveAssistOverlay(QWidget):
         self.update()
 
     def _apply_private(self):
-        ok = glass.exclude_from_capture(self, self._private) if self._private \
-            else (glass.exclude_from_capture(self, False) or True)
-        if self._private and not ok:
-            self.lbl_status.setText("Couldn't enable Private on this Windows version")
-        self._refresh_private_chip()
+        remote = glass.is_remote_session()
+        supported = glass.capture_exclusion_supported()
+        excluded = False
+        if self._private and supported and not remote:
+            excluded = glass.exclude_from_capture(self, True)
+        else:
+            glass.exclude_from_capture(self, False)
+        self._exclusion_ok = excluded
+        self._refresh_private_chip(remote, supported, excluded)
 
     def set_private(self, on):
         self._private = bool(on)
@@ -345,22 +406,37 @@ class LiveAssistOverlay(QWidget):
             self.app.save_config()
         self._apply_private()
 
-    def _refresh_private_chip(self):
-        t = _THEMES[self._theme_name]
-        if self._private:
-            self.lbl_private.setText("  PRIVATE · hidden from screen share  ")
-            self.lbl_private.setStyleSheet(
-                "background: rgba(34,197,94,0.18); color: #15803d; border: 1px solid "
-                "rgba(34,197,94,0.45); border-radius: 9px; font-size: 10px; font-weight: 700;")
-        else:
-            self.lbl_private.setText("  VISIBLE in screen share  ")
-            self.lbl_private.setStyleSheet(
-                "background: rgba(239,68,68,0.16); color: #b91c1c; border: 1px solid "
-                "rgba(239,68,68,0.45); border-radius: 9px; font-size: 10px; font-weight: 700;")
-        self.lbl_private.setToolTip(
-            "Hidden from screen sharing and recordings (Windows 10 2004+). Click to toggle."
-            if self._private else
-            "This overlay WILL show on a shared screen. Click to make it private.")
+    _CHIP_STYLES = {
+        "on": ("rgba(34,197,94,0.18)", "#15803d", "rgba(34,197,94,0.45)"),
+        "off": ("rgba(239,68,68,0.16)", "#b91c1c", "rgba(239,68,68,0.45)"),
+        "failed": ("rgba(239,68,68,0.16)", "#b91c1c", "rgba(239,68,68,0.45)"),
+        "unavailable": ("rgba(245,158,11,0.18)", "#b45309", "rgba(245,158,11,0.5)"),
+    }
+
+    def _refresh_private_chip(self, remote=None, supported=None, excluded=None):
+        if remote is None:
+            remote = glass.is_remote_session()
+        if supported is None:
+            supported = glass.capture_exclusion_supported()
+        if excluded is None:
+            excluded = glass.is_excluded_from_capture(self) if self.isVisible() \
+                else self._exclusion_ok
+        key, text = private_state(self._private, supported, remote, excluded)
+        bg, fg, border = self._CHIP_STYLES[key]
+        self.lbl_private.setText(f"  {text}  ")
+        self.lbl_private.setStyleSheet(
+            f"background: {bg}; color: {fg}; border: 1px solid {border}; "
+            "border-radius: 9px; font-size: 10px; font-weight: 700;")
+        tips = {
+            "on": "Hidden from Zoom/Teams/Meet shares, recordings and screenshots on "
+                  "this PC. Not hidden from phone cameras. Click to turn off (e.g. to "
+                  "include it in your own recording).",
+            "off": "This overlay WILL show on a shared screen. Click to make it private.",
+            "failed": "Windows refused to hide this window - assume it is visible in a share.",
+            "unavailable": "Screen-share privacy needs Windows 10 2004+ and a local "
+                           "(non-remote) session.",
+        }
+        self.lbl_private.setToolTip(tips[key])
 
     def _refresh_dot(self):
         color = "#ef4444" if self._meeting_active else _THEMES[self._theme_name]["faint"]
@@ -542,6 +618,12 @@ class LiveAssistOverlay(QWidget):
             self.app.save_config()
 
     def _on_tick(self):
+        # Watchdog: Qt can recreate the native window (flag/parent changes)
+        # and the exclusion lives on the HWND - re-apply if it went missing.
+        if (self._private and self.isVisible() and glass.capture_exclusion_supported()
+                and not glass.is_remote_session()
+                and not glass.is_excluded_from_capture(self)):
+            self._apply_private()
         if self._suggesting:
             el = int(time.time() - self._suggest_started)
             if el >= 3:

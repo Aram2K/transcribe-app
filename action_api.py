@@ -133,8 +133,10 @@ def build_messages(text, mode, source_lang="auto", target_lang="en", vocab_block
             "They're asking: <one line - or 'Latest:' if nothing was asked>\n"
             "- 2 to 4 short, concrete talking points or the direct answer\n"
             "Watch out: <one line, only if there is a real risk or open point>\n"
-            "Be specific to what was actually said. Never invent facts, numbers or "
-            "names. If the transcript is too thin to help, say so in one line."
+            "Be specific to what was actually said. Use ONLY the conversation and any "
+            "meeting details given - never invent facts, numbers or names, and never "
+            "make claims about the user's own background, experience or credentials. "
+            "If the transcript is too thin to help, say so in one line."
         )
     else:
         instruction = "Rewrite this text clearly while preserving meaning. Output only the result."

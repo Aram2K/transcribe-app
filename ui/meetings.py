@@ -337,10 +337,10 @@ class MeetingsWindow(QDialog):
 
         # Bottom Recording Control row
         btn_lay = QHBoxLayout()
-        btn_assist = QPushButton("Live Assist overlay", self.page_recording)
+        btn_assist = QPushButton("Live Prompter", self.page_recording)
         btn_assist.setToolTip(
-            "A private floating copilot: last thing said, running summary and "
-            "AI suggestions - hidden from screen sharing.")
+            "A private floating prompter: the last thing said, the running summary "
+            "and AI suggestions - kept out of your screen share.")
         btn_assist.clicked.connect(
             lambda: self.app and self.app.toggle_live_assist())
         btn_lay.addWidget(btn_assist)
