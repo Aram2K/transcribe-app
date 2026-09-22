@@ -180,6 +180,7 @@ _N_CTX = 8192
 
 _MAX_TOKENS_BY_MODE = {
     "meeting_notes": 1200,
+    "live_assist": 300,
     "summarize": 400,
     "write_email": 360,
     "smart_auto": 600,
@@ -412,6 +413,21 @@ def _messages_for(mode, text, source_lang, target_lang, vocab_block=""):
             "## Open questions  (bullets; skip if none)\n\n"
             "Preserve names exactly (incl. Armenian/Russian). Don't invent facts. "
             "If `[speaker change]` markers appear, use them to attribute who said what."
+        )
+    elif mode == "live_assist":
+        # Tighter than the cloud prompt - small local models follow short,
+        # direct instructions better. Same output shape.
+        instruction = (
+            "You are a real-time meeting copilot for the user during a live call. "
+            "The text is the latest part of the conversation (speech recognition, "
+            "may be imperfect), optionally followed by the user's question.\n"
+            "If there is a question from the user, answer it from the conversation. "
+            "Otherwise take the LAST question or request in the text (ignore earlier "
+            "ones), say what is being asked of the user, and what to say next.\n"
+            "Output plain text, under 100 words:\n"
+            "They're asking: <one line>\n"
+            "- 2-4 short concrete points\n"
+            "Do not invent facts or names."
         )
     else:
         instruction = "Rewrite the user's text clearly while preserving meaning. Output only the result."

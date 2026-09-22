@@ -13,6 +13,7 @@ ACTION_MAKE_TODO = "make_todo_list"
 ACTION_TRANSLATE = "translate"
 ACTION_SUMMARIZE = "summarize"
 ACTION_MEETING_NOTES = "meeting_notes"
+ACTION_LIVE_ASSIST = "live_assist"       # real-time copilot (ui/live_assist.py)
 
 RULE_BASED_ID = "rule_based"
 API_OPENAI_ID = "api_openai_compatible"
@@ -132,6 +133,7 @@ class ActionError(RuntimeError):
 _ACTION_MODE_WHITELIST = {
     ACTION_TRANSCRIBE_ONLY, ACTION_SMART_AUTO, ACTION_WRITE_EMAIL,
     ACTION_MAKE_TODO, ACTION_TRANSLATE, ACTION_SUMMARIZE, ACTION_MEETING_NOTES,
+    ACTION_LIVE_ASSIST,
 }
 
 
@@ -282,6 +284,8 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
         return _summarize_extractive(text)
     if mode == ACTION_MEETING_NOTES:
         return _meeting_notes_extractive(text)
+    if mode == ACTION_LIVE_ASSIST:
+        return _live_assist_basic(text)
     if mode == ACTION_TRANSLATE:
         try:
             return _translate_local(text, source_lang, target_lang)
@@ -294,6 +298,35 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
                     raise ActionError(str(e)) from e
             raise
     return text
+
+
+def _live_assist_basic(text):
+    """No-LLM fallback for Live Assist: point at the last question asked in
+    the conversation tail and echo the freshest points. Says plainly that it
+    is basic mode - a user who expects AI suggestions must not mistake this
+    for them. Input is the context built by ui.live_assist.rolling_context."""
+    convo, question = text or "", ""
+    m = re.search(r"User's question:\s*(.+)$", convo, re.S)
+    if m:
+        question = m.group(1).strip()
+        convo = convo[:m.start()]
+    convo = re.sub(r"^.*?Conversation \(latest part\):\s*", "", convo, flags=re.S)
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", convo) if s.strip()]
+    asked = next((s for s in reversed(sentences) if s.endswith("?")), "")
+    lines = []
+    if question:
+        lines.append(f"You asked: {question}")
+        lines.append("Basic mode can't answer questions - set up an AI engine in "
+                     "Settings → AI Actions (Transcribe Pro works out of the box).")
+    if asked:
+        lines.append(f"They're asking: {asked}")
+    else:
+        lines.append("Latest: " + (sentences[-1] if sentences else "(nothing yet)"))
+    for s in sentences[-3:]:
+        if s != asked:
+            lines.append(f"- {s[:140]}")
+    lines.append("(basic mode - no AI engine set up)")
+    return "\n".join(lines)
 
 
 def _first_downloaded_local_model():

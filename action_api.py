@@ -43,6 +43,8 @@ def _max_tokens_for(mode):
         return 1200
     if mode == "smart_auto":
         return 600
+    if mode == "live_assist":
+        return 320
     if mode == "summarize":
         return 400
     if mode == "write_email":
@@ -112,6 +114,27 @@ def build_messages(text, mode, source_lang="auto", target_lang="en", vocab_block
             "available from the attendees list.\n"
             "- If an attendee list is provided in context, prefer those exact names "
             "when attributing owners."
+        )
+    elif mode == "live_assist":
+        # Real-time copilot during a call. The input is the TAIL of a live
+        # transcript (imperfect ASR, maybe mid-sentence) plus an optional
+        # question from the user. Short, scannable output - it is read at a
+        # glance while the user is talking to someone.
+        instruction = (
+            "You are a discreet real-time meeting copilot for the user - the person "
+            "running this app - during a live call. The text is the most recent part "
+            "of the conversation (automatic speech recognition, may be imperfect or "
+            "cut mid-sentence), optionally followed by a question from the user.\n"
+            "If the user asked a question, answer it using the conversation.\n"
+            "Otherwise, work out what was MOST RECENTLY asked or expected of the "
+            "user - the last question or request in the text, not an earlier one - "
+            "and give them what to say next.\n"
+            "Format (plain text, at most ~120 words):\n"
+            "They're asking: <one line - or 'Latest:' if nothing was asked>\n"
+            "- 2 to 4 short, concrete talking points or the direct answer\n"
+            "Watch out: <one line, only if there is a real risk or open point>\n"
+            "Be specific to what was actually said. Never invent facts, numbers or "
+            "names. If the transcript is too thin to help, say so in one line."
         )
     else:
         instruction = "Rewrite this text clearly while preserving meaning. Output only the result."

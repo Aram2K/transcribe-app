@@ -337,6 +337,13 @@ class MeetingsWindow(QDialog):
 
         # Bottom Recording Control row
         btn_lay = QHBoxLayout()
+        btn_assist = QPushButton("Live Assist overlay", self.page_recording)
+        btn_assist.setToolTip(
+            "A private floating copilot: last thing said, running summary and "
+            "AI suggestions - hidden from screen sharing.")
+        btn_assist.clicked.connect(
+            lambda: self.app and self.app.toggle_live_assist())
+        btn_lay.addWidget(btn_assist)
         btn_lay.addStretch()
         
         btn_stop = QPushButton("Stop & Generate Notes", self.page_recording)
@@ -630,6 +637,9 @@ class MeetingsWindow(QDialog):
         self._final_transcript = ""
         self._final_notes = ""
         self._summary_downgraded = False
+        la = getattr(self.app, "live_assist", None)
+        if la is not None:
+            la.set_meeting_active(True, self._meeting_title, self._meeting_attendees)
         self._live_text = ""
         self._live_summary_text = ""
         self._last_summary_at = time.time()
@@ -798,6 +808,9 @@ class MeetingsWindow(QDialog):
     def _stop_meeting(self):
         if not self.app or self.state != self.STATE_RECORDING:
             return
+        la = getattr(self.app, "live_assist", None)
+        if la is not None:
+            la.set_meeting_active(False)
             
         self.state = self.STATE_PROCESSING
         self.container.setCurrentIndex(2)

@@ -134,6 +134,13 @@ DEFAULT = {
     # token + the page the notes land under. Plain-config like mistral_api_key.
     "notion_api_key": "",
     "notion_parent_page": "",
+    # Live Assist overlay (ui/live_assist.py): private copilot during calls.
+    "live_assist_hotkey": "ctrl+alt+a",
+    "live_assist_private": True,     # excluded from screen capture
+    "live_assist_opacity": 0.96,
+    "live_assist_theme": "light",
+    "live_assist_auto": False,       # auto-refresh suggestions while people talk
+    "live_assist_pos": None,
     # Bumped when the config shape changes in a way that needs migration.
     "config_schema_version": 1,
 }
@@ -1840,6 +1847,7 @@ class AppController(QObject):
     # QueuedConnection. Avoids QTimer.singleShot from non-Qt threads, which
     # silently no-ops because those threads have no Qt event loop.
     sig_hotkey = Signal()
+    sig_assist_hotkey = Signal()
     sig_enter = Signal()
     sig_escape = Signal()
     sig_update_available = Signal(str)  # tag of newer version
@@ -1885,6 +1893,9 @@ class AppController(QObject):
         self._mouse_listener = None
         self._kbd_listener = None
         self._registered_kbd_hotkey = None
+        self._registered_assist_hotkey = None
+        self._assist_listener = None
+        self.live_assist = None          # created on first use
         self._transient_kbd_handles = []
 
         # Auth + Pro entitlement (Supabase). All network calls run on worker
@@ -1915,6 +1926,8 @@ class AppController(QObject):
         # slot runs on this QObject's owning thread (the Qt main thread),
         # regardless of which thread emits the signal.
         self.sig_hotkey.connect(self._on_hotkey, Qt.QueuedConnection)
+        self.sig_assist_hotkey.connect(self.toggle_live_assist, Qt.QueuedConnection)
+        self._setup_assist_hotkey(self.cfg.get("live_assist_hotkey", ""))
         self.sig_enter.connect(self._on_enter, Qt.QueuedConnection)
         self.sig_escape.connect(self._on_escape, Qt.QueuedConnection)
         self.sig_update_available.connect(self._prompt_update, Qt.QueuedConnection)
@@ -2027,6 +2040,12 @@ class AppController(QObject):
         action_rec_meet = QAction("Record Meeting..." + ("" if is_pro else "   (Pro)"), self)
         action_rec_meet.triggered.connect(self.show_meeting)
         menu.addAction(action_rec_meet)
+
+        assist_key = (self.cfg.get("live_assist_hotkey") or "").strip()
+        action_assist = QAction(
+            "Live Assist overlay" + (f"   ({assist_key})" if assist_key else ""), self)
+        action_assist.triggered.connect(self.toggle_live_assist)
+        menu.addAction(action_assist)
 
         action_history = QAction("History Log", self)
         action_history.triggered.connect(self.show_history)
@@ -2583,6 +2602,68 @@ class AppController(QObject):
             logger.warning("Could not register hotkey %s: %s", hotkey, e)
             return False
         return True
+
+    def _setup_assist_hotkey(self, hotkey):
+        """Second global hotkey: toggles the Live Assist overlay. Kept apart
+        from the dictation hotkey's bookkeeping so re-registering one never
+        tears down the other."""
+        if self._registered_assist_hotkey is not None:
+            try:
+                import keyboard as kbd_lib
+                kbd_lib.remove_hotkey(self._registered_assist_hotkey)
+            except Exception:
+                pass
+            self._registered_assist_hotkey = None
+        if self._assist_listener is not None:
+            try:
+                self._assist_listener.stop()
+            except Exception:
+                pass
+            self._assist_listener = None
+        hotkey = (hotkey or "").strip().lower()
+        if not hotkey or hotkey == (self.cfg.get("hotkey") or "").strip().lower():
+            return False
+        try:
+            if sys.platform == "win32":
+                import keyboard as kbd_lib
+                kbd_lib.add_hotkey(hotkey, lambda: self.sig_assist_hotkey.emit(),
+                                   suppress=False, trigger_on_release=False)
+                self._registered_assist_hotkey = hotkey
+            else:
+                from pynput import keyboard as pynput_keyboard
+                listener = pynput_keyboard.GlobalHotKeys({
+                    self._to_pynput_hotkey(hotkey): lambda: self.sig_assist_hotkey.emit(),
+                })
+                listener.daemon = True
+                listener.start()
+                self._assist_listener = listener
+            logger.info("Registered Live Assist hotkey: %s", hotkey)
+            return True
+        except Exception as e:
+            logger.warning("Could not register Live Assist hotkey %s: %s", hotkey, e)
+            return False
+
+    def toggle_live_assist(self):
+        """Show/hide the private Live Assist overlay (tray item + hotkey)."""
+        try:
+            if self.live_assist is None:
+                from ui.live_assist import LiveAssistOverlay
+                self.live_assist = LiveAssistOverlay(main_app=self)
+                # Feed it from the meeting window's live pipeline.
+                mw = getattr(self, "meetings_win", None)
+                if mw is not None:
+                    mw.sig_chunk.connect(self.live_assist.feed_transcript)
+                    mw.sig_summary.connect(self.live_assist.set_summary)
+                    if getattr(mw, "state", None) == getattr(mw, "STATE_RECORDING", "recording"):
+                        self.live_assist.set_meeting_active(
+                            True, getattr(mw, "_meeting_title", ""),
+                            getattr(mw, "_meeting_attendees", ""))
+                        self.live_assist.feed_transcript(getattr(mw, "_live_text", ""))
+                        self.live_assist.set_summary(getattr(mw, "_live_summary_text", ""))
+            self.live_assist.toggle()
+        except Exception as e:
+            logger.warning("Live Assist failed: %s", e, exc_info=True)
+            self.show_tray_hint("Live Assist", f"Couldn't open the overlay: {e}")
 
     def _unregister_kbd_hotkey(self):
         if self._registered_kbd_hotkey is not None:

@@ -1,0 +1,115 @@
+"""Live Assist: context building, mode plumbing, no-AI fallback, glass helpers.
+
+Pure logic here; the overlay widget is exercised by offscreen smokes and the
+in-session probe. Qt-dependent parts are guarded like test_file_transcribe.
+"""
+import sys
+import unittest
+
+import actions
+import action_api
+import local_llm
+
+
+def _real_qt():
+    try:
+        from PySide6.QtWidgets import QWidget
+        return isinstance(QWidget, type) and QWidget.__module__.startswith("PySide6")
+    except Exception:
+        return False
+
+
+class TestModePlumbing(unittest.TestCase):
+    def test_mode_is_whitelisted(self):
+        # Without this the mode silently degrades to "transcribe only" and the
+        # overlay would echo the transcript back as a "suggestion".
+        self.assertEqual(actions.normalize_action_mode(actions.ACTION_LIVE_ASSIST),
+                         actions.ACTION_LIVE_ASSIST)
+
+    def test_cloud_and_local_prompts_exist(self):
+        cloud = action_api.build_messages("Conversation (latest part):\nhi?", "live_assist")
+        self.assertIn("copilot", cloud[-1]["content"])
+        self.assertIn("They're asking", cloud[-1]["content"])
+        local = local_llm._messages_for("live_assist", "hi?", "auto", "en")
+        self.assertIn("copilot", local[-1]["content"])
+        self.assertLess(len(local[-1]["content"]), len(cloud[-1]["content"]),
+                        "local prompt must stay tighter than the cloud one")
+
+    def test_token_budgets_are_short(self):
+        # It's read at a glance mid-conversation; a wall of text is a failure.
+        self.assertLessEqual(action_api._max_tokens_for("live_assist"), 400)
+        self.assertLessEqual(local_llm._MAX_TOKENS_BY_MODE["live_assist"], 400)
+
+
+class TestBasicFallback(unittest.TestCase):
+    def test_points_at_last_question(self):
+        text = ("Conversation (latest part):\nWe compared both trackers. "
+                "Can you send the calibration code by Friday?")
+        out = actions.process(text, actions.ACTION_LIVE_ASSIST,
+                              model=actions.RULE_BASED_ID, config={})
+        self.assertIn("They're asking: Can you send the calibration code by Friday?", out)
+        self.assertIn("basic mode", out)
+
+    def test_question_from_user_is_answered_honestly(self):
+        text = "Conversation (latest part):\nNothing much.\n\nUser's question: what deadline?"
+        out = actions.process(text, actions.ACTION_LIVE_ASSIST,
+                              model=actions.RULE_BASED_ID, config={})
+        self.assertIn("You asked: what deadline?", out)
+        self.assertIn("can't answer questions", out)
+
+    def test_no_question_gives_latest(self):
+        out = actions._live_assist_basic("Conversation (latest part):\nWe agreed on Friday.")
+        self.assertTrue(out.startswith("Latest: We agreed on Friday."))
+
+
+@unittest.skipUnless(_real_qt(), "real PySide6 not importable (stubbed)")
+class TestRollingContext(unittest.TestCase):
+    def setUp(self):
+        from ui.live_assist import rolling_context, TAIL_CHARS
+        self.rc, self.tail = rolling_context, TAIL_CHARS
+
+    def test_trims_to_tail_at_sentence_boundary(self):
+        text = ("Old stuff nobody needs. " * 400) + "Recent point. Final question?"
+        ctx = self.rc(text)
+        self.assertLessEqual(len(ctx), self.tail + 200)
+        self.assertTrue(ctx.endswith("Final question?"))
+        body = ctx.split("Conversation (latest part):\n", 1)[1]
+        self.assertTrue(body[0].isupper(), "must start at a sentence, not mid-word")
+
+    def test_includes_meta_and_question(self):
+        ctx = self.rc("Hello.", question="What now?", title="Sync", attendees="Aram")
+        self.assertIn("Meeting: Sync", ctx)
+        self.assertIn("Attendees: Aram", ctx)
+        self.assertTrue(ctx.endswith("User's question: What now?"))
+
+    def test_empty_transcript_is_explicit(self):
+        self.assertIn("(nothing transcribed yet)", self.rc(""))
+
+
+class TestGlassHelpers(unittest.TestCase):
+    def test_noop_off_windows_or_without_window(self):
+        from ui import glass
+
+        class NoWin:
+            def winId(self):
+                raise RuntimeError("no native window")
+        w = NoWin()
+        # Every helper must degrade to a harmless False/"" rather than raise.
+        self.assertFalse(glass.exclude_from_capture(w, True))
+        self.assertFalse(glass.is_excluded_from_capture(w))
+        self.assertEqual(glass.apply_backdrop_blur(w), "")
+        self.assertFalse(glass.set_click_through(w, True))
+        self.assertFalse(glass.round_corners(w))
+        glass.remove_backdrop_blur(w)
+
+    def test_support_flag_matches_platform(self):
+        from ui import glass
+        if sys.platform != "win32":
+            self.assertFalse(glass.capture_exclusion_supported())
+        else:
+            self.assertEqual(glass.capture_exclusion_supported(),
+                             glass.windows_build() >= 19041)
+
+
+if __name__ == "__main__":
+    unittest.main()
