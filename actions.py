@@ -14,6 +14,7 @@ ACTION_TRANSLATE = "translate"
 ACTION_SUMMARIZE = "summarize"
 ACTION_MEETING_NOTES = "meeting_notes"
 ACTION_LIVE_ASSIST = "live_assist"       # real-time copilot (ui/live_assist.py)
+ACTION_LIVE_RECAP = "live_recap"         # rolling "so far" summary during a call
 
 RULE_BASED_ID = "rule_based"
 API_OPENAI_ID = "api_openai_compatible"
@@ -133,7 +134,7 @@ class ActionError(RuntimeError):
 _ACTION_MODE_WHITELIST = {
     ACTION_TRANSCRIBE_ONLY, ACTION_SMART_AUTO, ACTION_WRITE_EMAIL,
     ACTION_MAKE_TODO, ACTION_TRANSLATE, ACTION_SUMMARIZE, ACTION_MEETING_NOTES,
-    ACTION_LIVE_ASSIST,
+    ACTION_LIVE_ASSIST, ACTION_LIVE_RECAP,
 }
 
 
@@ -287,6 +288,8 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
         return _meeting_notes_extractive(text)
     if mode == ACTION_LIVE_ASSIST:
         return _live_assist_basic(text)
+    if mode == ACTION_LIVE_RECAP:
+        return _summarize_extractive(text)
     if mode == ACTION_TRANSLATE:
         try:
             return _translate_local(text, source_lang, target_lang)
@@ -299,6 +302,73 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
                     raise ActionError(str(e)) from e
             raise
     return text
+
+
+NO_ENGINE_MESSAGE = ("No AI engine is connected. Sign in to Transcribe Pro, or add an "
+                     "API key in Settings → AI Actions.")
+
+
+def process_stream(text, mode, on_token, source_lang="auto", target_lang="en",
+                   model=RULE_BASED_ID, config=None):
+    """Streaming variant of :func:`process` for the live features: ``on_token``
+    receives text as it is generated; returns the complete text.
+
+    Deliberately has NO rule-based fallback - a live copilot that quietly
+    degrades to keyword extraction is worse than one that says it needs an
+    engine. Raises ActionError with NO_ENGINE_MESSAGE when nothing real can
+    run. Managed (Pro) calls are single-shot today, delivered in one callback."""
+    mode = normalize_action_mode(mode)
+    model = normalize_action_model(model)
+    kind = ACTION_MODELS.get(model, {}).get("kind")
+    if config and config.get("privacy_mode") and kind in ("cloud", "managed"):
+        raise ActionError("Cloud AI engines are off in Privacy Mode - pick a local model "
+                          "in Settings → AI Actions.")
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if model == RULE_BASED_ID or kind is None:
+        raise ActionError(NO_ENGINE_MESSAGE)
+
+    vocab_block = vocabulary.spelling_authority_block(config or {})
+    if vocab_block and config is not None:
+        config = {**config, "_vocab_block": vocab_block}
+
+    try:
+        if kind == "local_llm":
+            if not local_llm.model_downloaded(model):
+                label = local_llm.MODEL_CATALOG.get(model, {}).get("label", model)
+                raise ActionError(f"{label} isn't downloaded yet - download it in "
+                                  "Settings → AI Actions, or choose a cloud engine.")
+            return local_llm.run_action_stream(
+                text, mode, on_token, source_lang=source_lang, target_lang=target_lang,
+                model_id=model, vocab_block=vocab_block)
+        if kind == "cloud":
+            if not config:
+                raise ActionError(NO_ENGINE_MESSAGE)
+            api_config = {**config, "action_api_provider": ACTION_MODELS[model]["provider"]}
+            if (ACTION_MODELS[model]["provider"] == action_api.PROVIDER_GEMINI
+                    and not (api_config.get("action_api_key") or "").strip()):
+                google_key = (config.get("google_api_key") or "").strip()
+                if google_key:
+                    api_config["action_api_key"] = google_key
+            return action_api.run_action_stream(
+                text, mode, api_config, on_token,
+                source_lang=source_lang, target_lang=target_lang)
+        if kind == "managed":
+            token = (config or {}).get("_managed_token")
+            if not token:
+                raise ActionError("Sign in with your Transcribe Pro account to use the "
+                                  "Pro AI engine - or add your own API key in Settings "
+                                  "→ AI Actions.")
+            out = action_api.run_managed_action(
+                text, mode, token, source_lang=source_lang, target_lang=target_lang,
+                vocab_block=vocab_block, image_b64=(config or {}).get("_image_png_b64"))
+            if out:
+                on_token(out)
+            return out
+    except (local_llm.LocalLLMError, action_api.ActionAPIError) as e:
+        raise ActionError(str(e)) from e
+    raise ActionError(NO_ENGINE_MESSAGE)
 
 
 def _live_assist_basic(text):

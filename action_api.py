@@ -1,3 +1,5 @@
+import json
+
 import requests
 
 
@@ -45,6 +47,8 @@ def _max_tokens_for(mode):
         return 600
     if mode == "live_assist":
         return 320
+    if mode == "live_recap":
+        return 220
     if mode == "summarize":
         return 400
     if mode == "write_email":
@@ -114,6 +118,17 @@ def build_messages(text, mode, source_lang="auto", target_lang="en", vocab_block
             "available from the attendees list.\n"
             "- If an attendee list is provided in context, prefer those exact names "
             "when attributing owners."
+        )
+    elif mode == "live_recap":
+        # Rolling "so far" panel during a call: regenerated every ~20 s, read
+        # at a glance. Bullets only.
+        instruction = (
+            "You maintain a live running summary of an ongoing meeting from its "
+            "transcript so far (automatic speech recognition, may be imperfect). "
+            "Output Markdown bullets only - at most 6, under 90 words in total: what "
+            "has been discussed, any decisions, open questions; put the most recent "
+            "developments last and bold the key phrase of each bullet. No headings, "
+            "no preamble. Never invent facts or names."
         )
     elif mode == "live_assist":
         # Real-time copilot during a call. The input is the TAIL of a live
@@ -234,6 +249,151 @@ def anthropic_convo_with_image(convo, image_b64):
             ]
             break
     return out
+
+
+def _sse_data_lines(resp):
+    """Yield the payload of each `data:` line of a server-sent-events stream."""
+    for raw in resp.iter_lines(decode_unicode=True):
+        if not raw:
+            continue
+        line = raw.strip()
+        if not line.startswith("data:"):
+            continue
+        yield line[5:].strip()
+
+
+def _prepare(config, mode, source_lang, target_lang):
+    provider = normalize_provider(config.get("action_api_provider"))
+    key = (config.get("action_api_key") or "").strip()
+    if not key:
+        raise ActionAPIError("Add your action API key before using this action engine.")
+    if config.get("privacy_mode"):
+        raise ActionAPIError("Cloud action APIs are disabled in Privacy Mode.")
+    return provider, key
+
+
+def run_action_stream(text, mode, config, on_token, source_lang="auto", target_lang="en"):
+    """Streaming counterpart of run_action: ``on_token(delta)`` fires as text
+    arrives; returns the full text. Works for OpenAI-compatible endpoints
+    (OpenAI, Groq, Cerebras, ...), Gemini and Anthropic."""
+    provider, key = _prepare(config, mode, source_lang, target_lang)
+    if provider == PROVIDER_GEMINI:
+        return _stream_gemini(text, mode, config, source_lang, target_lang, key, on_token)
+    if provider == PROVIDER_ANTHROPIC:
+        return _stream_anthropic(text, mode, config, source_lang, target_lang, key, on_token)
+    return _stream_openai_compatible(text, mode, config, source_lang, target_lang, key, on_token)
+
+
+def _stream_openai_compatible(text, mode, config, source_lang, target_lang, key, on_token):
+    provider_defaults = defaults(PROVIDER_OPENAI)
+    base_url = (config.get("action_api_base_url") or provider_defaults["default_base_url"]).rstrip("/")
+    model = (config.get("action_api_model") or provider_defaults["default_model"]).strip()
+    payload = {
+        "model": model,
+        "messages": openai_messages_with_image(
+            build_messages(text, mode, source_lang, target_lang,
+                           vocab_block=config.get("_vocab_block", "")),
+            config.get("_image_png_b64")),
+        "temperature": 0.1,
+        "max_tokens": _max_tokens_for(mode),
+        "stream": True,
+    }
+    try:
+        resp = requests.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=payload, stream=True, timeout=(10, 60),
+        )
+    except requests.RequestException as e:
+        raise ActionAPIError(f"Network error reaching the action API: {e}")
+    if not (200 <= resp.status_code < 300):
+        _json_or_error(resp)
+    parts = []
+    for data in _sse_data_lines(resp):
+        if data == "[DONE]":
+            break
+        try:
+            obj = json.loads(data)
+            delta = obj["choices"][0].get("delta", {}).get("content") or ""
+        except Exception:
+            continue
+        if delta:
+            parts.append(delta)
+            on_token(delta)
+    return "".join(parts).strip()
+
+
+def _stream_gemini(text, mode, config, source_lang, target_lang, key, on_token):
+    provider_defaults = defaults(PROVIDER_GEMINI)
+    base_url = (config.get("action_api_base_url") or provider_defaults["default_base_url"]).rstrip("/")
+    model = (config.get("action_api_model") or provider_defaults["default_model"]).strip()
+    messages = build_messages(text, mode, source_lang, target_lang,
+                              vocab_block=config.get("_vocab_block", ""))
+    prompt = "\n\n".join(m["content"] for m in messages)
+    try:
+        resp = requests.post(
+            f"{base_url}/models/{model}:streamGenerateContent?alt=sse",
+            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+            json={"contents": [{"parts": gemini_parts(prompt, config.get("_image_png_b64"))}],
+                  "generationConfig": {"temperature": 0.1}},
+            stream=True, timeout=(10, 60),
+        )
+    except requests.RequestException as e:
+        raise ActionAPIError(f"Network error reaching Gemini: {e}")
+    if not (200 <= resp.status_code < 300):
+        _json_or_error(resp)
+    parts = []
+    for data in _sse_data_lines(resp):
+        try:
+            obj = json.loads(data)
+            for part in obj.get("candidates", [{}])[0].get("content", {}).get("parts", []):
+                delta = part.get("text") or ""
+                if delta:
+                    parts.append(delta)
+                    on_token(delta)
+        except Exception:
+            continue
+    return "".join(parts).strip()
+
+
+def _stream_anthropic(text, mode, config, source_lang, target_lang, key, on_token):
+    provider_defaults = defaults(PROVIDER_ANTHROPIC)
+    base_url = (config.get("action_api_base_url") or provider_defaults["default_base_url"]).rstrip("/")
+    model = (config.get("action_api_model") or provider_defaults["default_model"]).strip()
+    messages = build_messages(text, mode, source_lang, target_lang,
+                              vocab_block=config.get("_vocab_block", ""))
+    system = messages[0]["content"]
+    convo = [m for m in messages[1:] if m.get("role") in ("user", "assistant")]
+    if not convo:
+        convo = [{"role": "user", "content": text}]
+    convo = anthropic_convo_with_image(convo, config.get("_image_png_b64"))
+    try:
+        resp = requests.post(
+            f"{base_url}/messages",
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                     "Content-Type": "application/json"},
+            json={"model": model, "system": system, "messages": convo,
+                  "temperature": 0.1, "max_tokens": _max_tokens_for(mode), "stream": True},
+            stream=True, timeout=(10, 60),
+        )
+    except requests.RequestException as e:
+        raise ActionAPIError(f"Network error reaching Anthropic: {e}")
+    if not (200 <= resp.status_code < 300):
+        _json_or_error(resp)
+    parts = []
+    for data in _sse_data_lines(resp):
+        try:
+            obj = json.loads(data)
+        except Exception:
+            continue
+        if obj.get("type") == "content_block_delta":
+            delta = (obj.get("delta") or {}).get("text") or ""
+            if delta:
+                parts.append(delta)
+                on_token(delta)
+        elif obj.get("type") == "message_stop":
+            break
+    return "".join(parts).strip()
 
 
 def run_action(text, mode, config, source_lang="auto", target_lang="en"):

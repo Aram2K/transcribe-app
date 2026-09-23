@@ -181,6 +181,7 @@ _N_CTX = 8192
 _MAX_TOKENS_BY_MODE = {
     "meeting_notes": 1200,
     "live_assist": 300,
+    "live_recap": 220,
     "summarize": 400,
     "write_email": 360,
     "smart_auto": 600,
@@ -292,6 +293,38 @@ def run_action(text, mode, source_lang="auto", target_lang="en", model_id=QWEN_T
     with _infer_lock_for(model_id):
         return _run_action_locked(llm, text, mode, source_lang, target_lang,
                                   vocab_block)
+
+
+def run_action_stream(text, mode, on_token, source_lang="auto", target_lang="en",
+                      model_id=QWEN_TINY_ID, vocab_block=""):
+    """Like run_action but streams: ``on_token(delta)`` fires for every piece
+    of text as the model produces it; returns the complete text. Inputs that
+    would need the map-reduce path fall back to a single-shot run (one
+    callback with the whole result)."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    llm = _load_model(model_id)
+    with _infer_lock_for(model_id):
+        messages = _messages_for(mode, text, source_lang, target_lang, vocab_block)
+        max_out = _MAX_TOKENS_BY_MODE.get(mode, 240)
+        if mode == "translate" or _messages_tokens(llm, messages) > _N_CTX - max_out - 128:
+            out = _run_action_locked(llm, text, mode, source_lang, target_lang, vocab_block)
+            if out:
+                on_token(out)
+            return out
+        parts = []
+        for chunk in llm.create_chat_completion(
+                messages=messages, temperature=0.1, top_p=0.9, max_tokens=max_out,
+                repeat_penalty=1.08, stream=True):
+            try:
+                delta = chunk["choices"][0].get("delta", {}).get("content") or ""
+            except Exception:
+                delta = ""
+            if delta:
+                parts.append(delta)
+                on_token(delta)
+        return "".join(parts).strip()
 
 
 def _run_action_locked(llm, text, mode, source_lang, target_lang, vocab_block):
@@ -413,6 +446,13 @@ def _messages_for(mode, text, source_lang, target_lang, vocab_block=""):
             "## Open questions  (bullets; skip if none)\n\n"
             "Preserve names exactly (incl. Armenian/Russian). Don't invent facts. "
             "If `[speaker change]` markers appear, use them to attribute who said what."
+        )
+    elif mode == "live_recap":
+        instruction = (
+            "Keep a running summary of an ongoing meeting from the transcript so far "
+            "(speech recognition, may be imperfect). Output Markdown bullets only, at "
+            "most 6, under 90 words: what has been discussed, decisions, open "
+            "questions - most recent last. No headings, no preamble, never invent."
         )
     elif mode == "live_assist":
         # Tighter than the cloud prompt - small local models follow short,

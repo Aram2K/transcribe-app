@@ -3035,6 +3035,13 @@ class Settings(QDialog):
         except Exception:
             entries = []
 
+        # Meetings first: saved folders with notes/transcript/recording. Each
+        # card opens the detail view (Summary / Transcript, Resume, exports).
+        meetings_shown = self._add_meeting_cards(query)
+
+        if not entries and meetings_shown:
+            self._history_vlay.addStretch()
+            return
         if not entries:
             if query:
                 msg = "No transcripts match your search."
@@ -3052,6 +3059,11 @@ class Settings(QDialog):
             self._history_vlay.addStretch()
             return
 
+        if meetings_shown:
+            sec = QLabel("Dictations")
+            sec.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 700; "
+                              "letter-spacing: 1px; margin-top: 6px;")
+            self._history_vlay.addWidget(sec)
         for e in entries[:100]:
             card = QFrame()
             card.setObjectName("cardFrame")
@@ -3069,6 +3081,66 @@ class Settings(QDialog):
             cl.addWidget(body)
             self._history_vlay.addWidget(card)
         self._history_vlay.addStretch()
+
+    def _add_meeting_cards(self, query=""):
+        """Meeting cards at the top of the History list. Returns how many."""
+        try:
+            import meeting_store
+            meetings = meeting_store.list_meetings()
+        except Exception:
+            return 0
+        q = (query or "").lower()
+        shown = 0
+        for m in meetings[:60]:
+            preview = ""
+            try:
+                preview = meeting_store.summary_preview(meeting_store.load_notes(m["dir"]))
+            except Exception:
+                pass
+            hay = f"{m['title']} {m['attendees']} {m['timestamp']} {preview}".lower()
+            if q and q not in hay:
+                continue
+            if shown == 0:
+                sec = QLabel("Meetings")
+                sec.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 700; "
+                                  "letter-spacing: 1px;")
+                self._history_vlay.addWidget(sec)
+            card = QFrame()
+            card.setObjectName("cardFrame")
+            card.setCursor(Qt.PointingHandCursor)
+            card.setToolTip("Open: summary, transcript, resume, export")
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(12, 10, 12, 10)
+            cl.setSpacing(3)
+            title = QLabel(m["title"], card)
+            title.setStyleSheet("font-weight: 700; font-size: 13px;")
+            cl.addWidget(title)
+            bits = [m["timestamp"], meeting_store.format_duration(m["duration_sec"])]
+            if m["attendees"]:
+                bits.append(m["attendees"])
+            if m["audio_parts"]:
+                bits.append("recording saved")
+            meta = QLabel("   ·   ".join(b for b in bits if b), card)
+            meta.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            cl.addWidget(meta)
+            if preview:
+                body = QLabel(preview, card)
+                body.setWordWrap(True)
+                body.setStyleSheet("color: #475569;")
+                cl.addWidget(body)
+            card.mousePressEvent = lambda e, d=m["dir"]: self._open_meeting(d)
+            self._history_vlay.addWidget(card)
+            shown += 1
+        return shown
+
+    def _open_meeting(self, folder):
+        try:
+            from ui.meeting_detail import MeetingDetailDialog
+            dlg = MeetingDetailDialog(folder, main_app=self.app, parent=self)
+            dlg.exec()
+        except Exception as e:
+            QMessageBox.warning(self, "Meeting", f"Couldn't open this meeting:\n{e}")
+        self._populate_history_list()
 
     def _clear_all_history(self):
         reply = QMessageBox.question(

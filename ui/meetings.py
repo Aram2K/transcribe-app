@@ -101,6 +101,10 @@ class MeetingsWindow(QDialog):
         self._chunks_lock = threading.Lock()
         self._record_started_at = None
         self._meeting_dir = None
+        # Resume-session state (set by resume_meeting, cleared when notes land).
+        self._resume_dir = None
+        self._resume_prior = ""
+        self._resume_prior_duration = 0
         self._chunks_path = None
         self._final_notes = ""
         self._final_transcript = ""
@@ -604,10 +608,14 @@ class MeetingsWindow(QDialog):
             self.app.cfg["action_model"] = self.combo_action.currentData()
         self.app.save_config()
 
-        # Build local timestamp folder for auto-save recovery
+        # Build local timestamp folder for auto-save recovery (a resumed
+        # meeting keeps writing into its original folder).
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         try:
-            self._meeting_dir = storage.path_for("meetings") / timestamp
+            if getattr(self, "_resume_dir", None) is not None:
+                self._meeting_dir = self._resume_dir
+            else:
+                self._meeting_dir = storage.path_for("meetings") / timestamp
             self._meeting_dir.mkdir(parents=True, exist_ok=True)
             self._chunks_path = self._meeting_dir / "chunks.jsonl"
         except OSError as e:
@@ -640,6 +648,9 @@ class MeetingsWindow(QDialog):
         la = getattr(self.app, "live_assist", None)
         if la is not None:
             la.set_meeting_active(True, self._meeting_title, self._meeting_attendees)
+            prior = getattr(self, "_resume_prior", "")
+            if prior:
+                la.feed_transcript(prior[-1500:])     # earlier context for suggestions
         self._live_text = ""
         self._live_summary_text = ""
         self._last_summary_at = time.time()
@@ -765,29 +776,55 @@ class MeetingsWindow(QDialog):
         }.get(mode, "Capturing")
         self.lbl_rec_timer.setText(f"REC  ·  {dur_str}  ·  {mode_label}")
 
-        # Rolling live summary: regenerate (locally, off the GUI thread) every
-        # SUMMARY_INTERVAL seconds while there's new transcript to summarize.
-        SUMMARY_INTERVAL = 15.0
+        # Rolling live summary: regenerate (off the GUI thread) every
+        # SUMMARY_INTERVAL seconds once enough NEW speech has arrived - an LLM
+        # call per tick would burn quota re-summarising the same text.
+        SUMMARY_INTERVAL = 20.0
         now = time.time()
+        grown = len(self._live_text) - getattr(self, "_summary_len_at_last", 0)
         if (not self._summary_running
                 and self._live_text.strip()
+                and grown >= 160
                 and now - self._last_summary_at >= SUMMARY_INTERVAL):
             self._last_summary_at = now
+            self._summary_len_at_last = len(self._live_text)
             self._summary_running = True
             snapshot = self._live_text
             threading.Thread(target=self._compute_live_summary,
                              args=(snapshot,), daemon=True).start()
 
+    def _live_engine(self):
+        """A REAL engine for live features (no rule-based): the configured
+        notes engine with Pro routing, else a downloaded local model, else
+        (None, cfg)."""
+        engine, cfg = self.app._resolve_action_engine()
+        info = actions.ACTION_MODELS.get(engine, {})
+        kind = info.get("kind")
+        has_key = bool((self.app.cfg.get("action_api_key") or "").strip())
+        if (not has_key
+                and info.get("provider") == getattr(action_api, "PROVIDER_GEMINI", None)):
+            has_key = bool((self.app.cfg.get("google_api_key") or "").strip())
+        has_token = bool((cfg or {}).get("_managed_token"))
+        if engine == actions.RULE_BASED_ID or (kind == "cloud" and not has_key) \
+                or (kind == "managed" and not has_token):
+            local = actions._first_downloaded_local_model()
+            return (local, cfg) if local else (None, cfg)
+        return engine, cfg
+
     def _compute_live_summary(self, transcript):
-        # Worker thread: build a cheap, fully-local extractive summary so the
-        # live panel never spends cloud quota or blocks the GUI. The polished
-        # final summary (cloud for Pro) is produced separately on Stop.
+        # Worker thread: the rolling "so far" panel is written by a real LLM
+        # (live_recap mode - short bullets). No rule-based fallback: if no
+        # engine can run, the panel says how to connect one instead of
+        # showing keyword extraction dressed up as a summary.
         summary = ""
         try:
-            summary = actions.process(
-                transcript, actions.ACTION_MEETING_NOTES,
-                model=actions.RULE_BASED_ID,
-                config=self.app.cfg if self.app else None)
+            engine, cfg = self._live_engine()
+            if engine is None:
+                summary = ("_Connect an AI engine for a live summary: sign in to "
+                           "Transcribe Pro, or add a key in Settings → AI Actions._")
+            else:
+                summary = actions.process(
+                    transcript, actions.ACTION_LIVE_RECAP, model=engine, config=cfg)
         except Exception as e:
             logger.debug("Live summary failed: %s", e)
         finally:
@@ -803,7 +840,10 @@ class MeetingsWindow(QDialog):
         if self.state != self.STATE_RECORDING:
             return
         self._live_summary_text = text
-        self.live_summary_log.setPlainText(text)
+        try:
+            self.live_summary_log.setMarkdown(text)
+        except Exception:
+            self.live_summary_log.setPlainText(text)
 
     def _stop_meeting(self):
         if not self.app or self.state != self.STATE_RECORDING:
@@ -894,6 +934,13 @@ class MeetingsWindow(QDialog):
             except Exception as e:
                 logger.warning("Speaker attribution failed, using plain transcript: %s", e)
 
+            # A resumed meeting continues its earlier transcript.
+            prior = getattr(self, "_resume_prior", "")
+            if prior:
+                self._final_transcript = (
+                    f"{prior}\n\n— Resumed {time.strftime('%Y-%m-%d %H:%M')} —\n\n"
+                    f"{self._final_transcript}")
+
             # Persist the transcript to disk IMMEDIATELY - before the summary -
             # so a summary failure (missing key, network, server error) can never
             # lose the recording. This is the durable copy alongside chunks.jsonl.
@@ -902,6 +949,19 @@ class MeetingsWindow(QDialog):
                     f.write(self._final_transcript)
             except OSError:
                 pass
+
+            # Keep the raw recording too (one WAV per segment, never overwritten)
+            # so it can be exported later from History.
+            try:
+                import audio_export
+                import meeting_store
+                audio = self.app.recorder.get_full_audio()
+                if audio is not None and len(audio) > 1600:
+                    self._emit_status("Saving the recording…")
+                    audio_export.write_wav(
+                        meeting_store.next_audio_part_path(self._meeting_dir), audio)
+            except Exception as e:
+                logger.warning("Could not save meeting audio: %s", e)
 
             # 2. Summarize as a separate step so the Done page's "Retry Summary"
             # can re-run just this part on the saved transcript (no re-record).
@@ -1015,7 +1075,8 @@ class MeetingsWindow(QDialog):
                         json.dump({
                             "title": self._meeting_title,
                             "attendees": self._meeting_attendees,
-                            "duration_sec": int(time.time() - self._record_started_at) if self._record_started_at else 0,
+                            "duration_sec": (int(time.time() - self._record_started_at) if self._record_started_at else 0)
+                                            + int(getattr(self, "_resume_prior_duration", 0) or 0),
                             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                         }, f)
             except Exception:
@@ -1054,6 +1115,7 @@ class MeetingsWindow(QDialog):
 
         self.state = self.STATE_DONE
         self._final_notes = notes
+        self._clear_resume_state()
         # Keep Retry (and its engine picker) visible when the notes were
         # produced by the downgrade fallback - "success" via the built-in
         # formatter is exactly the case the picker exists for.
@@ -1085,6 +1147,36 @@ class MeetingsWindow(QDialog):
 
         from main import APP_VERSION
         telemetry.track("meeting_notes_completed", {}, self.app.cfg, APP_VERSION)
+
+    def resume_meeting(self, folder):
+        """Continue a saved meeting from History: same folder, the new segment
+        is appended to the transcript (with a 'Resumed' marker) and saved as
+        the next audio part; the notes are regenerated from everything."""
+        import meeting_store
+        from pathlib import Path
+        if self.state == self.STATE_RECORDING:
+            QMessageBox.information(self, "Already recording",
+                                    "Stop the current meeting before resuming another.")
+            return
+        meta = meeting_store.load_meta(folder)
+        self._resume_dir = Path(folder)
+        self._resume_prior = meeting_store.load_transcript(folder).strip()
+        self._resume_prior_duration = int(meta.get("duration_sec") or 0)
+        self.input_title.setText(meta.get("title") or "Untitled Meeting")
+        self.input_attendees.setText(meta.get("attendees") or "")
+        self.state = self.STATE_IDLE
+        self.container.setCurrentIndex(0)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self._start_meeting()
+        if self.state != self.STATE_RECORDING:
+            self._resume_dir, self._resume_prior, self._resume_prior_duration = None, "", 0
+
+    def _clear_resume_state(self):
+        self._resume_dir = None
+        self._resume_prior = ""
+        self._resume_prior_duration = 0
 
     def _render_transcript(self, transcript):
         """Readable transcript: bold slate speaker labels and real line spacing

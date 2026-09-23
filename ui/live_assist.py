@@ -327,6 +327,7 @@ class _DragBar(QFrame):
 class LiveAssistOverlay(QWidget):
     sig_suggestion = Signal(str, str)     # text, error
     sig_status = Signal(str)              # short footer note from the worker
+    sig_partial = Signal(str)             # streamed text so far
 
     def __init__(self, main_app=None):
         super().__init__()
@@ -366,6 +367,8 @@ class LiveAssistOverlay(QWidget):
 
         self.sig_suggestion.connect(self._on_suggestion)
         self.sig_status.connect(self._set_status)
+        self.sig_partial.connect(self._on_partial)
+        self._first_token_at = 0.0
         self._build()
         self._richify_tooltips()
         self._apply_theme()
@@ -445,11 +448,13 @@ class LiveAssistOverlay(QWidget):
 
         self.lbl_now_head = QLabel("NOW", self.body)
         body.addWidget(self.lbl_now_head)
-        self.txt_now = QLabel("Press Listen and the last thing said in the call "
-                              "will appear here.", self.body)
+        self.txt_now = QLabel("", self.body)
         self.txt_now.setWordWrap(True)
         self.txt_now.setObjectName("laNow")
         body.addWidget(self.txt_now)
+        # Nothing to show before a session - no placeholder copy.
+        self.lbl_now_head.hide()
+        self.txt_now.hide()
 
         self.lbl_sum_head = QLabel("SO FAR", self.body)
         body.addWidget(self.lbl_sum_head)
@@ -1009,7 +1014,9 @@ class LiveAssistOverlay(QWidget):
             self._live_text = ""
             self._summary = ""
             self._title, self._attendees = title or "", attendees or ""
-            self.txt_now.setText("Listening… the last thing said will appear here.")
+            self.txt_now.setText("Listening…")
+            self.lbl_now_head.show()
+            self.txt_now.show()
             self.txt_summary.clear()
             self.lbl_status.setText("")
         else:
@@ -1025,6 +1032,9 @@ class LiveAssistOverlay(QWidget):
         self._text_since_suggest += len(piece)
         sentences = [s for s in re.split(r"(?<=[.!?])\s+", self._live_text) if s]
         self.txt_now.setText(" ".join(sentences[-2:])[-260:])
+        if not self.txt_now.isVisible() and self._expanded:
+            self.lbl_now_head.show()
+            self.txt_now.show()
 
     def set_summary(self, text):
         self._summary = text or ""
@@ -1061,6 +1071,7 @@ class LiveAssistOverlay(QWidget):
             image_b64 = capture_screen_png_b64(self.screen() or QApplication.primaryScreen())
         self._suggesting = True
         self._suggest_started = time.time()
+        self._first_token_at = 0.0
         self._text_since_suggest = 0
         self.btn_suggest.setEnabled(False)
         self.txt_suggestion.setPlainText("Thinking…")
@@ -1074,13 +1085,18 @@ class LiveAssistOverlay(QWidget):
     def _resolve_engine(self):
         """Engine for suggestions: the configured notes engine with Pro routing;
         if that engine can't run (managed without Pro, cloud without its key),
-        prefer a downloaded local model, else the built-in basic mode."""
+        prefer a downloaded local model. Returns (None, cfg) when no REAL
+        engine can run - there is deliberately no rule-based fallback."""
         engine, cfg = self.app._resolve_action_engine()
         info = actions.ACTION_MODELS.get(engine, {})
         kind = info.get("kind")
         has_key = bool((self.app.cfg.get("action_api_key") or "").strip())
+        if (not has_key and info.get("provider") == getattr(actions.action_api,
+                                                              "PROVIDER_GEMINI", None)):
+            has_key = bool((self.app.cfg.get("google_api_key") or "").strip())
         has_token = bool((cfg or {}).get("_managed_token"))
-        if (kind == "cloud" and not has_key) or (kind == "managed" and not has_token):
+        if engine == actions.RULE_BASED_ID or (kind == "cloud" and not has_key) \
+                or (kind == "managed" and not has_token):
             try:
                 import local_llm
                 for mid in local_llm.MODEL_CATALOG:
@@ -1088,12 +1104,15 @@ class LiveAssistOverlay(QWidget):
                         return mid, cfg
             except Exception:
                 pass
-            return actions.RULE_BASED_ID, cfg
+            return None, cfg
         return engine, cfg
 
     def _suggest_worker(self, context, image_b64):
         try:
             engine, cfg = self._resolve_engine()
+            if engine is None:
+                self.sig_suggestion.emit("", actions.NO_ENGINE_MESSAGE)
+                return
             kind = actions.ACTION_MODELS.get(engine, {}).get("kind")
             cfg = dict(cfg or {})
             if image_b64 and kind in ("cloud", "managed"):
@@ -1101,11 +1120,30 @@ class LiveAssistOverlay(QWidget):
             elif image_b64:
                 self.sig_status.emit("Screen needs a cloud AI engine (Pro or your own "
                                      "key) - answered from the transcript only.")
-            text = actions.process(context, actions.ACTION_LIVE_ASSIST,
-                                   model=engine, config=cfg)
-            self.sig_suggestion.emit(text or "", "")
+            acc = []
+            last_emit = [0.0]
+
+            def on_token(delta):
+                acc.append(delta)
+                now = time.time()
+                if now - last_emit[0] >= 0.08:      # ~12 UI updates/s is plenty
+                    last_emit[0] = now
+                    self.sig_partial.emit("".join(acc))
+
+            text = actions.process_stream(context, actions.ACTION_LIVE_ASSIST, on_token,
+                                          model=engine, config=cfg)
+            self.sig_suggestion.emit((text or "".join(acc)).strip(), "")
         except Exception as e:
             self.sig_suggestion.emit("", str(e)[:240])
+
+    def _on_partial(self, text):
+        if not self._suggesting:
+            return
+        if not self._first_token_at:
+            self._first_token_at = time.time()
+        self.txt_suggestion.setPlainText(text)
+        sb = self.txt_suggestion.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def _on_suggestion(self, text, error):
         self._suggesting = False
@@ -1117,8 +1155,11 @@ class LiveAssistOverlay(QWidget):
             return
         render_markdown(self.txt_suggestion, text.strip() or "(no suggestion)")
         if not self.lbl_status.text().startswith("Screen"):
+            first = (f"first words {self._first_token_at - self._suggest_started:.1f}s · "
+                     if self._first_token_at else "")
             self.lbl_status.setText(
-                f"Updated {time.strftime('%H:%M:%S')} · {took:.1f}s · AI can be wrong - check facts")
+                f"Updated {time.strftime('%H:%M:%S')} · {first}done {took:.1f}s · "
+                "AI can be wrong - check facts")
         self.input_ask.clear()
 
     def _on_auto_toggled(self, on):
@@ -1138,7 +1179,7 @@ class LiveAssistOverlay(QWidget):
             self._update_timer()
         if self._suggesting:
             el = int(time.time() - self._suggest_started)
-            if el >= 3:
+            if el >= 3 and not self._first_token_at:
                 self.txt_suggestion.setPlainText(f"Thinking… {el}s")
             return
         if (self._auto and self._meeting_active and self.isVisible()
