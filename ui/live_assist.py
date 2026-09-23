@@ -460,7 +460,7 @@ class LiveAssistOverlay(QWidget):
         body.addWidget(self.txt_summary)
 
         head_row = QHBoxLayout()
-        self.lbl_sug_head = QLabel("SUGGESTION · CHECK FACTS", self.body)
+        self.lbl_sug_head = QLabel("SUGGESTION", self.body)
         self.lbl_sug_head.setToolTip("AI suggestions can be wrong - treat them as notes, "
                                      "not facts.")
         head_row.addWidget(self.lbl_sug_head)
@@ -1117,7 +1117,8 @@ class LiveAssistOverlay(QWidget):
             return
         render_markdown(self.txt_suggestion, text.strip() or "(no suggestion)")
         if not self.lbl_status.text().startswith("Screen"):
-            self.lbl_status.setText(f"Updated {time.strftime('%H:%M:%S')} · {took:.1f}s")
+            self.lbl_status.setText(
+                f"Updated {time.strftime('%H:%M:%S')} · {took:.1f}s · AI can be wrong - check facts")
         self.input_ask.clear()
 
     def _on_auto_toggled(self, on):
