@@ -6,6 +6,7 @@ import requests
 PROVIDER_OPENAI = "openai_compatible"
 PROVIDER_GEMINI = "gemini"
 PROVIDER_ANTHROPIC = "anthropic"
+PROVIDER_CEREBRAS = "cerebras"      # OpenAI-compatible wire; fastest inference (vision-capable Qwen)
 
 PROVIDERS = {
     PROVIDER_OPENAI: {
@@ -26,7 +27,51 @@ PROVIDERS = {
         "default_base_url": "https://api.anthropic.com/v1",
         "default_model": "claude-sonnet-4-6",
     },
+    PROVIDER_CEREBRAS: {
+        # Verified Sept 2026: qwen-3.8-27b streams ~1,850 tok/s, accepts PNG
+        # images as data URIs, and needs reasoning_effort "none" or it thinks
+        # for seconds first. Same /chat/completions wire as OpenAI.
+        "label": "Cerebras (fastest · vision)",
+        "description": "Sub-second answers for Live Prompter. Key from cloud.cerebras.ai.",
+        "default_base_url": "https://api.cerebras.ai/v1",
+        "default_model": "qwen-3.8-27b",
+        "default_recap_model": "gpt-oss-120b",
+    },
 }
+
+# Models that think before answering unless told not to. For the live
+# features every second of hidden reasoning is a second the user waits.
+_NO_REASONING_FAMILIES = ("qwen-3.", "qwen3.", "qwen/qwen3.")
+_MIN_LOW_FAMILIES = ("gpt-oss",)          # cannot disable reasoning, only lower it
+
+
+def reasoning_effort_for(model, configured=""):
+    """The reasoning_effort to send for ``model`` (or None to omit): the
+    explicit setting wins; otherwise thinking models default to "none", and
+    gpt-oss (which rejects "none") is floored at "low"."""
+    m = (model or "").lower()
+    val = (configured or "").strip().lower()
+    if not val:
+        if any(f in m for f in _NO_REASONING_FAMILIES):
+            val = "none"
+        elif any(f in m for f in _MIN_LOW_FAMILIES):
+            val = "low"
+        else:
+            return None
+    if val == "none" and any(f in m for f in _MIN_LOW_FAMILIES):
+        val = "low"
+    return val
+
+
+def model_for(config, mode, provider_defaults):
+    """Model id for this call: an optional cheaper/faster model for the
+    rolling recap (action_api_model_recap), else the configured model, else
+    the provider default."""
+    if mode == "live_recap":
+        recap = (config.get("action_api_model_recap") or "").strip()
+        if recap:
+            return recap
+    return (config.get("action_api_model") or provider_defaults["default_model"]).strip()
 
 
 class ActionAPIError(RuntimeError):
@@ -56,8 +101,18 @@ def _max_tokens_for(mode):
     return 240
 
 
+_ENGINE_TO_PROVIDER = {
+    "api_openai_compatible": PROVIDER_OPENAI,
+    "api_gemini": PROVIDER_GEMINI,
+    "api_anthropic": PROVIDER_ANTHROPIC,
+    "api_cerebras": PROVIDER_CEREBRAS,
+}
+
+
 def normalize_provider(provider):
-    return provider if provider in PROVIDERS else PROVIDER_OPENAI
+    if provider in PROVIDERS:
+        return provider
+    return _ENGINE_TO_PROVIDER.get(provider, PROVIDER_OPENAI)
 
 
 def defaults(provider):
@@ -285,9 +340,9 @@ def run_action_stream(text, mode, config, on_token, source_lang="auto", target_l
 
 
 def _stream_openai_compatible(text, mode, config, source_lang, target_lang, key, on_token):
-    provider_defaults = defaults(PROVIDER_OPENAI)
+    provider_defaults = defaults(config.get("action_api_provider"))
     base_url = (config.get("action_api_base_url") or provider_defaults["default_base_url"]).rstrip("/")
-    model = (config.get("action_api_model") or provider_defaults["default_model"]).strip()
+    model = model_for(config, mode, provider_defaults)
     payload = {
         "model": model,
         "messages": openai_messages_with_image(
@@ -298,6 +353,9 @@ def _stream_openai_compatible(text, mode, config, source_lang, target_lang, key,
         "max_tokens": _max_tokens_for(mode),
         "stream": True,
     }
+    effort = reasoning_effort_for(model, config.get("action_api_reasoning_effort"))
+    if effort:
+        payload["reasoning_effort"] = effort
     try:
         resp = requests.post(
             f"{base_url}/chat/completions",
@@ -412,9 +470,9 @@ def run_action(text, mode, config, source_lang="auto", target_lang="en"):
 
 
 def _run_openai_compatible(text, mode, config, source_lang, target_lang, key):
-    provider_defaults = defaults(PROVIDER_OPENAI)
+    provider_defaults = defaults(config.get("action_api_provider"))
     base_url = (config.get("action_api_base_url") or provider_defaults["default_base_url"]).rstrip("/")
-    model = (config.get("action_api_model") or provider_defaults["default_model"]).strip()
+    model = model_for(config, mode, provider_defaults)
     payload = {
         "model": model,
         "messages": openai_messages_with_image(
@@ -424,6 +482,9 @@ def _run_openai_compatible(text, mode, config, source_lang, target_lang, key):
         "temperature": 0.1,
         "max_tokens": _max_tokens_for(mode),
     }
+    effort = reasoning_effort_for(model, config.get("action_api_reasoning_effort"))
+    if effort:
+        payload["reasoning_effort"] = effort
     resp = requests.post(
         f"{base_url}/chat/completions",
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},

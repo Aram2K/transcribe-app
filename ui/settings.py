@@ -1673,6 +1673,9 @@ class Settings(QDialog):
                              "Content-Type": "application/json"},
                     json={"model": m, "max_tokens": 1,
                           "messages": [{"role": "user", "content": "ping"}]}, timeout=20)
+            elif provider == actions.API_CEREBRAS_ID:
+                b = (base or "https://api.cerebras.ai/v1").rstrip("/")
+                r = requests.get(f"{b}/models", headers={"Authorization": f"Bearer {key}"}, timeout=20)
             else:  # OpenAI-compatible
                 b = (base or "https://api.openai.com/v1").rstrip("/")
                 r = requests.get(f"{b}/models", headers={"Authorization": f"Bearer {key}"}, timeout=20)
@@ -2044,6 +2047,7 @@ class Settings(QDialog):
         # NOTE: the rule-based formatter is no longer offered as a pickable
         # engine - it survives only as the app's invisible safety fallback
         # (privacy mode, lapsed Pro, missing local model).
+        self.combo_engine.addItem("Cerebras API - fastest, vision (Cloud Engine)", actions.API_CEREBRAS_ID)
         self.combo_engine.addItem("Google Gemini API (Cloud Engine)", actions.API_GEMINI_ID)
         self.combo_engine.addItem("OpenAI-compatible API (Cloud Engine)", actions.API_OPENAI_ID)
         self.combo_engine.addItem("Anthropic Claude API (Cloud Engine)", actions.API_ANTHROPIC_ID)
@@ -2646,6 +2650,39 @@ class Settings(QDialog):
                 if idx >= 0:
                     self.cloud_api_model.setCurrentIndex(idx)
                 
+            elif provider == actions.API_CEREBRAS_ID:
+                # The "instant" engine (verified Sept 2026): qwen-3.8-27b
+                # streams ~1,850 tok/s with vision; gpt-oss-120b is the cheap
+                # text-only pick for the rolling recap. Same OpenAI wire.
+                self.lbl_cloud_url.setVisible(True)
+                self.cloud_api_url.setVisible(True)
+                self.cloud_api_url.setPlaceholderText("https://api.cerebras.ai/v1")
+                models_info = [
+                    ("qwen-3.8-27b  -  fastest, vision  (~$0.99 in / $1.49 out per 1M)", "qwen-3.8-27b"),
+                    ("gpt-oss-120b  -  text only, cheaper  (~$0.35 in / $0.75 out per 1M)", "gpt-oss-120b"),
+                ]
+                for label, model_id in models_info:
+                    self.cloud_api_model.addItem(label, model_id)
+                self.cloud_api_model.addItem("Custom Model...")
+                self.cloud_api_key.setText(self.cfg_working.get("action_api_key", ""))
+                url = (self.cfg_working.get("action_api_base_url", "") or "").strip()
+                if "cerebras" not in url:
+                    url = "https://api.cerebras.ai/v1"
+                self.cloud_api_url.setText(url)
+
+                saved_model = self.cfg_working.get("action_api_model", "") or "qwen-3.8-27b"
+                if saved_model in set(gemini_models + anthropic_models + openai_models):
+                    saved_model = "qwen-3.8-27b"
+                idx = self.cloud_api_model.findData(saved_model)
+                if idx < 0:
+                    idx = self.cloud_api_model.findText(saved_model)
+                    if idx < 0 and saved_model != "Custom Model...":
+                        insert_idx = max(0, self.cloud_api_model.count() - 1)
+                        self.cloud_api_model.insertItem(insert_idx, saved_model)
+                        idx = insert_idx
+                if idx >= 0:
+                    self.cloud_api_model.setCurrentIndex(idx)
+
             else: # OpenAI
                 self.lbl_cloud_url.setVisible(True)
                 self.cloud_api_url.setVisible(True)
@@ -2907,6 +2944,7 @@ class Settings(QDialog):
             cloud_ids = {
                 actions.API_MANAGED_ID, actions.API_GEMINI_ID,
                 actions.API_OPENAI_ID, actions.API_ANTHROPIC_ID,
+                actions.API_CEREBRAS_ID,
             }
             model = self.combo_engine.model()
             for i in range(self.combo_engine.count()):

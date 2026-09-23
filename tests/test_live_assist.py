@@ -198,3 +198,33 @@ class TestGlassHelpers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFastProviderPlumbing(unittest.TestCase):
+    def test_reasoning_effort_defaults(self):
+        f = action_api.reasoning_effort_for
+        # Thinking models must be told not to think unless configured.
+        self.assertEqual(f("qwen-3.8-27b"), "none")
+        self.assertEqual(f("qwen/qwen3.8-27b"), "none")
+        # gpt-oss cannot disable reasoning: floor at low, even if asked for none.
+        self.assertEqual(f("gpt-oss-120b"), "low")
+        self.assertEqual(f("gpt-oss-120b", "none"), "low")
+        # Explicit setting wins; unknown models send nothing.
+        self.assertEqual(f("qwen-3.8-27b", "low"), "low")
+        self.assertIsNone(f("gpt-4o-mini"))
+
+    def test_recap_model_override(self):
+        d = action_api.defaults(action_api.PROVIDER_CEREBRAS)
+        self.assertEqual(d["default_model"], "qwen-3.8-27b")
+        self.assertEqual(action_api.model_for({}, "live_assist", d), "qwen-3.8-27b")
+        self.assertEqual(action_api.model_for({"action_api_model_recap": "gpt-oss-120b"},
+                                              "live_recap", d), "gpt-oss-120b")
+        self.assertEqual(action_api.model_for({"action_api_model_recap": "gpt-oss-120b"},
+                                              "live_assist", d), "qwen-3.8-27b")
+
+    def test_cerebras_is_a_registered_cloud_engine(self):
+        info = actions.ACTION_MODELS[actions.API_CEREBRAS_ID]
+        self.assertEqual(info["kind"], "cloud")
+        self.assertEqual(info["provider"], action_api.PROVIDER_CEREBRAS)
+        self.assertEqual(action_api.defaults(action_api.PROVIDER_CEREBRAS)["default_base_url"],
+                         "https://api.cerebras.ai/v1")

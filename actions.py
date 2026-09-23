@@ -20,6 +20,7 @@ RULE_BASED_ID = "rule_based"
 API_OPENAI_ID = "api_openai_compatible"
 API_GEMINI_ID = "api_gemini"
 API_ANTHROPIC_ID = "api_anthropic"
+API_CEREBRAS_ID = "api_cerebras"
 API_MANAGED_ID = "managed"  # Pro: runs through the server (founder's Mistral key)
 
 ACTION_MODES = {
@@ -74,6 +75,14 @@ ACTION_MODELS = {
         "available": True,
         "kind": "cloud",
         "provider": action_api.PROVIDER_ANTHROPIC,
+    },
+    API_CEREBRAS_ID: {
+        "label": "Cerebras API (fastest · vision)",
+        "description": "Sub-second streamed answers - the engine Live Prompter is built for. "
+                       "Key from cloud.cerebras.ai.",
+        "available": True,
+        "kind": "cloud",
+        "provider": action_api.PROVIDER_CEREBRAS,
     },
 }
 
