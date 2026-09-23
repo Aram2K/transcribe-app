@@ -339,7 +339,8 @@ def start_ipc_server(server_sock, on_action):
             try:
                 conn, _ = server_sock.accept()
                 data = conn.recv(64).decode("utf-8", errors="ignore").strip()
-                if data in ("show_settings", "show_onboarding"):
+                if data in ("show_settings", "show_onboarding", "show_meeting",
+                            "live_prompter"):
                     conn.sendall(b"transcribe-ok")
                 conn.close()
                 if data:
@@ -2622,8 +2623,11 @@ class AppController(QObject):
             except Exception:
                 pass
             self._assist_listener = None
-        hotkey = (hotkey or "").strip().lower()
-        if not hotkey or hotkey == (self.cfg.get("hotkey") or "").strip().lower():
+        # Normalise "Alt + E" -> "alt+e" (what the keyboard library expects).
+        hotkey = "+".join(p.strip().lower() for p in (hotkey or "").split("+") if p.strip())
+        dictation = "+".join(p.strip().lower()
+                             for p in (self.cfg.get("hotkey") or "").split("+") if p.strip())
+        if not hotkey or hotkey == dictation:
             return False
         try:
             if sys.platform == "win32":
@@ -3415,7 +3419,18 @@ def main():
     controller = AppController(qapp)
 
     # Attach lock socket IPC listener
-    start_ipc_server(lock_sock, lambda action: QTimer.singleShot(0, lambda: controller.show_settings()))
+    # A second launch (or `python main.py <action>`) hands its action to the
+    # running instance: "show_settings" (default), "show_meeting", or
+    # "live_prompter" to toggle the overlay.
+    def _ipc_dispatch(action):
+        if action == "live_prompter":
+            controller.toggle_live_assist()
+        elif action == "show_meeting":
+            controller.show_meeting()
+        else:
+            controller.show_settings()
+    start_ipc_server(lock_sock, lambda action: QTimer.singleShot(
+        0, lambda a=action: _ipc_dispatch(a)))
 
     # The Settings panel IS the app - show it on every launch. The only quiet
     # launch is the Windows-startup shortcut (--background), and the first run

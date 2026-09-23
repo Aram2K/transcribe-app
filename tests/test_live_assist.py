@@ -102,7 +102,12 @@ class TestOverlayHelpers(unittest.TestCase):
         self.assertEqual(ps(True, True, True, False)[0], "unavailable")    # remote session
         self.assertEqual(ps(False, True, False, False)[0], "off")
         for args in ((True, False, False, True), (True, True, True, True)):
-            self.assertNotIn("not in your screen share", ps(*args)[1])
+            self.assertNotIn("not in share", ps(*args)[1])
+        # Header budget: every chip text must stay short enough not to clip.
+        for args in ((True, True, False, True), (True, True, False, False),
+                     (True, False, False, False), (True, True, True, False),
+                     (False, True, False, False)):
+            self.assertLessEqual(len(ps(*args)[1]), 24, ps(*args)[1])
 
     def test_position_clamped_onto_a_live_screen(self):
         rects = [(0, 0, 1920, 1080)]
@@ -120,6 +125,50 @@ class TestOverlayHelpers(unittest.TestCase):
         self.assertEqual(labels[0], "Say next")
         self.assertEqual(self.la.QUICK_ACTIONS[0][1], "")     # default = plain Suggest
         self.assertTrue(all(q for _, q in self.la.QUICK_ACTIONS[1:]))
+
+
+class TestImagePlumbing(unittest.TestCase):
+    MSGS = [{"role": "system", "content": "sys"},
+            {"role": "user", "content": "example"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "the real question"}]
+
+    def test_openai_attaches_to_last_user_turn_only(self):
+        out = action_api.openai_messages_with_image(self.MSGS, "AAAA")
+        self.assertEqual(out[1]["content"], "example")          # few-shot untouched
+        parts = out[3]["content"]
+        self.assertEqual(parts[0], {"type": "text", "text": "the real question"})
+        self.assertTrue(parts[1]["image_url"]["url"].startswith("data:image/png;base64,AAAA"))
+        self.assertEqual(self.MSGS[3]["content"], "the real question")   # input not mutated
+
+    def test_no_image_is_a_plain_copy(self):
+        self.assertEqual(action_api.openai_messages_with_image(self.MSGS, None), self.MSGS)
+
+    def test_gemini_and_anthropic_shapes(self):
+        parts = action_api.gemini_parts("p", "AAAA")
+        self.assertEqual(parts[0], {"text": "p"})
+        self.assertEqual(parts[1]["inline_data"]["mime_type"], "image/png")
+        self.assertEqual(action_api.gemini_parts("p", None), [{"text": "p"}])
+        convo = action_api.anthropic_convo_with_image(
+            [{"role": "user", "content": "q"}], "AAAA")
+        self.assertEqual(convo[0]["content"][0]["type"], "image")   # image first
+        self.assertEqual(convo[0]["content"][1]["text"], "q")
+
+
+class TestDevTier(unittest.TestCase):
+    def test_env_override_only_when_running_from_source(self):
+        import os
+        import entitlements
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"TRANSCRIBE_DEV_TIER": "pro"}):
+            with patch.object(sys, "frozen", False, create=True):
+                self.assertEqual(entitlements.tier(None), entitlements.TIER_PRO)
+                self.assertTrue(entitlements.has_pro_access(None))
+            # A frozen (installed) build must ignore it completely.
+            with patch.object(sys, "frozen", True, create=True):
+                self.assertEqual(entitlements.tier(None), entitlements.TIER_GUEST)
+        with patch.dict(os.environ, {"TRANSCRIBE_DEV_TIER": "nonsense"}):
+            self.assertEqual(entitlements.tier(None), entitlements.TIER_GUEST)
 
 
 class TestGlassHelpers(unittest.TestCase):

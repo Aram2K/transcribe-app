@@ -153,20 +153,30 @@ SMART_ACTION_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/smart-
 
 
 def run_managed_action(text, mode, token, source_lang="auto", target_lang="en",
-                       vocab_block=""):
+                       vocab_block="", image_b64=None):
     """Pro Smart Actions via the server (no BYO key): we build the messages here
-    and the edge function runs them through the founder's Mistral key."""
+    and the edge function runs them through the founder's Mistral key.
+
+    ``image_b64`` (a PNG screenshot) rides along as OpenAI-style content parts,
+    which the server forwards verbatim; if the server or model rejects the
+    multimodal shape, the call is retried once text-only so a screenshot can
+    never turn a working suggestion into an error."""
     if not token:
         raise ActionAPIError("Sign in with Pro to use managed Smart Actions.")
     messages = build_messages(text, mode, source_lang, target_lang,
                               vocab_block=vocab_block)
-    try:
-        resp = requests.post(
+
+    def _post(msgs):
+        return requests.post(
             SMART_ACTION_URL,
-            json={"messages": messages, "max_tokens": _max_tokens_for(mode)},
+            json={"messages": msgs, "max_tokens": _max_tokens_for(mode)},
             headers={"Authorization": f"Bearer {token}"},
             timeout=45,
         )
+    try:
+        resp = _post(openai_messages_with_image(messages, image_b64))
+        if image_b64 and resp.status_code in (400, 413, 415, 422):
+            resp = _post(messages)
     except requests.RequestException as e:
         raise ActionAPIError(f"Network error reaching Smart Actions: {e}")
     if resp.status_code == 403:
@@ -177,6 +187,50 @@ def run_managed_action(text, mode, token, source_lang="auto", target_lang="en",
         raise ActionAPIError("Managed Smart Actions aren't set up on the server yet.")
     data = _json_or_error(resp)
     return (data.get("text") or "").strip()
+
+
+def _image_data_url(b64):
+    return f"data:image/png;base64,{b64}"
+
+
+def openai_messages_with_image(messages, image_b64):
+    """Attach a PNG to the LAST user turn as OpenAI-style content parts (the
+    shape the managed server forwards unchanged). No image -> untouched copy."""
+    out = [dict(m) for m in messages]
+    if not image_b64:
+        return out
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") == "user" and isinstance(out[i].get("content"), str):
+            out[i]["content"] = [
+                {"type": "text", "text": out[i]["content"]},
+                {"type": "image_url", "image_url": {"url": _image_data_url(image_b64)}},
+            ]
+            break
+    return out
+
+
+def gemini_parts(prompt, image_b64=None):
+    parts = [{"text": prompt}]
+    if image_b64:
+        parts.append({"inline_data": {"mime_type": "image/png", "data": image_b64}})
+    return parts
+
+
+def anthropic_convo_with_image(convo, image_b64):
+    """Image block before the text of the LAST user turn (Anthropic's
+    recommended ordering for image + question)."""
+    out = [dict(m) for m in convo]
+    if not image_b64:
+        return out
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") == "user" and isinstance(out[i].get("content"), str):
+            out[i]["content"] = [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                              "data": image_b64}},
+                {"type": "text", "text": out[i]["content"]},
+            ]
+            break
+    return out
 
 
 def run_action(text, mode, config, source_lang="auto", target_lang="en"):
@@ -200,8 +254,10 @@ def _run_openai_compatible(text, mode, config, source_lang, target_lang, key):
     model = (config.get("action_api_model") or provider_defaults["default_model"]).strip()
     payload = {
         "model": model,
-        "messages": build_messages(text, mode, source_lang, target_lang,
-                                   vocab_block=config.get("_vocab_block", "")),
+        "messages": openai_messages_with_image(
+            build_messages(text, mode, source_lang, target_lang,
+                           vocab_block=config.get("_vocab_block", "")),
+            config.get("_image_png_b64")),
         "temperature": 0.1,
         "max_tokens": _max_tokens_for(mode),
     }
@@ -225,7 +281,8 @@ def _run_gemini(text, mode, config, source_lang, target_lang, key):
     resp = requests.post(
         f"{base_url}/models/{model}:generateContent",
         headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-        json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.1}},
+        json={"contents": [{"parts": gemini_parts(prompt, config.get("_image_png_b64"))}],
+              "generationConfig": {"temperature": 0.1}},
         timeout=45,
     )
     data = _json_or_error(resp)
@@ -247,6 +304,7 @@ def _run_anthropic(text, mode, config, source_lang, target_lang, key):
     convo = [m for m in messages[1:] if m.get("role") in ("user", "assistant")]
     if not convo:
         convo = [{"role": "user", "content": text}]
+    convo = anthropic_convo_with_image(convo, config.get("_image_png_b64"))
     resp = requests.post(
         f"{base_url}/messages",
         headers={

@@ -16,6 +16,8 @@ state to tiers + feature gates. It never decides Pro on its own.
 """
 
 import logging
+import os
+import sys
 
 import storage
 
@@ -53,8 +55,22 @@ def is_super_admin(auth):
     return bool(auth is not None and getattr(auth, "is_admin", False))
 
 
+def _dev_tier():
+    """Developer-only tier override: TRANSCRIBE_DEV_TIER=pro|free|guest, honoured
+    ONLY when running from source. A frozen (PyInstaller) build ignores it, so
+    it cannot unlock anything for end users - it exists so a developer can test
+    Pro flows on a machine that is offline or not signed in."""
+    if getattr(sys, "frozen", False):
+        return None
+    ov = (os.environ.get("TRANSCRIBE_DEV_TIER") or "").strip().lower()
+    return ov if ov in (TIER_GUEST, TIER_FREE, TIER_PRO) else None
+
+
 def _override_tier(auth, cfg):
     """A super admin's forced tier from config, or None."""
+    dev = _dev_tier()
+    if dev:
+        return dev
     if cfg and is_super_admin(auth):
         ov = cfg.get("admin_tier_override", "auto")
         if ov in (TIER_GUEST, TIER_FREE, TIER_PRO):

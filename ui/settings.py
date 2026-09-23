@@ -682,6 +682,50 @@ class Settings(QDialog):
         hk_lay.addWidget(self.btn_hotkey)
         layout.addWidget(hotkey_frame)
 
+        # Live Prompter - the private call assistant. These controls write
+        # straight to app.cfg and apply immediately: the overlay owns the
+        # live_assist_* keys, which the Save write-back deliberately skips.
+        lp_frame = QFrame(tab)
+        lp_frame.setObjectName("cardFrame")
+        lp_lay = QVBoxLayout(lp_frame)
+        lp_lay.addWidget(QLabel("Live Prompter  ·  private call assistant", lp_frame))
+        lp_desc = QLabel(
+            "A floating glass prompter for calls: the last thing said, a running "
+            "summary and instant AI suggestions - kept out of your screen share. "
+            "Press Listen on it (or start a meeting recording) to begin.", lp_frame)
+        lp_desc.setObjectName("subtitleLabel")
+        lp_desc.setWordWrap(True)
+        lp_lay.addWidget(lp_desc)
+        lp_row = QHBoxLayout()
+        btn_lp_open = QPushButton("Open Live Prompter", lp_frame)
+        btn_lp_open.setObjectName("heroButton")
+        btn_lp_open.clicked.connect(lambda: self.app and self.app.toggle_live_assist())
+        lp_row.addWidget(btn_lp_open)
+        lp_row.addSpacing(12)
+        lp_row.addWidget(QLabel("Hotkey", lp_frame))
+        # Press-to-capture, exactly like the dictation hotkey button: click,
+        # then press the combination you want.
+        self.btn_lp_hotkey = QPushButton(self._lp_hotkey_label(), lp_frame)
+        self.btn_lp_hotkey.setToolTip("Click, then press the key combination you want "
+                                      "to open/close Live Prompter.")
+        self.btn_lp_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; "
+                                         "min-width: 160px; border-color: #3b82f6;")
+        self.btn_lp_hotkey.clicked.connect(self._toggle_lp_capture)
+        lp_row.addWidget(self.btn_lp_hotkey)
+        lp_row.addStretch()
+        lp_lay.addLayout(lp_row)
+        self.chk_lp_private = QCheckBox("Private by default - never in your screen share", lp_frame)
+        self.chk_lp_private.setChecked(
+            bool(self.app.cfg.get("live_assist_private", True)) if self.app else True)
+        self.chk_lp_private.toggled.connect(self._apply_lp_private)
+        lp_lay.addWidget(self.chk_lp_private)
+        self.chk_lp_auto = QCheckBox("Auto-refresh suggestions while people talk", lp_frame)
+        self.chk_lp_auto.setChecked(
+            bool(self.app.cfg.get("live_assist_auto", False)) if self.app else False)
+        self.chk_lp_auto.toggled.connect(self._apply_lp_auto)
+        lp_lay.addWidget(self.chk_lp_auto)
+        layout.addWidget(lp_frame)
+
         # Spoken Language
         lang_frame = QFrame(tab)
         lang_frame.setObjectName("cardFrame")
@@ -4230,12 +4274,92 @@ class Settings(QDialog):
                 return True # swallow event
         return super().eventFilter(obj, event)
 
-    def _toggle_capture(self):
+    # ── Live Prompter controls (apply immediately, bypass cfg_working) ──
+    @staticmethod
+    def _norm_hotkey(combo):
+        """'Alt + E' -> 'alt+e' (the form the keyboard library and the tray
+        label expect)."""
+        return "+".join(p.strip().lower() for p in (combo or "").split("+") if p.strip())
+
+    def _lp_hotkey_label(self):
+        combo = self._norm_hotkey(self.app.cfg.get("live_assist_hotkey", "")) if self.app else "ctrl+alt+a"
+        return self._fmt_hotkey(None, combo).upper() if combo else "NOT SET"
+
+    _LP_BTN_STYLE = "font-weight: bold; min-height: 36px; min-width: 160px; border-color: #3b82f6;"
+    _LP_BTN_ARMED = "font-weight: bold; min-height: 36px; min-width: 160px; border-color: #ef4444; color: #ef4444;"
+
+    def _reset_lp_capture_button(self):
+        btn = getattr(self, "btn_lp_hotkey", None)
+        if btn is not None:
+            btn.setText(self._lp_hotkey_label())
+            btn.setStyleSheet(self._LP_BTN_STYLE)
+
+    def _toggle_lp_capture(self):
+        """Arm the Prompter hotkey button: the next key combination pressed
+        becomes the hotkey (shares keyPressEvent with the dictation button)."""
+        if self.capturing and getattr(self, "_capture_target", "") == "prompter":
+            self.capturing = False
+            self._capture_target = "dictation"
+            self._reset_lp_capture_button()
+            return
+        # Disarm the dictation button if it was waiting.
         if self.capturing:
             self.capturing = False
             self.btn_hotkey.setText(self.cfg_working.get("hotkey", "alt+r").upper() if self.app else "ALT+R")
             self.btn_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; border-color: #3b82f6;")
+        self._capture_target = "prompter"
+        self.capturing = True
+        self.btn_lp_hotkey.setText("PRESS KEY COMBINATION...")
+        self.btn_lp_hotkey.setStyleSheet(self._LP_BTN_ARMED)
+        self.setFocus()
+
+    def _apply_lp_hotkey(self, combo):
+        if not self.app:
+            return
+        combo = self._norm_hotkey(combo)
+        if combo == self._norm_hotkey(self.cfg_working.get("hotkey", "") or self.app.cfg.get("hotkey", "")):
+            QMessageBox.information(
+                self, "Already used",
+                f"{self._fmt_hotkey(None, combo)} is your dictation hotkey. "
+                "Pick a different combination for Live Prompter.")
+            self._reset_lp_capture_button()
+            return
+        self.app.cfg["live_assist_hotkey"] = combo
+        self.app.save_config()
+        ok = self.app._setup_assist_hotkey(combo)
+        self._reset_lp_capture_button()
+        if combo and not ok:
+            QMessageBox.information(
+                self, "Hotkey not registered",
+                f"{self._fmt_hotkey(None, combo)} couldn't be registered on this "
+                "system. Try another combination, e.g. Ctrl+Alt+A.")
+
+    def _apply_lp_private(self, on):
+        if not self.app:
+            return
+        self.app.cfg["live_assist_private"] = bool(on)
+        self.app.save_config()
+        la = getattr(self.app, "live_assist", None)
+        if la is not None:
+            la.set_private(bool(on))
+
+    def _apply_lp_auto(self, on):
+        if not self.app:
+            return
+        self.app.cfg["live_assist_auto"] = bool(on)
+        self.app.save_config()
+        la = getattr(self.app, "live_assist", None)
+        if la is not None and hasattr(la, "btn_auto"):
+            la.btn_auto.setChecked(bool(on))
+
+    def _toggle_capture(self):
+        if self.capturing and getattr(self, "_capture_target", "dictation") == "dictation":
+            self.capturing = False
+            self.btn_hotkey.setText(self.cfg_working.get("hotkey", "alt+r").upper() if self.app else "ALT+R")
+            self.btn_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; border-color: #3b82f6;")
         else:
+            self._reset_lp_capture_button()
+            self._capture_target = "dictation"
             self.capturing = True
             self.btn_hotkey.setText("PRESS KEY COMBINATION...")
             self.btn_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; border-color: #ef4444; color: #ef4444;")
@@ -4311,9 +4435,17 @@ class Settings(QDialog):
 
         hotkey_str = "+".join(mods + [key_str]) if mods else key_str
 
+        # The same capture path serves both hotkey buttons; whichever was
+        # clicked last is the target.
+        if getattr(self, "_capture_target", "dictation") == "prompter":
+            self.capturing = False
+            self._capture_target = "dictation"
+            self._apply_lp_hotkey(hotkey_str)
+            return
+
         if self.app:
             self.cfg_working["hotkey"] = hotkey_str
-            
+
         self.capturing = False
         self.btn_hotkey.setText(self._fmt_hotkey(None, hotkey_str).upper())
         self.btn_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; border-color: #3b82f6;")

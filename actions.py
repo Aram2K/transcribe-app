@@ -254,7 +254,8 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
             try:
                 return action_api.run_managed_action(
                     text, mode, token, source_lang=source_lang, target_lang=target_lang,
-                    vocab_block=vocab_block)
+                    vocab_block=vocab_block,
+                    image_b64=(config or {}).get("_image_png_b64"))
             except action_api.ActionAPIError as e:
                 raise ActionError(str(e)) from e
 
