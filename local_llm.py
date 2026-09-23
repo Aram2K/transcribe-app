@@ -424,9 +424,10 @@ def _messages_for(mode, text, source_lang, target_lang, vocab_block=""):
             "If there is a question from the user, answer it from the conversation. "
             "Otherwise take the LAST question or request in the text (ignore earlier "
             "ones), say what is being asked of the user, and what to say next.\n"
-            "Output plain text, under 100 words:\n"
-            "They're asking: <one line>\n"
-            "- 2-4 short concrete points\n"
+            "Output Markdown, under 100 words:\n"
+            "**They're asking:** <one line>\n"
+            "- 2-4 short concrete points, key phrase in **bold**\n"
+            "Use a fenced code block only if code or a command is actually needed.\n"
             "Use only the conversation. Do not invent facts or names, and never make "
             "claims about the user's own background or experience."
         )

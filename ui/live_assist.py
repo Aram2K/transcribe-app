@@ -114,8 +114,13 @@ def private_state(wanted, supported, remote, excluded):
     return "failed", "NOT PRIVATE · visible"
 
 
+_LANG_NAMES = {"en": "English", "de": "German", "fr": "French", "es": "Spanish",
+               "it": "Italian", "pt": "Portuguese", "nl": "Dutch", "ru": "Russian",
+               "hy": "Armenian", "tr": "Turkish", "zh": "Chinese", "ja": "Japanese"}
+
+
 def rolling_context(live_text, question="", title="", attendees="",
-                    tail_chars=TAIL_CHARS, screen=False):
+                    tail_chars=TAIL_CHARS, screen=False, output_lang="en"):
     """The text handed to the model: recent conversation + optional question.
     Pure, so it is unit-testable. Cuts at a sentence boundary when it can so
     the model doesn't start mid-word."""
@@ -136,9 +141,52 @@ def rolling_context(live_text, question="", title="", attendees="",
     parts.append("Conversation (latest part):\n" + (tail or "(nothing transcribed yet)"))
     if screen:
         parts.append("(A screenshot of the user's screen is attached - use it as context.)")
+    if output_lang and output_lang != "auto":
+        parts.append(f"(Respond in {_LANG_NAMES.get(output_lang, output_lang)}.)")
     if (question or "").strip():
         parts.append("User's question: " + question.strip())
     return "\n\n".join(parts)
+
+
+def _looks_like_capture_hole(small_img, black_max=12, band_frac=0.14):
+    """True when a horizontal band of the (downscaled) sample is pure black -
+    the signature of a hardware video surface that BitBlt cannot read. A
+    genuinely dark desktop is not a contiguous pure-black band."""
+    try:
+        w, h = small_img.width(), small_img.height()
+        if w < 4 or h < 4:
+            return False
+        black_rows = 0
+        for y in range(h):
+            dark = 0
+            for x in range(w):
+                c = small_img.pixelColor(x, y)
+                if c.red() <= black_max and c.green() <= black_max and c.blue() <= black_max:
+                    dark += 1
+            if dark >= w * 0.9:
+                black_rows += 1
+        return black_rows >= max(2, int(h * band_frac))
+    except Exception:
+        return False
+
+
+_CODE_CSS = ("pre, code { font-family: 'Cascadia Mono', Consolas, 'Courier New', monospace; "
+             "font-size: 12px; } pre { background: rgba(15,23,42,0.08); border-radius: 6px; "
+             "padding: 6px; }")
+
+
+def render_markdown(text_edit, md):
+    """Show Markdown in a QTextEdit with monospace, boxed code blocks. Qt's
+    setMarkdown has no styling hook, so the document is converted to HTML
+    first and re-set with a default stylesheet for pre/code."""
+    try:
+        doc = text_edit.document()
+        doc.setDefaultStyleSheet(_CODE_CSS)
+        doc.setMarkdown(md or "")
+        html = doc.toHtml()
+        text_edit.setHtml(html)
+    except Exception:
+        text_edit.setPlainText(md or "")
 
 
 def capture_screen_png_b64(screen, max_w=1280):
@@ -237,6 +285,11 @@ class _IconButton(QPushButton):
             p.drawRoundedRect(QRectF(cx - 5.5, cy - 4.5, 11, 7.5), 1.6, 1.6)
             p.drawLine(QPointF(cx, cy + 3), QPointF(cx, cy + 5.2))
             p.drawLine(QPointF(cx - 3, cy + 5.2), QPointF(cx + 3, cy + 5.2))
+        elif self._kind == "stop":
+            # Red rounded square - the universal "stop recording".
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#ef4444"))
+            p.drawRoundedRect(QRectF(cx - 4.5, cy - 4.5, 9, 9), 2.2, 2.2)
 
 
 class _DragBar(QFrame):
@@ -345,21 +398,31 @@ class LiveAssistOverlay(QWidget):
         bl = QHBoxLayout(self.bar)
         bl.setContentsMargins(4, 2, 0, 2)
         bl.setSpacing(8)
-        self.lbl_dot = QLabel("●", self.bar)
-        bl.addWidget(self.lbl_dot)
         self.lbl_title = QLabel("Live Prompter", self.bar)
         bl.addWidget(self.lbl_title)
-        self.btn_listen = QPushButton("● Listen", self.bar)
-        self.btn_listen.setObjectName("laListen")
-        self.btn_listen.setCursor(Qt.PointingHandCursor)
-        self.btn_listen.setToolTip("Start live transcription of this call (system audio + "
-                                   "microphone). Stop generates the meeting notes.")
-        self.btn_listen.clicked.connect(self._toggle_listen)
-        bl.addWidget(self.btn_listen)
-        self.lbl_private = QLabel("", self.bar)
-        self.lbl_private.setCursor(Qt.PointingHandCursor)
-        self.lbl_private.mousePressEvent = lambda e: self.set_private(not self._private)
-        bl.addWidget(self.lbl_private)
+        # Idle: a solid Start button. Live: a green timer + a red stop button.
+        self.btn_start = QPushButton("Start", self.bar)
+        self.btn_start.setObjectName("laStart")
+        self.btn_start.setCursor(Qt.PointingHandCursor)
+        self.btn_start.setToolTip("Start live transcription of this call (system audio + "
+                                  "microphone).")
+        self.btn_start.clicked.connect(self._start_listening)
+        bl.addWidget(self.btn_start)
+        self.lbl_timer = QLabel("● 00:00", self.bar)
+        self.lbl_timer.setObjectName("laTimer")
+        self.lbl_timer.hide()
+        bl.addWidget(self.lbl_timer)
+        self.btn_stop = _IconButton("stop", self.bar, "Stop listening and generate the notes")
+        self.btn_stop.clicked.connect(self._stop_listening)
+        self.btn_stop.hide()
+        bl.addWidget(self.btn_stop)
+        # Private toggle: eye-off + "Private" when hidden from screen share,
+        # eye + "Visible" when not. Always truthful (see private_state).
+        self.btn_private = QPushButton("", self.bar)
+        self.btn_private.setObjectName("laPrivate")
+        self.btn_private.setCursor(Qt.PointingHandCursor)
+        self.btn_private.clicked.connect(lambda: self.set_private(not self._private))
+        bl.addWidget(self.btn_private)
         bl.addStretch()
         self.btn_theme = _IconButton("theme", self.bar, "Light / dark glass")
         self.btn_theme.clicked.connect(self._toggle_theme)
@@ -452,6 +515,9 @@ class LiveAssistOverlay(QWidget):
 
         self.lbl_status = QLabel("", self.body)
         self.lbl_status.setObjectName("laFoot")
+        # Wrap: a long note must never widen the layout past the card.
+        self.lbl_status.setWordWrap(True)
+        self.lbl_status.setMaximumHeight(32)
         body.addWidget(self.lbl_status)
 
         root.addWidget(self.body, 1)
@@ -487,12 +553,17 @@ class LiveAssistOverlay(QWidget):
                 color: white; font-weight: bold; border: none; padding: 7px 18px; border-radius: 15px;
             }}
             QPushButton#laSuggest:disabled {{ background: #94a3b8; }}
-            QPushButton#laListen {{
-                background: rgba(37,99,235,0.14); color: {accent}; font-weight: 700;
-                border: 1px solid rgba(37,99,235,0.35); border-radius: 11px; padding: 2px 12px;
+            QPushButton#laStart {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3b82f6, stop:1 #6366f1);
+                color: white; font-weight: 700; border: none; border-radius: 11px;
+                padding: 3px 16px; font-size: 12px;
             }}
-            QPushButton#laListen[recording="true"] {{
-                background: rgba(34,197,94,0.18); color: #15803d; border-color: rgba(34,197,94,0.5);
+            QPushButton#laStart:hover {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2563eb, stop:1 #4f46e5);
+            }}
+            QLabel#laTimer {{
+                color: #15803d; background: rgba(34,197,94,0.16); border: 1px solid rgba(34,197,94,0.45);
+                border-radius: 11px; padding: 2px 10px; font-size: 12px; font-weight: 700;
             }}
             QLabel#laFoot {{ color: {t['faint']}; font-size: 11px; }}
         """)
@@ -500,11 +571,12 @@ class LiveAssistOverlay(QWidget):
             lbl.setStyleSheet(f"color: {t['faint']}; font-size: 10px; font-weight: 700; "
                               "letter-spacing: 1px; background: transparent;")
         self.lbl_title.setStyleSheet(f"color: {t['text']}; font-weight: 700; font-size: 13px;")
-        for b in (self.btn_theme, self.btn_collapse, self.btn_close, self.btn_screen):
+        for b in (self.btn_theme, self.btn_collapse, self.btn_close, self.btn_screen,
+                  self.btn_stop):
             b.set_theme(t)
         self._shadow_key = None          # shadow tint depends on theme
         self._refresh_private_chip()
-        self._refresh_dot()
+        self._refresh_live_controls()
         self.update()
 
     def _toggle_theme(self):
@@ -561,11 +633,11 @@ class LiveAssistOverlay(QWidget):
         # Sampling is only safe while excluded, so the glass tier may change.
         self._apply_glass()
 
-    _CHIP_STYLES = {
-        "on": ("rgba(34,197,94,0.18)", "#15803d", "rgba(34,197,94,0.45)"),
-        "off": ("rgba(239,68,68,0.16)", "#b91c1c", "rgba(239,68,68,0.45)"),
-        "failed": ("rgba(239,68,68,0.16)", "#b91c1c", "rgba(239,68,68,0.45)"),
-        "unavailable": ("rgba(245,158,11,0.18)", "#b45309", "rgba(245,158,11,0.5)"),
+    _CHIP_COLORS = {
+        "on": ("rgba(34,197,94,0.16)", "#15803d", "rgba(34,197,94,0.45)"),
+        "off": ("rgba(239,68,68,0.14)", "#b91c1c", "rgba(239,68,68,0.45)"),
+        "failed": ("rgba(239,68,68,0.14)", "#b91c1c", "rgba(239,68,68,0.45)"),
+        "unavailable": ("rgba(245,158,11,0.16)", "#b45309", "rgba(245,158,11,0.5)"),
     }
 
     def _refresh_private_chip(self, remote=None, supported=None, excluded=None):
@@ -576,31 +648,50 @@ class LiveAssistOverlay(QWidget):
         if excluded is None:
             excluded = glass.is_excluded_from_capture(self) if self.isVisible() \
                 else self._exclusion_ok
-        key, text = private_state(self._private, supported, remote, excluded)
-        bg, fg, border = self._CHIP_STYLES[key]
-        self.lbl_private.setText(f"  {text}  ")
-        self.lbl_private.setStyleSheet(
-            f"background: {bg}; color: {fg}; border: 1px solid {border}; "
-            "border-radius: 9px; font-size: 10px; font-weight: 700;")
+        key, _ = private_state(self._private, supported, remote, excluded)
+        text = {"on": "Private", "off": "Visible", "failed": "Not private",
+                "unavailable": "Private n/a"}[key]
+        bg, fg, border = self._CHIP_COLORS[key]
+        try:
+            from ui.icons import eye_icon
+            from PySide6.QtCore import QSize
+            # Eye-off while hidden from the share, open eye when it shows.
+            self.btn_private.setIcon(eye_icon(open_=(key != "on"), size=16, color=QColor(fg)))
+            self.btn_private.setIconSize(QSize(16, 16))
+        except Exception:
+            pass
+        self.btn_private.setText(text)
+        self.btn_private.setStyleSheet(
+            f"QPushButton#laPrivate {{ background: {bg}; color: {fg}; border: 1px solid "
+            f"{border}; border-radius: 11px; padding: 2px 10px 2px 8px; font-size: 12px; "
+            "font-weight: 600; }")
         tips = {
             "on": "Hidden from Zoom/Teams/Meet shares, recordings and screenshots on "
-                  "this PC. Not hidden from phone cameras. Click to turn off (e.g. to "
-                  "include it in your own recording).",
-            "off": "This overlay WILL show on a shared screen. Click to make it private.",
+                  "this PC (not from phone cameras). Click to make it visible - e.g. "
+                  "to include it in your own recording.",
+            "off": "This card WILL show on a shared screen. Click to hide it from shares.",
             "failed": "Windows refused to hide this window - assume it is visible in a share.",
             "unavailable": "Screen-share privacy needs Windows 10 2004+ and a local "
                            "(non-remote) session.",
         }
-        self.lbl_private.setToolTip(tips[key])
+        self.btn_private.setToolTip(tips[key])
 
-    def _refresh_dot(self):
-        # Live = green (the dot and the button), idle = quiet grey.
-        color = "#22c55e" if self._meeting_active else _THEMES[self._theme_name]["faint"]
-        self.lbl_dot.setStyleSheet(f"color: {color}; font-size: 12px;")
-        self.btn_listen.setText("● LIVE · Stop" if self._meeting_active else "● Listen")
-        self.btn_listen.setProperty("recording", "true" if self._meeting_active else "false")
-        self.btn_listen.style().unpolish(self.btn_listen)
-        self.btn_listen.style().polish(self.btn_listen)
+    def _refresh_live_controls(self):
+        live = self._meeting_active
+        self.btn_start.setVisible(not live)
+        self.lbl_timer.setVisible(live)
+        self.btn_stop.setVisible(live)
+        if live:
+            self._update_timer()
+
+    def _update_timer(self):
+        since = getattr(self, "_live_since", None)
+        if not since:
+            return
+        s = int(time.time() - since)
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        self.lbl_timer.setText(("● %d:%02d:%02d" % (h, m, sec)) if h else ("● %02d:%02d" % (m, sec)))
 
     def _drag_began(self):
         if self._glass_mode == "liquid":
@@ -637,6 +728,24 @@ class LiveAssistOverlay(QWidget):
             # body (soft), /5 for the refraction ring (content stays legible).
             body = img.scaled(max(1, w // 12), max(1, h // 12), Qt.IgnoreAspectRatio,
                               Qt.SmoothTransformation)
+            if _looks_like_capture_hole(body):
+                # Hardware-accelerated video (a call's webcam strip, a player)
+                # comes back from BitBlt as solid BLACK. Refracting that paints
+                # a black bar through the glass. Let DWM's acrylic compose those
+                # frames instead; the next sample re-tests.
+                if self._glass_mode == "liquid":
+                    self._glass_mode = "acrylic-video"
+                    t = _THEMES[self._theme_name]
+                    tint = (t["tint_blur"].red(), t["tint_blur"].green(),
+                            t["tint_blur"].blue(), 0x20)
+                    self._blur_mode = glass.apply_backdrop_blur(self, tint)
+                    self._bd_body = self._bd_ring = None
+                    self.update()
+                return
+            if self._glass_mode == "acrylic-video":
+                glass.remove_backdrop_blur(self)
+                self._blur_mode = ""
+                self._glass_mode = "liquid"
             body = body.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
             ring = img.scaled(max(1, w // 5), max(1, h // 5), Qt.IgnoreAspectRatio,
                               Qt.SmoothTransformation)
@@ -793,16 +902,14 @@ class LiveAssistOverlay(QWidget):
         self._shadow_key = None
         QTimer.singleShot(0, self._apply_glass)
 
-    # ── listen / stop (drives the meeting recorder) ──
-    def _toggle_listen(self):
+    # ── start / stop (drives the meeting recorder) ──
+    def _start_listening(self):
         mw = getattr(self.app, "meetings_win", None) if self.app else None
         if mw is None:
             self._set_status("Meeting recorder isn't available.")
             return
         try:
             if getattr(mw, "state", None) == mw.STATE_RECORDING:
-                mw._stop_meeting()
-                self._set_status("Stopping - notes are generated in Record Meeting.")
                 return
             if hasattr(self.app, "is_pro") and not self.app.is_pro():
                 if hasattr(self.app, "_pro_upsell"):
@@ -810,17 +917,44 @@ class LiveAssistOverlay(QWidget):
                 return
             if hasattr(mw, "input_title") and not mw.input_title.text().strip():
                 mw.input_title.setText("Live session " + time.strftime("%H:%M"))
+            # Transcription language for this session (default English) - the
+            # recorder reads cfg["language"]; the previous value is restored
+            # when the session ends so dictation keeps its own setting.
+            lang = (self.app.cfg.get("live_assist_language") or "en").strip()
+            if lang and lang != "auto":
+                self._prev_language = self.app.cfg.get("language", "auto")
+                self.app.cfg["language"] = lang
             mw._start_meeting()
             if getattr(mw, "state", None) != mw.STATE_RECORDING:
+                self._restore_language()
                 self._set_status("Couldn't start listening - see Record Meeting.")
         except Exception as e:
-            logger.warning("Live Prompter listen toggle failed: %s", e, exc_info=True)
+            logger.warning("Live Prompter start failed: %s", e, exc_info=True)
+            self._restore_language()
             self._set_status(f"Couldn't start: {str(e)[:80]}")
+
+    def _stop_listening(self):
+        mw = getattr(self.app, "meetings_win", None) if self.app else None
+        if mw is None or getattr(mw, "state", None) != mw.STATE_RECORDING:
+            return
+        try:
+            mw._stop_meeting()
+            self._set_status("Stopped - the notes are generated in Record Meeting.")
+        except Exception as e:
+            logger.warning("Live Prompter stop failed: %s", e, exc_info=True)
+            self._set_status(f"Couldn't stop: {str(e)[:80]}")
+
+    def _restore_language(self):
+        prev = getattr(self, "_prev_language", None)
+        if prev is not None and self.app:
+            self.app.cfg["language"] = prev
+            self._prev_language = None
 
     # ── data feed (GUI thread) ──
     def set_meeting_active(self, active, title="", attendees=""):
         self._meeting_active = bool(active)
         if active:
+            self._live_since = time.time()
             self._live_text = ""
             self._summary = ""
             self._title, self._attendees = title or "", attendees or ""
@@ -828,8 +962,9 @@ class LiveAssistOverlay(QWidget):
             self.txt_summary.clear()
             self.lbl_status.setText("")
         else:
+            self._restore_language()
             self.lbl_status.setText("Stopped - suggestions use the final transcript.")
-        self._refresh_dot()
+        self._refresh_live_controls()
 
     def feed_transcript(self, piece):
         piece = (piece or "").strip()
@@ -878,8 +1013,10 @@ class LiveAssistOverlay(QWidget):
         self._text_since_suggest = 0
         self.btn_suggest.setEnabled(False)
         self.txt_suggestion.setPlainText("Thinking…")
-        context = rolling_context(self._live_text, question, self._title, self._attendees,
-                                  screen=bool(image_b64))
+        context = rolling_context(
+            self._live_text, question, self._title, self._attendees,
+            screen=bool(image_b64),
+            output_lang=(self.app.cfg.get("live_assist_output_language") or "en"))
         threading.Thread(target=self._suggest_worker, args=(context, image_b64),
                          daemon=True).start()
 
@@ -911,8 +1048,8 @@ class LiveAssistOverlay(QWidget):
             if image_b64 and kind in ("cloud", "managed"):
                 cfg["_image_png_b64"] = image_b64
             elif image_b64:
-                self.sig_status.emit("Screen context needs a cloud AI engine (Pro or "
-                                     "your own key) - answered from the transcript only")
+                self.sig_status.emit("Screen needs a cloud AI engine (Pro or your own "
+                                     "key) - answered from the transcript only.")
             text = actions.process(context, actions.ACTION_LIVE_ASSIST,
                                    model=engine, config=cfg)
             self.sig_suggestion.emit(text or "", "")
@@ -927,8 +1064,8 @@ class LiveAssistOverlay(QWidget):
         if error:
             self.txt_suggestion.setPlainText(f"Couldn't get a suggestion: {error}")
             return
-        self.txt_suggestion.setPlainText(text.strip() or "(no suggestion)")
-        if not self.lbl_status.text().startswith("Screen context"):
+        render_markdown(self.txt_suggestion, text.strip() or "(no suggestion)")
+        if not self.lbl_status.text().startswith("Screen"):
             self.lbl_status.setText(f"Updated {time.strftime('%H:%M:%S')} · {took:.1f}s")
         self.input_ask.clear()
 
@@ -945,6 +1082,8 @@ class LiveAssistOverlay(QWidget):
                 and not glass.is_remote_session()
                 and not glass.is_excluded_from_capture(self)):
             self._apply_glass()
+        if self._meeting_active:
+            self._update_timer()
         if self._suggesting:
             el = int(time.time() - self._suggest_started)
             if el >= 3:

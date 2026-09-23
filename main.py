@@ -141,6 +141,8 @@ DEFAULT = {
     "live_assist_theme": "light",
     "live_assist_auto": False,       # auto-refresh suggestions while people talk
     "live_assist_pos": None,
+    "live_assist_language": "en",         # transcription language for prompter sessions
+    "live_assist_output_language": "en",  # language of the suggestions
     # Bumped when the config shape changes in a way that needs migration.
     "config_schema_version": 1,
 }
