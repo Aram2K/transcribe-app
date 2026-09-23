@@ -28,9 +28,9 @@ import re
 import threading
 import time
 
-from PySide6.QtCore import Qt, QBuffer, QIODevice, QPointF, QRectF, QTimer, Signal
+from PySide6.QtCore import Qt, QBuffer, QIODevice, QPointF, QRect, QRectF, QTimer, Signal
 from PySide6.QtGui import (
-    QBrush, QColor, QCursor, QFont, QLinearGradient, QPainter, QPainterPath,
+    QBrush, QColor, QCursor, QFont, QImage, QLinearGradient, QPainter, QPainterPath,
     QPen, QRadialGradient,
 )
 from PySide6.QtWidgets import (
@@ -341,6 +341,7 @@ class LiveAssistOverlay(QWidget):
         self._glass_mode = "flat"          # "liquid" | "acrylic" | "flat"
         self._bd_body = None               # sampled backdrop, strong blur
         self._bd_ring = None               # sampled backdrop, mild blur (refraction)
+        self._bd_refr = self._bd_glow = None
         self._spec_pos = QPointF(SHADOW + 120, SHADOW + 8)
         self._expanded = True
         self._meeting_active = False
@@ -366,6 +367,7 @@ class LiveAssistOverlay(QWidget):
         self.sig_suggestion.connect(self._on_suggestion)
         self.sig_status.connect(self._set_status)
         self._build()
+        self._richify_tooltips()
         self._apply_theme()
 
         pos = cfg.get("live_assist_pos")
@@ -480,6 +482,16 @@ class LiveAssistOverlay(QWidget):
         self.btn_auto.toggled.connect(self._on_auto_toggled)
         self.btn_auto.setFixedHeight(22)
         head_row.addWidget(self.btn_auto)
+        # Screen context sits with the other suggestion options: a monitor
+        # icon, accent-filled when on.
+        self.btn_screen = _IconButton(
+            "screen", self.body,
+            "Attach a screenshot of your screen to the next suggestion (this overlay "
+            "is left out of it). Needs a cloud AI engine - Transcribe Pro or your own key.")
+        self.btn_screen.setCheckable(True)
+        self.btn_screen.setFixedSize(24, 24)
+        self.btn_screen.toggled.connect(lambda _on: self.btn_screen.update())
+        head_row.addWidget(self.btn_screen)
         body.addLayout(head_row)
         self.txt_suggestion = QTextEdit(self.body)
         self.txt_suggestion.setReadOnly(True)
@@ -492,16 +504,6 @@ class LiveAssistOverlay(QWidget):
 
         ask_row = QHBoxLayout()
         ask_row.setSpacing(8)
-        # Screen context as an "attach" affordance at the left of the ask bar,
-        # like a paperclip in a chat app: a monitor icon, accent-filled when on.
-        self.btn_screen = _IconButton(
-            "screen", self.body,
-            "Attach a screenshot of your screen to the next suggestion (this overlay "
-            "is left out of it). Needs a cloud AI engine - Transcribe Pro or your own key.")
-        self.btn_screen.setCheckable(True)
-        self.btn_screen.setFixedSize(30, 30)
-        self.btn_screen.toggled.connect(lambda _on: self.btn_screen.update())
-        ask_row.addWidget(self.btn_screen)
         self.input_ask = QLineEdit(self.body)
         self.input_ask.setPlaceholderText("Ask about the conversation or your screen…")
         self.input_ask.returnPressed.connect(self._ask)
@@ -527,12 +529,25 @@ class LiveAssistOverlay(QWidget):
         except (TypeError, ValueError):
             self.setWindowOpacity(0.96)
 
+    def _richify_tooltips(self):
+        """Qt word-wraps rich-text tooltips but not plain ones: a long plain
+        tooltip becomes a single ~1000 px line. Wrap every tooltip in <p>."""
+        import html as html_mod
+        for w in [self] + self.findChildren(QWidget):
+            tip = w.toolTip()
+            if tip and not tip.lstrip().startswith("<"):
+                w.setToolTip(f"<p style='white-space:normal'>{html_mod.escape(tip)}</p>")
+
     # ── theme / glass ──
     def _apply_theme(self):
         t = _THEMES[self._theme_name]
         accent = t["accent"]
         self.setStyleSheet(f"""
             QLabel {{ color: {t['text']}; background: transparent; font-size: 12px; }}
+            QToolTip {{
+                background-color: #0f172a; color: #f8fafc; border: 1px solid rgba(255,255,255,0.18);
+                border-radius: 6px; padding: 6px 9px; font-size: 12px;
+            }}
             QLabel#laNow {{ font-size: 13px; color: {t['text']}; }}
             QTextEdit#laCard {{
                 background: {t['card']}; border: 1px solid {t['card_border']};
@@ -607,7 +622,7 @@ class LiveAssistOverlay(QWidget):
         else:
             self._sample_timer.stop()
             self._spec_timer.stop()
-            self._bd_body = self._bd_ring = None
+            self._bd_body = self._bd_ring = self._bd_refr = self._bd_glow = None
             t = _THEMES[self._theme_name]
             tint = (t["tint_blur"].red(), t["tint_blur"].green(), t["tint_blur"].blue(), 0x20)
             self._blur_mode = glass.apply_backdrop_blur(self, tint)
@@ -739,7 +754,7 @@ class LiveAssistOverlay(QWidget):
                     tint = (t["tint_blur"].red(), t["tint_blur"].green(),
                             t["tint_blur"].blue(), 0x20)
                     self._blur_mode = glass.apply_backdrop_blur(self, tint)
-                    self._bd_body = self._bd_ring = None
+                    self._bd_body = self._bd_ring = self._bd_refr = self._bd_glow = None
                     self.update()
                 return
             if self._glass_mode == "acrylic-video":
@@ -750,10 +765,56 @@ class LiveAssistOverlay(QWidget):
             ring = img.scaled(max(1, w // 5), max(1, h // 5), Qt.IgnoreAspectRatio,
                               Qt.SmoothTransformation)
             ring = ring.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            self._bd_refr, self._bd_glow = self._masked_refraction(ring, w, h)
             self._bd_body, self._bd_ring = body, ring
             self.update()
         except Exception as e:
             logger.debug("backdrop sample failed: %s", e)
+
+    def _masked_refraction(self, ring, w, h):
+        """The edge refraction as a pre-composed layer: the backdrop magnified
+        about the centre, kept only near the card edge through a BLURRED mask
+        that fades to nothing toward the middle. A hard ring boundary read as
+        a stripe (very visibly on the 52 px pill); a soft mask reads as thick
+        glass bending what's behind it. Returns (refraction, edge_glow)."""
+        card = QRectF(SHADOW, SHADOW, w - 2 * SHADOW, h - 2 * SHADOW)
+        edge = max(4.0, min(22.0, card.height() / 2 - 3, card.width() / 2 - 3))
+        mask = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+        mask.fill(Qt.transparent)
+        mp = QPainter(mask)
+        mp.setRenderHint(QPainter.Antialiasing, True)
+        outer = QPainterPath()
+        outer.addRoundedRect(card, RADIUS, RADIUS)
+        inner = QPainterPath()
+        inner.addRoundedRect(card.adjusted(edge, edge, -edge, -edge),
+                             max(2.0, RADIUS - edge * 0.6), max(2.0, RADIUS - edge * 0.6))
+        mp.fillPath(outer.subtracted(inner), QColor(255, 255, 255, 255))
+        mp.end()
+        small = mask.scaled(max(1, w // 6), max(1, h // 6), Qt.IgnoreAspectRatio,
+                            Qt.SmoothTransformation)
+        mask = small.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+        refr = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+        refr.fill(Qt.transparent)
+        rp = QPainter(refr)
+        rp.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        cx, cy = w / 2.0, h / 2.0
+        rp.translate(cx, cy + 2)
+        rp.scale(1.09, 1.09)
+        rp.translate(-cx, -cy)
+        rp.drawImage(QRect(0, 0, w, h), ring)
+        rp.resetTransform()
+        rp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+        rp.drawImage(0, 0, mask)
+        rp.end()
+
+        glow = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+        glow.fill(QColor(255, 255, 255, 34))
+        gp = QPainter(glow)
+        gp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+        gp.drawImage(0, 0, mask)
+        gp.end()
+        return refr, glow
 
     def _track_specular(self):
         """The highlight drifts toward the cursor while it is over the card -
@@ -782,7 +843,6 @@ class LiveAssistOverlay(QWidget):
         if getattr(self, "_shadow_key", None) == key:
             return self._shadow_img
         w, h = self.width(), self.height()
-        from PySide6.QtGui import QImage
         img = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
         img.fill(Qt.transparent)
         p = QPainter(img)
@@ -817,21 +877,12 @@ class LiveAssistOverlay(QWidget):
         liquid = self._glass_mode == "liquid" and self._bd_body is not None
         if liquid:
             p.drawImage(self.rect(), self._bd_body)
-            # Refraction ring: the backdrop magnified toward the edges, as if
-            # bent through thick glass.
-            inner = QPainterPath()
-            inner.addRoundedRect(card.adjusted(18, 18, -18, -18), RADIUS - 12, RADIUS - 12)
-            ring = path.subtracted(inner)
-            p.save()
-            p.setClipPath(ring, Qt.IntersectClip)
-            cx, cy = self.width() / 2.0, self.height() / 2.0
-            p.translate(cx, cy + 2)
-            p.scale(1.09, 1.09)
-            p.translate(-cx, -cy)
-            p.setOpacity(0.92)
-            p.drawImage(self.rect(), self._bd_ring)
-            p.restore()
-            p.fillPath(ring, QColor(255, 255, 255, 22))
+            # Edge refraction, pre-composed with a soft mask in
+            # _masked_refraction - no boundary anywhere, at any card size.
+            refr = getattr(self, "_bd_refr", None)
+            if refr is not None:
+                p.drawImage(0, 0, refr)
+                p.drawImage(0, 0, self._bd_glow)
             p.fillPath(path, t["tint_liquid"])
         else:
             p.fillPath(path, t["tint_blur"] if self._blur_mode else t["tint_flat"])
