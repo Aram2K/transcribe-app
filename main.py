@@ -42,7 +42,7 @@ import text_cleanup
 import vocabulary
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 
 # ── Managed cloud transcription (Pro moat) ────────────────────────────────────
 MANAGED_PROXY_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-proxy"
@@ -143,6 +143,7 @@ DEFAULT = {
     "live_assist_pos": None,
     "live_assist_language": "en",         # transcription language for prompter sessions
     "live_assist_output_language": "en",  # language of the suggestions
+    "live_assist_screen_auto": True,      # attach a screenshot when the talk refers to the screen
     # Bumped when the config shape changes in a way that needs migration.
     "config_schema_version": 1,
 }

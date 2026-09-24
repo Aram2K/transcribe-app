@@ -228,3 +228,29 @@ class TestFastProviderPlumbing(unittest.TestCase):
         self.assertEqual(info["provider"], action_api.PROVIDER_CEREBRAS)
         self.assertEqual(action_api.defaults(action_api.PROVIDER_CEREBRAS)["default_base_url"],
                          "https://api.cerebras.ai/v1")
+
+
+@unittest.skipUnless(_real_qt(), "real PySide6 not importable (stubbed)")
+class TestAutoScreenContext(unittest.TestCase):
+    def setUp(self):
+        from ui.live_assist import should_attach_screen
+        self.f = should_attach_screen
+
+    def test_question_cues(self):
+        self.assertTrue(self.f("what does this error mean?", ""))
+        self.assertTrue(self.f("summarise the slide", ""))
+        self.assertTrue(self.f("what's on my screen", ""))
+        # A question with no screen reference costs no screenshot.
+        self.assertFalse(self.f("what deadline did they mention?", "look at this chart"))
+
+    def test_conversation_cues_when_no_question(self):
+        self.assertTrue(self.f("", "Speaker 2: as you can see on this slide the numbers dropped."))
+        self.assertTrue(self.f("", "Can you share your screen and show the dashboard?"))
+        self.assertFalse(self.f("", "We agreed to ship on Friday."))
+
+    def test_only_recent_speech_counts(self):
+        old_cue = "look at this chart. " + ("Then we talked about lunch. " * 40)
+        self.assertFalse(self.f("", old_cue))
+
+    def test_off_switch(self):
+        self.assertFalse(self.f("what is on my screen?", "", auto=False))

@@ -189,6 +189,28 @@ def render_markdown(text_edit, md):
         text_edit.setPlainText(md or "")
 
 
+_SCREEN_CUES = re.compile(
+    r"\b(screen|slides?|deck|chart|graph|diagram|table|dashboard|spreadsheet|figure|"
+    r"image|picture|photo|screenshot|this code|the code|error|stack ?trace|terminal|"
+    r"console|this page|the page|this doc(ument)?|the doc(ument)?|shown|showing|"
+    r"displayed|on my screen|on the screen|on screen|share(d)? my screen|"
+    r"what (do|does) (this|that|it) (say|mean|show)|(see|look at) (this|that|here|my))\b",
+    re.I)
+
+
+def should_attach_screen(question="", live_tail="", auto=True):
+    """Auto screen context: attach a screenshot only when it plausibly helps -
+    the user's question refers to something on screen, or the last thing said
+    in the call does ("as you can see on this slide"). A typed question with
+    no such cue gets no screenshot (tokens, latency, privacy)."""
+    if not auto:
+        return False
+    q = (question or "").strip()
+    if q:
+        return bool(_SCREEN_CUES.search(q))
+    return bool(_SCREEN_CUES.search((live_tail or "")[-400:]))
+
+
 def capture_screen_png_b64(screen, max_w=1280):
     """Screenshot of ``screen`` as base64 PNG, downscaled for upload. The
     overlay itself is absent when capture exclusion is active."""
@@ -428,6 +450,18 @@ class LiveAssistOverlay(QWidget):
         self.btn_private.setCursor(Qt.PointingHandCursor)
         self.btn_private.clicked.connect(lambda: self.set_private(not self._private))
         bl.addWidget(self.btn_private)
+        # Screen context, AUTO by default: the app attaches a screenshot only
+        # when the question or the conversation refers to what's on screen.
+        self.btn_screen = _IconButton(
+            "screen", self.bar,
+            "Screen context: Auto. A screenshot of your screen (this card left out) "
+            "is attached when you or the other side refer to what's on screen - "
+            "a slide, an error, 'as you can see'. Needs a cloud AI engine. Click to turn off.")
+        self.btn_screen.setCheckable(True)
+        self.btn_screen.setChecked(
+            bool((self.app.cfg if self.app else {}).get("live_assist_screen_auto", True)))
+        self.btn_screen.toggled.connect(self._on_screen_toggled)
+        bl.addWidget(self.btn_screen)
         bl.addStretch()
         self.btn_theme = _IconButton("theme", self.bar, "Light / dark glass")
         self.btn_theme.clicked.connect(self._toggle_theme)
@@ -487,16 +521,6 @@ class LiveAssistOverlay(QWidget):
         self.btn_auto.toggled.connect(self._on_auto_toggled)
         self.btn_auto.setFixedHeight(22)
         head_row.addWidget(self.btn_auto)
-        # Screen context sits with the other suggestion options: a monitor
-        # icon, accent-filled when on.
-        self.btn_screen = _IconButton(
-            "screen", self.body,
-            "Attach a screenshot of your screen to the next suggestion (this overlay "
-            "is left out of it). Needs a cloud AI engine - Transcribe Pro or your own key.")
-        self.btn_screen.setCheckable(True)
-        self.btn_screen.setFixedSize(24, 24)
-        self.btn_screen.toggled.connect(lambda _on: self.btn_screen.update())
-        head_row.addWidget(self.btn_screen)
         body.addLayout(head_row)
         self.txt_suggestion = QTextEdit(self.body)
         self.txt_suggestion.setReadOnly(True)
@@ -1057,18 +1081,20 @@ class LiveAssistOverlay(QWidget):
         if not self.app:
             self._on_suggestion("", "No app context.")
             return
-        want_screen = self.btn_screen.isChecked()
+        auto_screen = self.btn_screen.isChecked()
         if not self._live_text.strip() and not question:
-            if want_screen:
+            if auto_screen:
+                # Nothing said, nothing asked, Suggest pressed: the screen is
+                # the only context there is.
                 question = "Describe what is on my screen and what I should do next."
             else:
                 self.txt_suggestion.setPlainText(
-                    "Nothing has been said yet - press Listen first, or turn on Screen "
-                    "and ask about what's on your screen.")
+                    "Nothing has been said yet - press Start first, or ask a question.")
                 return
         image_b64 = ""
-        if want_screen:
+        if should_attach_screen(question, self._live_text, auto_screen):
             image_b64 = capture_screen_png_b64(self.screen() or QApplication.primaryScreen())
+        self._last_attached_screen = bool(image_b64)
         self._suggesting = True
         self._suggest_started = time.time()
         self._first_token_at = 0.0
@@ -1157,8 +1183,9 @@ class LiveAssistOverlay(QWidget):
         if not self.lbl_status.text().startswith("Screen"):
             first = (f"first words {self._first_token_at - self._suggest_started:.1f}s · "
                      if self._first_token_at else "")
+            shot = "screen attached · " if getattr(self, "_last_attached_screen", False) else ""
             self.lbl_status.setText(
-                f"Updated {time.strftime('%H:%M:%S')} · {first}done {took:.1f}s · "
+                f"Updated {time.strftime('%H:%M:%S')} · {first}done {took:.1f}s · {shot}"
                 "AI can be wrong - check facts")
         self.input_ask.clear()
 
@@ -1166,6 +1193,18 @@ class LiveAssistOverlay(QWidget):
         self._auto = bool(on)
         if self.app:
             self.app.cfg["live_assist_auto"] = self._auto
+            self.app.save_config()
+
+    def _on_screen_toggled(self, on):
+        self.btn_screen.update()
+        self.btn_screen.setToolTip(
+            "Screen context: Auto. A screenshot of your screen (this card left out) is "
+            "attached when you or the other side refer to what's on screen. Needs a "
+            "cloud AI engine. Click to turn off." if on else
+            "Screen context: Off. Suggestions never see your screen. Click for Auto.")
+        self._richify_tooltips()
+        if self.app:
+            self.app.cfg["live_assist_screen_auto"] = bool(on)
             self.app.save_config()
 
     def _on_tick(self):

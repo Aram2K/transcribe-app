@@ -38,6 +38,9 @@ It was built especially for **Armenian speakers** who need accurate, native-scri
 | | |
 |---|---|
 | 🎙 **Hotkey recording** | Press any key combo (or mouse button) to start/stop |
+| 🪟 **Live Prompter** | A private liquid-glass copilot over your calls: live transcript, running AI summary, instant streamed suggestions, screen-aware answers - **excluded from screen sharing** |
+| 🎧 **Record meetings** | System audio + mic, speaker labels, AI notes with action items, Notion export, resumable sessions, MP3/WAV recordings |
+| 📄 **Transcribe Files** | Drop any audio/video file → a Word document with speaker labels and timestamps |
 | 📋 **Smart paste** | Auto-pastes at your cursor; falls back to clipboard |
 | 🌐 **Armenian-first** | Optimized offline models with Armenian Flag Tricolor branding and native AIBUBEN Yerevan AI Community integration |
 | 🔒 **Fully offline** | Local Whisper AI and Qwen/Gemma action summaries offline |
@@ -120,7 +123,22 @@ Each meeting is stored in `%APPDATA%\Transcribe\meetings\<timestamp>\` with:
 - `chunks.jsonl` - every transcribed chunk as it arrived (crash-recoverable)
 - `transcript.txt` - full transcript
 - `notes.md` - Summary + Key decisions + Action items + Open questions
-- `meta.json` - duration, chunk count, language
+- `meta.json` - title, attendees, duration, timestamp
+- `audio_partN.wav` - the raw recording, one file per recording segment
+
+**Settings → History** lists every meeting. Open one for its **Summary** and **Transcript** tabs, **Resume session** (continue the same meeting later - the new part is appended and the notes regenerated), **Save recording** as MP3 or WAV, **Save as Word**, and **Send to Notion**.
+
+### Live Prompter 🪟
+
+While a meeting is being recorded (or straight from the tray / **Ctrl+Alt+A**), the **Live Prompter** floats over your call as a translucent glass card:
+
+- **Start** begins live transcription right from the card; a green timer runs, the red button stops and generates the notes.
+- **NOW** shows the last thing said; **SO FAR** a running AI summary.
+- **Say next / Follow-ups / Recap** or any typed question → answers stream in instantly, formatted (bold key phrases, bullets, code blocks).
+- **Screen context (Auto)**: when the conversation or your question refers to what's on screen, a screenshot goes to the AI - the card itself is never in it.
+- **Private**: the card is excluded from screen sharing and recordings on Windows 10 2004+, and the eye badge always reports the real state (it says so when the OS can't guarantee it - e.g. Remote Desktop, macOS).
+
+It is a privacy feature for your own notes during calls; recording-consent guidance applies, and it is not intended for interviews, exams or assessments where assistance is prohibited.
 
 ### Capturing the *other* participants' audio
 
@@ -136,11 +154,12 @@ The summary and action items use whatever action engine you've configured in **S
 
 | Engine | Notes quality | Cost |
 |---|---|---|
-| **Rule-based** (default) | Basic extractive summary + keyword-based action items | Free |
-| **Local Qwen** (1.5B/3B/7B) | Good summarisation, no network required | Free (one-time download) |
-| **OpenAI / Gemini / Anthropic** | Best quality (Gemini 2.5 Flash, Claude 4.6/4.8, GPT-5.4/5.5 with integrated real-time pricing display) | Pennies per meeting |
+| **Transcribe Pro** (managed cloud) | Best quality, zero setup | Included in Pro |
+| **Cerebras** (bring your own key) | Fastest - sub-second streamed answers, screen-aware (vision) | ~$0.003 per Live Prompter answer |
+| **Local Qwen / Gemma** (1.5B–7B) | Good summarisation, no network required | Free (one-time download) |
+| **OpenAI / Gemini / Anthropic** | Best quality (GPT-5.x, Gemini Flash, Claude 4.x) | Pennies per meeting |
 
-For 1-hour+ meetings, a cloud engine is recommended because local Qwen has a smaller context window.
+Meetings of any length work with local models too - long transcripts are summarised in stages automatically. The built-in formatter is only a last-resort fallback for final notes; the live features (Live Prompter, running summary) use real AI models or tell you to connect one.
 
 ---
 
@@ -265,9 +284,13 @@ GitHub Actions builds `TranscribeApp-Windows.zip` and `TranscribeApp-Mac.dmg` an
 - [x] Custom vocabulary / prompt
 - [x] macOS support
 - [x] GitHub Actions CI - auto-builds .exe and .dmg on tag
+- [x] Meeting recording with speaker labels, AI notes, Notion export
+- [x] Transcribe Files - audio/video file → Word document
+- [x] Live Prompter - private, screen-share-excluded live copilot with streamed answers
+- [x] Export history to CSV / TXT; meeting recordings to MP3 / WAV
 - [ ] One-click `.dmg` installer (macOS)
 - [ ] Configurable silence detection (auto-stop)
-- [ ] Export history to CSV / TXT
+- [ ] Two-model live ASR (sub-second partials) and speculative suggestions
 
 ---
 
