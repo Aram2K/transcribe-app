@@ -880,8 +880,24 @@ class MeetingsWindow(QDialog):
             logger.warning("Error stopping recorder for meeting finalize: %s", e)
         self._process_meeting_notes()
 
+    def _save_recording_segment(self):
+        """Write the raw audio of this segment to the meeting folder. Called
+        FIRST in post-processing so a transcription or summary failure can
+        never lose the recording itself."""
+        try:
+            import audio_export
+            import meeting_store
+            audio = self.app.recorder.get_full_audio()
+            if audio is not None and len(audio) > 1600 and self._meeting_dir:
+                self._emit_status("Saving the recording…")
+                audio_export.write_wav(
+                    meeting_store.next_audio_part_path(self._meeting_dir), audio)
+        except Exception as e:
+            logger.warning("Could not save meeting audio: %s", e)
+
     def _process_meeting_notes(self):
         try:
+            self._save_recording_segment()
             self._emit_status("Finalizing transcript…")
             # 1. Wait briefly to drain active audio queue and transcription threads
             text, detected_lang = self.app.recorder.transcribe()
@@ -949,19 +965,6 @@ class MeetingsWindow(QDialog):
                     f.write(self._final_transcript)
             except OSError:
                 pass
-
-            # Keep the raw recording too (one WAV per segment, never overwritten)
-            # so it can be exported later from History.
-            try:
-                import audio_export
-                import meeting_store
-                audio = self.app.recorder.get_full_audio()
-                if audio is not None and len(audio) > 1600:
-                    self._emit_status("Saving the recording…")
-                    audio_export.write_wav(
-                        meeting_store.next_audio_part_path(self._meeting_dir), audio)
-            except Exception as e:
-                logger.warning("Could not save meeting audio: %s", e)
 
             # 2. Summarize as a separate step so the Done page's "Retry Summary"
             # can re-run just this part on the saved transcript (no re-record).
@@ -1154,9 +1157,11 @@ class MeetingsWindow(QDialog):
         the next audio part; the notes are regenerated from everything."""
         import meeting_store
         from pathlib import Path
-        if self.state == self.STATE_RECORDING:
-            QMessageBox.information(self, "Already recording",
-                                    "Stop the current meeting before resuming another.")
+        if self.state in (self.STATE_RECORDING, self.STATE_PROCESSING):
+            QMessageBox.information(
+                self, "Meeting in progress",
+                "Stop the current meeting and let its notes finish before resuming "
+                "another.")
             return
         meta = meeting_store.load_meta(folder)
         self._resume_dir = Path(folder)
@@ -1389,6 +1394,9 @@ class MeetingsWindow(QDialog):
 
     def _reset(self):
         self.state = self.STATE_IDLE
+        # Reset/Abort must drop any pending resume, or the NEXT new meeting
+        # would write into the resumed folder and inherit its transcript.
+        self._clear_resume_state()
         self.input_title.clear()
         self.input_attendees.clear()
         self.combo_device.setCurrentIndex(0)
