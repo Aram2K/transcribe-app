@@ -7,6 +7,7 @@ PROVIDER_OPENAI = "openai_compatible"
 PROVIDER_GEMINI = "gemini"
 PROVIDER_ANTHROPIC = "anthropic"
 PROVIDER_CEREBRAS = "cerebras"      # OpenAI-compatible wire; fastest inference (vision-capable Qwen)
+PROVIDER_MISTRAL = "mistral"        # OpenAI-compatible wire; reuses the Voxtral speech key
 
 PROVIDERS = {
     PROVIDER_OPENAI: {
@@ -37,7 +38,40 @@ PROVIDERS = {
         "default_model": "qwen-3.8-27b",
         "default_recap_model": "gpt-oss-120b",
     },
+    PROVIDER_MISTRAL: {
+        # One Mistral key covers speech (Voxtral), the copilot (Ministral 3,
+        # image input) and OCR. Same /chat/completions wire as OpenAI; Mistral
+        # rejects unknown fields, so no reasoning_effort is sent to it.
+        "label": "Mistral AI (Ministral · vision)",
+        "description": "Ministral / Mistral models; reuses your Mistral (Voxtral) key.",
+        "default_base_url": "https://api.mistral.ai/v1",
+        "default_model": "ministral-14b-2512",
+        "default_recap_model": "ministral-8b-2512",
+    },
 }
+
+MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
+
+
+def mistral_ocr(image_b64, key, timeout=30):
+    """Text of a screenshot via Mistral OCR (markdown, all pages joined).
+    Returns "" on any failure - callers treat OCR as best-effort context."""
+    if not (image_b64 and (key or "").strip()):
+        return ""
+    try:
+        resp = requests.post(
+            MISTRAL_OCR_URL,
+            headers={"Authorization": f"Bearer {key.strip()}", "Content-Type": "application/json"},
+            json={"model": "mistral-ocr-latest",
+                  "document": {"type": "image_url", "image_url": _image_data_url(image_b64)}},
+            timeout=timeout,
+        )
+        if not (200 <= resp.status_code < 300):
+            return ""
+        pages = resp.json().get("pages") or []
+        return "\n\n".join((p.get("markdown") or "") for p in pages).strip()
+    except Exception:
+        return ""
 
 # Models that think before answering unless told not to. For the live
 # features every second of hidden reasoning is a second the user waits.
@@ -106,6 +140,7 @@ _ENGINE_TO_PROVIDER = {
     "api_gemini": PROVIDER_GEMINI,
     "api_anthropic": PROVIDER_ANTHROPIC,
     "api_cerebras": PROVIDER_CEREBRAS,
+    "api_mistral": PROVIDER_MISTRAL,
 }
 
 
@@ -307,7 +342,12 @@ def anthropic_convo_with_image(convo, image_b64):
 
 
 def _sse_data_lines(resp):
-    """Yield the payload of each `data:` line of a server-sent-events stream."""
+    """Yield the payload of each `data:` line of a server-sent-events stream.
+
+    Event streams are UTF-8 by specification, but `requests` falls back to
+    ISO-8859-1 for any text/* response without a charset - which would garble
+    every non-ASCII token (Armenian, Russian...). Pin the decoding."""
+    resp.encoding = "utf-8"
     for raw in resp.iter_lines(decode_unicode=True):
         if not raw:
             continue

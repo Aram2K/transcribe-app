@@ -21,6 +21,7 @@ API_OPENAI_ID = "api_openai_compatible"
 API_GEMINI_ID = "api_gemini"
 API_ANTHROPIC_ID = "api_anthropic"
 API_CEREBRAS_ID = "api_cerebras"
+API_MISTRAL_ID = "api_mistral"
 API_MANAGED_ID = "managed"  # Pro: runs through the server (founder's Mistral key)
 
 ACTION_MODES = {
@@ -84,7 +85,41 @@ ACTION_MODELS = {
         "kind": "cloud",
         "provider": action_api.PROVIDER_CEREBRAS,
     },
+    API_MISTRAL_ID: {
+        "label": "Mistral AI (Ministral · vision)",
+        "description": "Fast Ministral models with image input; reuses your Mistral (Voxtral) key "
+                       "and adds Mistral OCR for screen text.",
+        "available": True,
+        "kind": "cloud",
+        "provider": action_api.PROVIDER_MISTRAL,
+    },
 }
+
+
+def cloud_api_config(model, config):
+    """The config a cloud engine runs with: provider set from the engine, plus
+    the key conveniences - Gemini may run on the Google speech key, Mistral on
+    the Voxtral speech key - so one key powers speech AND AI actions."""
+    info = ACTION_MODELS[model]
+    api_config = {**(config or {}), "action_api_provider": info["provider"]}
+    if not (api_config.get("action_api_key") or "").strip():
+        fallback = ""
+        if info["provider"] == action_api.PROVIDER_GEMINI:
+            fallback = (config or {}).get("google_api_key") or ""
+        elif info["provider"] == action_api.PROVIDER_MISTRAL:
+            fallback = (config or {}).get("mistral_api_key") or ""
+        if fallback.strip():
+            api_config["action_api_key"] = fallback.strip()
+    return api_config
+
+
+def engine_has_key(model, cfg):
+    """True when ``model`` can run with the keys in ``cfg`` (non-cloud engines
+    always can, as far as keys are concerned)."""
+    info = ACTION_MODELS.get(model, {})
+    if info.get("kind") != "cloud":
+        return True
+    return bool((cloud_api_config(model, cfg).get("action_api_key") or "").strip())
 
 for _code, _info in local_llm.MODEL_CATALOG.items():
     ACTION_MODELS[_code] = {
@@ -211,15 +246,7 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
         if kind == "cloud":
             if not config:
                 raise ActionError("Add your API key in Settings → AI Actions to use Smart actions.")
-            api_config = {**config, "action_api_provider": ACTION_MODELS[model]["provider"]}
-            # Convenience: Gemini actions reuse the Google API key (used for the
-            # speech backend) when no dedicated action key is configured, so a
-            # single Google key powers both transcription and Smart actions.
-            if (ACTION_MODELS[model]["provider"] == action_api.PROVIDER_GEMINI
-                    and not (api_config.get("action_api_key") or "").strip()):
-                google_key = (config.get("google_api_key") or "").strip()
-                if google_key:
-                    api_config["action_api_key"] = google_key
+            api_config = cloud_api_config(model, config)
             try:
                 return action_api.run_action(
                     text, ACTION_SMART_AUTO, api_config,
@@ -272,7 +299,7 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
     if ACTION_MODELS[model].get("kind") == "cloud":
         if not config:
             raise ActionError("Add your action API settings before using this action engine.")
-        api_config = {**config, "action_api_provider": ACTION_MODELS[model]["provider"]}
+        api_config = cloud_api_config(model, config)
         try:
             return action_api.run_action(text, mode, api_config, source_lang=source_lang, target_lang=target_lang)
         except action_api.ActionAPIError as e:
@@ -354,12 +381,7 @@ def process_stream(text, mode, on_token, source_lang="auto", target_lang="en",
         if kind == "cloud":
             if not config:
                 raise ActionError(NO_ENGINE_MESSAGE)
-            api_config = {**config, "action_api_provider": ACTION_MODELS[model]["provider"]}
-            if (ACTION_MODELS[model]["provider"] == action_api.PROVIDER_GEMINI
-                    and not (api_config.get("action_api_key") or "").strip()):
-                google_key = (config.get("google_api_key") or "").strip()
-                if google_key:
-                    api_config["action_api_key"] = google_key
+            api_config = cloud_api_config(model, config)
             return action_api.run_action_stream(
                 text, mode, api_config, on_token,
                 source_lang=source_lang, target_lang=target_lang)

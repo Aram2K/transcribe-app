@@ -1116,10 +1116,7 @@ class LiveAssistOverlay(QWidget):
         engine, cfg = self.app._resolve_action_engine()
         info = actions.ACTION_MODELS.get(engine, {})
         kind = info.get("kind")
-        has_key = bool((self.app.cfg.get("action_api_key") or "").strip())
-        if (not has_key and info.get("provider") == getattr(actions.action_api,
-                                                              "PROVIDER_GEMINI", None)):
-            has_key = bool((self.app.cfg.get("google_api_key") or "").strip())
+        has_key = actions.engine_has_key(engine, self.app.cfg)
         has_token = bool((cfg or {}).get("_managed_token"))
         if engine == actions.RULE_BASED_ID or (kind == "cloud" and not has_key) \
                 or (kind == "managed" and not has_token):
@@ -1144,8 +1141,17 @@ class LiveAssistOverlay(QWidget):
             if image_b64 and kind in ("cloud", "managed"):
                 cfg["_image_png_b64"] = image_b64
             elif image_b64:
-                self.sig_status.emit("Screen needs a cloud AI engine (Pro or your own "
-                                     "key) - answered from the transcript only.")
+                # Text-only engine (local model): read the screen with Mistral
+                # OCR when a Mistral key exists, so screen context still works.
+                mkey = (cfg.get("mistral_api_key") or "").strip()
+                ocr = actions.action_api.mistral_ocr(image_b64, mkey) if mkey else ""
+                if ocr:
+                    context += ("\n\nText visible on the user's screen (OCR):\n"
+                                + ocr[:3000])
+                    self.sig_status.emit("Screen read via OCR")
+                else:
+                    self.sig_status.emit("Screen needs a cloud AI engine (Pro or your own "
+                                         "key) - answered from the transcript only.")
             acc = []
             last_emit = [0.0]
 

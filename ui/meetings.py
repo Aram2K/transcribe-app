@@ -800,10 +800,7 @@ class MeetingsWindow(QDialog):
         engine, cfg = self.app._resolve_action_engine()
         info = actions.ACTION_MODELS.get(engine, {})
         kind = info.get("kind")
-        has_key = bool((self.app.cfg.get("action_api_key") or "").strip())
-        if (not has_key
-                and info.get("provider") == getattr(action_api, "PROVIDER_GEMINI", None)):
-            has_key = bool((self.app.cfg.get("google_api_key") or "").strip())
+        has_key = actions.engine_has_key(engine, self.app.cfg)
         has_token = bool((cfg or {}).get("_managed_token"))
         if engine == actions.RULE_BASED_ID or (kind == "cloud" and not has_key) \
                 or (kind == "managed" and not has_token):
@@ -922,7 +919,10 @@ class MeetingsWindow(QDialog):
 
             self._final_transcript = "\n\n".join(full_chunks_text).strip()
 
-            if not self._final_transcript:
+            # A resumed session with no NEW speech still has its earlier
+            # transcript - regenerate the notes from that instead of calling
+            # the meeting empty (which would also reset the resume state).
+            if not self._final_transcript and not getattr(self, "_resume_prior", ""):
                 msg = "No transcription recorded. The meeting is empty."
                 # In a system-audio mode, a dead-silent loopback means the
                 # sound the user heard was playing on a DIFFERENT output
@@ -953,9 +953,10 @@ class MeetingsWindow(QDialog):
             # A resumed meeting continues its earlier transcript.
             prior = getattr(self, "_resume_prior", "")
             if prior:
+                new_part = self._final_transcript.strip()
                 self._final_transcript = (
-                    f"{prior}\n\n— Resumed {time.strftime('%Y-%m-%d %H:%M')} —\n\n"
-                    f"{self._final_transcript}")
+                    f"{prior}\n\n— Resumed {time.strftime('%Y-%m-%d %H:%M')} —\n\n{new_part}"
+                    if new_part else prior)
 
             # Persist the transcript to disk IMMEDIATELY - before the summary -
             # so a summary failure (missing key, network, server error) can never
@@ -1034,10 +1035,7 @@ class MeetingsWindow(QDialog):
             # Key check is PROVIDER-aware: a Google key only counts for the
             # Gemini engine (matching actions.process's own fallback) - it must
             # not let an Anthropic/OpenAI pick sail through and fail later.
-            has_key = bool((self.app.cfg.get("action_api_key") or "").strip())
-            if (not has_key
-                    and info.get("provider") == getattr(action_api, "PROVIDER_GEMINI", None)):
-                has_key = bool((self.app.cfg.get("google_api_key") or "").strip())
+            has_key = actions.engine_has_key(engine, self.app.cfg)
             has_token = bool((engine_config or {}).get("_managed_token"))
             downgraded_from = ""
             if (kind == "cloud" and not has_key) or (kind == "managed" and not has_token):

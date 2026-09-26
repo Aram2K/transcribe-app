@@ -156,6 +156,7 @@ The summary and action items use whatever action engine you've configured in **S
 |---|---|---|
 | **Transcribe Pro** (managed cloud) | Best quality, zero setup | Included in Pro |
 | **Cerebras** (bring your own key) | Fastest - sub-second streamed answers, screen-aware (vision) | ~$0.003 per Live Prompter answer |
+| **Mistral AI** (bring your own key) | Ministral models with image input; the same key runs Voxtral speech and Mistral OCR for screen text | Pennies per meeting |
 | **Local Qwen / Gemma** (1.5B–7B) | Good summarisation, no network required | Free (one-time download) |
 | **OpenAI / Gemini / Anthropic** | Best quality (GPT-5.x, Gemini Flash, Claude 4.x) | Pennies per meeting |
 

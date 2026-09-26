@@ -254,3 +254,81 @@ class TestAutoScreenContext(unittest.TestCase):
 
     def test_off_switch(self):
         self.assertFalse(self.f("what is on my screen?", "", auto=False))
+
+
+class TestStreamingRobustness(unittest.TestCase):
+    def test_sse_lines_decode_utf8_without_charset(self):
+        # requests defaults text/* without a charset to ISO-8859-1, which
+        # garbles every non-ASCII token; event streams are UTF-8 by spec.
+        body = ('data: {"choices":[{"delta":{"content":"Բարեւ ձեզ — привет"}}]}\n\n'
+                'data: [DONE]\n').encode("utf-8")
+
+        class FakeResp:
+            # Mimics requests: decode_unicode uses .encoding, which requests
+            # sets to ISO-8859-1 for text/* responses lacking a charset.
+            encoding = "ISO-8859-1"
+
+            def iter_lines(self, decode_unicode=False):
+                for line in body.split(b"\n"):
+                    yield line.decode(self.encoding) if decode_unicode else line
+
+        resp = FakeResp()
+        lines = list(action_api._sse_data_lines(resp))
+        self.assertEqual(resp.encoding, "utf-8")
+        self.assertIn("Բարեւ ձեզ — привет", lines[0])
+        self.assertEqual(lines[1], "[DONE]")
+
+    def test_process_cloud_branch_uses_google_key_for_gemini(self):
+        # The live recap routes through process(); a Gemini engine running on
+        # the speech Google key must not be rejected for a missing action key.
+        from unittest.mock import patch
+        seen = {}
+        def fake_run(text, mode, api_config, source_lang="auto", target_lang="en"):
+            seen.update(api_config)
+            return "- recap"
+        with patch.object(action_api, "run_action", fake_run):
+            out = actions.process("Conversation (latest part):\nhi", actions.ACTION_LIVE_RECAP,
+                                  model=actions.API_GEMINI_ID,
+                                  config={"google_api_key": "G-KEY", "action_api_key": ""})
+        self.assertEqual(out, "- recap")
+        self.assertEqual(seen.get("action_api_key"), "G-KEY")
+
+
+class TestMistralEngine(unittest.TestCase):
+    def test_mistral_is_registered_with_speech_key_fallback(self):
+        info = actions.ACTION_MODELS[actions.API_MISTRAL_ID]
+        self.assertEqual(info["provider"], action_api.PROVIDER_MISTRAL)
+        d = action_api.defaults(action_api.PROVIDER_MISTRAL)
+        self.assertEqual(d["default_base_url"], "https://api.mistral.ai/v1")
+        cfg = {"mistral_api_key": "M-KEY", "action_api_key": ""}
+        api_cfg = actions.cloud_api_config(actions.API_MISTRAL_ID, cfg)
+        self.assertEqual(api_cfg["action_api_key"], "M-KEY")
+        self.assertEqual(api_cfg["action_api_provider"], action_api.PROVIDER_MISTRAL)
+        self.assertTrue(actions.engine_has_key(actions.API_MISTRAL_ID, cfg))
+        self.assertFalse(actions.engine_has_key(actions.API_MISTRAL_ID, {}))
+        # A dedicated action key wins over the speech key.
+        self.assertEqual(actions.cloud_api_config(actions.API_MISTRAL_ID,
+                                                  {"mistral_api_key": "M", "action_api_key": "A"})["action_api_key"], "A")
+        # Mistral rejects unknown fields: no reasoning_effort for its models.
+        self.assertIsNone(action_api.reasoning_effort_for("ministral-14b-2512"))
+
+    def test_engine_has_key_for_other_kinds(self):
+        self.assertTrue(actions.engine_has_key("qwen_tiny", {}))          # local: keys irrelevant
+        self.assertTrue(actions.engine_has_key(actions.API_GEMINI_ID, {"google_api_key": "G"}))
+        self.assertFalse(actions.engine_has_key(actions.API_CEREBRAS_ID, {"mistral_api_key": "M"}))
+
+    def test_mistral_ocr_request_shape_and_failure(self):
+        from unittest.mock import MagicMock, patch
+        ok = MagicMock(status_code=200)
+        ok.json.return_value = {"pages": [{"markdown": "Quarterly numbers"}, {"markdown": "42% growth"}]}
+        with patch.object(action_api.requests, "post", return_value=ok) as post:
+            text = action_api.mistral_ocr("AAAA", "M-KEY")
+        self.assertEqual(text, "Quarterly numbers\n\n42% growth")
+        body = post.call_args[1]["json"]
+        self.assertEqual(body["model"], "mistral-ocr-latest")
+        self.assertEqual(body["document"]["type"], "image_url")
+        self.assertTrue(body["document"]["image_url"].startswith("data:image/png;base64,AAAA"))
+        bad = MagicMock(status_code=401)
+        with patch.object(action_api.requests, "post", return_value=bad):
+            self.assertEqual(action_api.mistral_ocr("AAAA", "M-KEY"), "")
+        self.assertEqual(action_api.mistral_ocr("AAAA", ""), "")

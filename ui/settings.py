@@ -1676,6 +1676,9 @@ class Settings(QDialog):
             elif provider == actions.API_CEREBRAS_ID:
                 b = (base or "https://api.cerebras.ai/v1").rstrip("/")
                 r = requests.get(f"{b}/models", headers={"Authorization": f"Bearer {key}"}, timeout=20)
+            elif provider == actions.API_MISTRAL_ID:
+                b = (base or "https://api.mistral.ai/v1").rstrip("/")
+                r = requests.get(f"{b}/models", headers={"Authorization": f"Bearer {key}"}, timeout=20)
             else:  # OpenAI-compatible
                 b = (base or "https://api.openai.com/v1").rstrip("/")
                 r = requests.get(f"{b}/models", headers={"Authorization": f"Bearer {key}"}, timeout=20)
@@ -2048,6 +2051,7 @@ class Settings(QDialog):
         # engine - it survives only as the app's invisible safety fallback
         # (privacy mode, lapsed Pro, missing local model).
         self.combo_engine.addItem("Cerebras API - fastest, vision (Cloud Engine)", actions.API_CEREBRAS_ID)
+        self.combo_engine.addItem("Mistral AI - Ministral, vision (Cloud Engine)", actions.API_MISTRAL_ID)
         self.combo_engine.addItem("Google Gemini API (Cloud Engine)", actions.API_GEMINI_ID)
         self.combo_engine.addItem("OpenAI-compatible API (Cloud Engine)", actions.API_OPENAI_ID)
         self.combo_engine.addItem("Anthropic Claude API (Cloud Engine)", actions.API_ANTHROPIC_ID)
@@ -2650,6 +2654,39 @@ class Settings(QDialog):
                 if idx >= 0:
                     self.cloud_api_model.setCurrentIndex(idx)
                 
+            elif provider == actions.API_MISTRAL_ID:
+                # One Mistral key for speech (Voxtral), the copilot (Ministral 3
+                # with image input) and OCR. The key field pre-fills from the
+                # speech key when no dedicated action key is set.
+                self.lbl_cloud_url.setVisible(False)
+                self.cloud_api_url.setVisible(False)
+                self.cloud_api_url.setText("https://api.mistral.ai/v1")
+                models_info = [
+                    ("ministral-14b-2512  -  fast, vision  (approx. $0.20 / 1M tokens)", "ministral-14b-2512"),
+                    ("ministral-8b-2512  -  cheaper, vision  (approx. $0.15 / 1M tokens)", "ministral-8b-2512"),
+                    ("mistral-small-latest  -  stronger, vision  (approx. $0.20 / 1M tokens)", "mistral-small-latest"),
+                    ("mistral-medium-latest  -  best quality  (approx. $0.40 / 1M tokens)", "mistral-medium-latest"),
+                ]
+                for label, model_id in models_info:
+                    self.cloud_api_model.addItem(label, model_id)
+                self.cloud_api_model.addItem("Custom Model...")
+                self.cloud_api_key.setText(
+                    self.cfg_working.get("action_api_key", "")
+                    or self.cfg_working.get("mistral_api_key", ""))
+
+                saved_model = self.cfg_working.get("action_api_model", "") or "ministral-14b-2512"
+                if saved_model in set(gemini_models + anthropic_models + openai_models):
+                    saved_model = "ministral-14b-2512"
+                idx = self.cloud_api_model.findData(saved_model)
+                if idx < 0:
+                    idx = self.cloud_api_model.findText(saved_model)
+                    if idx < 0 and saved_model != "Custom Model...":
+                        insert_idx = max(0, self.cloud_api_model.count() - 1)
+                        self.cloud_api_model.insertItem(insert_idx, saved_model)
+                        idx = insert_idx
+                if idx >= 0:
+                    self.cloud_api_model.setCurrentIndex(idx)
+
             elif provider == actions.API_CEREBRAS_ID:
                 # The "instant" engine (verified Sept 2026): qwen-3.8-27b
                 # streams ~1,850 tok/s with vision; gpt-oss-120b is the cheap
@@ -2944,7 +2981,7 @@ class Settings(QDialog):
             cloud_ids = {
                 actions.API_MANAGED_ID, actions.API_GEMINI_ID,
                 actions.API_OPENAI_ID, actions.API_ANTHROPIC_ID,
-                actions.API_CEREBRAS_ID,
+                actions.API_CEREBRAS_ID, actions.API_MISTRAL_ID,
             }
             model = self.combo_engine.model()
             for i in range(self.combo_engine.count()):
@@ -2984,7 +3021,13 @@ class Settings(QDialog):
                 self.cfg_working["google_api_key"] = key_text
             else:
                 self.cfg_working["action_api_key"] = key_text
-                self.cfg_working["action_api_base_url"] = self.cloud_api_url.text().strip()
+                # Only providers with an editable/preset URL persist one; for
+                # the fixed-endpoint providers a stale URL from another preset
+                # must never leak into the saved config.
+                url_field = self.cloud_api_url.text().strip()
+                self.cfg_working["action_api_base_url"] = (
+                    url_field if provider in (actions.API_OPENAI_ID, actions.API_CEREBRAS_ID,
+                                              actions.API_MISTRAL_ID) else "")
                 
             saved_val = self.cloud_api_model.currentData()
             if not saved_val:
