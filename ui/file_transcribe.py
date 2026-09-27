@@ -345,6 +345,10 @@ class FileTranscribeTab(QWidget):
         args = (self._path, self.combo_model.currentData(),
                 self.chk_speakers.isChecked(), self.chk_timestamps.isChecked(),
                 self._is_pro())
+        self._job_started = time.time()
+        if self.app is not None:
+            self.app.track("file_transcription_started", {
+                "model": args[1], "speakers": args[2], "timestamps": args[3]})
         threading.Thread(target=self._run_job, args=args, daemon=True).start()
 
     def _request_cancel(self):
@@ -497,6 +501,20 @@ class FileTranscribeTab(QWidget):
             self.app._file_job_running = False
         self.prog_box.hide()
         self.btn_go.setEnabled(bool(self._path))
+        if self.app is not None:
+            took_min = round((time.time() - getattr(self, "_job_started", time.time())) / 60, 1)
+            if error:
+                reason = ("cancelled" if error == "cancelled"
+                          else "too_long" if error.startswith("limit:") else "error")
+                self.app.track("file_transcription_failed", {"reason": reason, "took_minutes": took_min})
+            elif result:
+                self.app.track("file_transcription_completed", {
+                    "model": result.get("model"),
+                    "audio_minutes": round(result.get("duration", 0) / 60, 1),
+                    "took_minutes": took_min,
+                    "speakers": result.get("speaker_count", 0),
+                    "timestamps": result.get("timestamps", False),
+                })
         if error == "cancelled":
             return
         if error:
@@ -553,6 +571,8 @@ class FileTranscribeTab(QWidget):
 
     def _copy_text(self):
         QApplication.clipboard().setText(self._plain_text())
+        if self.app is not None:
+            self.app.track("file_transcription_saved", {"format": "clipboard"})
 
     def _save_docx(self):
         if not self._result:
@@ -574,6 +594,8 @@ class FileTranscribeTab(QWidget):
         except OSError as e:
             QMessageBox.warning(self, "Save failed", str(e))
             return
+        if self.app is not None:
+            self.app.track("file_transcription_saved", {"format": "docx"})
         box = QMessageBox(self)
         box.setWindowTitle("Saved")
         box.setText(f"Word document saved:\n{path}")

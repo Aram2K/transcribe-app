@@ -7,11 +7,16 @@ the single reader used by the History tab, the detail view and Resume.
 """
 import json
 import re
+import shutil
+import wave
 from pathlib import Path
 
 import storage
 
 _PART_RE = re.compile(r"^audio_part(\d+)\.wav$", re.I)
+# A session the user aborted & discarded: its live chunks, kept on disk under
+# this name (as before) but out of the History list.
+DISCARDED_CHUNKS = "chunks.discarded.jsonl"
 
 
 def meetings_dir():
@@ -40,7 +45,49 @@ def load_notes(folder):
 
 
 def load_transcript(folder):
-    return _read(folder, "transcript.txt")
+    """transcript.txt - or, for a meeting that never got that far (the app
+    closed mid-meeting), what its live chunks captured, so it still shows
+    and resumes with what was said."""
+    text = _read(folder, "transcript.txt")
+    return text if text.strip() else chunks_text(folder)
+
+
+def chunks_text(folder):
+    """The text of chunks.jsonl in spoken order. Chunk indices restart with
+    every recording segment, so they're only sorted when unique (one
+    segment); otherwise the file order is kept."""
+    rows = []
+    try:
+        with open(Path(folder) / "chunks.jsonl", "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue            # a line cut short by a crash
+                if isinstance(row, dict) and isinstance(row.get("text"), str) \
+                        and row["text"].strip():
+                    rows.append(row)
+    except Exception:
+        return ""
+    idx = [r.get("index") for r in rows]
+    if all(isinstance(i, int) for i in idx) and len(set(idx)) == len(idx):
+        rows.sort(key=lambda r: r["index"])
+    return " ".join(r["text"].strip() for r in rows)
+
+
+def mark_discarded(folder):
+    """Hide an aborted session's live chunks from History (see list_meetings)
+    without deleting them. A chunk thread finishing after the rename can
+    recreate chunks.jsonl - the marker still hides it."""
+    folder = Path(folder)
+    try:
+        src = folder / "chunks.jsonl"
+        if src.is_file():
+            src.replace(folder / DISCARDED_CHUNKS)
+        elif folder.is_dir():
+            (folder / DISCARDED_CHUNKS).touch()
+    except OSError:
+        pass
 
 
 def audio_parts(folder):
@@ -78,8 +125,10 @@ def summary_preview(notes, limit=140):
 
 
 def list_meetings():
-    """Newest first. Only folders that actually hold a meeting (meta or
-    transcript) are listed; an empty aborted folder is skipped."""
+    """Newest first. Every folder that holds any of a meeting is listed -
+    including one with only its recording or live chunks (transcription or
+    notes failed, or the app closed mid-meeting), so a saved recording is
+    always reachable. Empty and discarded folders are skipped."""
     root = meetings_dir()
     out = []
     try:
@@ -90,24 +139,89 @@ def list_meetings():
         meta = load_meta(folder)
         has_transcript = (folder / "transcript.txt").is_file()
         has_notes = (folder / "notes.md").is_file()
-        if not (meta or has_transcript or has_notes):
+        parts = audio_parts(folder)
+        has_chunks = ((folder / "chunks.jsonl").is_file()
+                      and not (folder / DISCARDED_CHUNKS).exists())
+        # Live chunks alone don't make a meeting: that is the one being
+        # recorded right now, or a session discarded before 1.9.1 (no marker
+        # then) - both must stay out of History. With meta.json (written when
+        # processing starts) they are a meeting whose transcription failed.
+        # meta.json alone (nothing was captured) is no meeting either.
+        if not (has_transcript or has_notes or parts or (meta and has_chunks)):
             continue
         out.append({
             "dir": str(folder),
             "id": folder.name,
-            "title": (meta.get("title") or "Untitled Meeting").strip(),
-            "attendees": meta.get("attendees") or "",
-            "timestamp": meta.get("timestamp") or _folder_timestamp(folder.name),
-            "duration_sec": int(meta.get("duration_sec") or 0),
+            "title": str(meta.get("title") or "Untitled Meeting").strip(),
+            "attendees": str(meta.get("attendees") or ""),
+            "timestamp": str(meta.get("timestamp") or _folder_timestamp(folder.name)),
+            # No meta.json (it's written when processing starts): the
+            # recording's own length beats a "0 s" card.
+            "duration_sec": _int(meta.get("duration_sec")) or _wav_seconds(parts),
             "has_transcript": has_transcript,
             "has_notes": has_notes,
-            "audio_parts": [str(p) for p in audio_parts(folder)],
+            "audio_parts": [str(p) for p in parts],
         })
     return out
 
 
+def _int(value):
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _wav_seconds(parts):
+    total = 0.0
+    for p in parts:
+        try:
+            with wave.open(str(p), "rb") as w:
+                total += w.getnframes() / float(w.getframerate() or 1)
+        except Exception:
+            continue                # unreadable/partial WAV: skip it
+    return int(total)
+
+
+def delete_meeting(folder):
+    """Permanently delete one meeting folder - notes, transcript, recording.
+    Refuses anything that isn't a folder inside the meetings library.
+    Returns True when it's gone."""
+    try:
+        root = meetings_dir().resolve()
+        target = Path(folder).resolve()
+    except Exception:
+        return False
+    if target == root or root not in target.parents or not target.is_dir():
+        return False
+    try:
+        shutil.rmtree(target)
+    except OSError:
+        return False
+    return not target.exists()
+
+
+def delete_all_meetings(keep=None):
+    """Delete every meeting folder (listed or aborted leftovers) except
+    ``keep`` - a meeting still being recorded or processed. Returns how many
+    folders were removed."""
+    try:
+        folders = [p for p in meetings_dir().iterdir() if p.is_dir()]
+        keep_path = Path(keep).resolve() if keep else None
+    except Exception:
+        return 0
+    removed = 0
+    for folder in folders:
+        if keep_path is not None and folder.resolve() == keep_path:
+            continue
+        if delete_meeting(folder):
+            removed += 1
+    return removed
+
+
 def _folder_timestamp(name):
-    m = re.match(r"^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})$", name)
+    # "_2", "_3"...: a second meeting started within the same second.
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})(?:_\d+)?$", name)
     if not m:
         return name
     y, mo, d, h, mi, s = m.groups()

@@ -368,6 +368,19 @@ class Onboarding(QDialog):
 
     def _on_auth_result(self, status, message):
         self._set_form_busy(False)
+        if self.app and hasattr(self.app, "track"):
+            if status == "ok":
+                self.app.track("login_succeeded", {"method": "email", "mode": self._auth_mode})
+            elif status == "verify":
+                self.app.track("signup_verification_sent")
+            else:
+                # A fixed code from auth, never the message: the server's text
+                # can quote the address back ('Email address "x@y" is invalid').
+                auth = getattr(self.app, "auth", None)
+                self.app.track("login_failed", {
+                    "method": "email", "mode": self._auth_mode,
+                    "reason": getattr(auth, "last_error", "") or "other",
+                })
         if status == "ok":
             self.guest_mode = False
             self._proceed_after_auth()
@@ -793,6 +806,9 @@ class Onboarding(QDialog):
         if self.app:
             self.app.cfg["account_gate_seen"] = True
             self.app.save_config()
+            if hasattr(self.app, "track"):
+                self.app.track("onboarding_completed", {
+                    "account_only": True, "signed_in": not self.guest_mode})
         self.accept()
 
     def _back(self):
@@ -852,5 +868,11 @@ class Onboarding(QDialog):
 
             self.app.save_config()
             self.app.apply_tray_bindings()
-            
+            # After saving, so a user who just opted out of analytics sends nothing.
+            if hasattr(self.app, "track"):
+                self.app.track("onboarding_completed", {
+                    "account_only": False, "signed_in": not self.guest_mode,
+                    "backend": self.backend_val, "language": self.lang_val,
+                })
+
         self.accept()

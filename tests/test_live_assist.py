@@ -1,9 +1,10 @@
-"""Live Assist: context building, mode plumbing, no-AI fallback, glass helpers.
+"""Live Assistance: context building, mode plumbing, no-AI fallback, glass helpers.
 
 Pure logic here; the overlay widget is exercised by offscreen smokes and the
 in-session probe. Qt-dependent parts are guarded like test_file_transcribe.
 """
 import sys
+import json
 import unittest
 
 import actions
@@ -28,16 +29,30 @@ class TestModePlumbing(unittest.TestCase):
 
     def test_cloud_and_local_prompts_exist(self):
         cloud = action_api.build_messages("Conversation (latest part):\nhi?", "live_assist")
-        self.assertIn("copilot", cloud[-1]["content"])
-        self.assertIn("They're asking", cloud[-1]["content"])
+        # The brief is the system message (same on every call - cacheable);
+        # the user turn is only the live context.
+        self.assertEqual(cloud[0]["role"], "system")
+        self.assertEqual(cloud[1]["content"], "Conversation (latest part):\nhi?")
+        prompt = cloud[0]["content"]
+        self.assertIn("companion", prompt)
+        self.assertIn("at a glance", prompt)                    # the model is told WHY to be brief
+        self.assertIn("no speaker labels", prompt)              # ...and how to read the transcript
+        self.assertNotIn("interview", prompt)
+        # A companion answers - the old "They're asking / Latest" header read
+        # as a summary, and recaps are exactly what users don't want here.
+        self.assertNotIn("They're asking", prompt)
+        self.assertIn("Never recap", prompt)
+        self.assertIn("screenshot", prompt)
         local = local_llm._messages_for("live_assist", "hi?", "auto", "en")
-        self.assertIn("copilot", local[-1]["content"])
-        self.assertLess(len(local[-1]["content"]), len(cloud[-1]["content"]),
+        self.assertIn("companion", local[-1]["content"])
+        self.assertLess(len(local[-1]["content"]), len(prompt),
                         "local prompt must stay tighter than the cloud one")
 
-    def test_token_budgets_are_short(self):
-        # It's read at a glance mid-conversation; a wall of text is a failure.
-        self.assertLessEqual(action_api._max_tokens_for("live_assist"), 400)
+    def test_token_budgets(self):
+        # Room for a full code solution in the cloud (it streams in); small
+        # local models on a CPU stay short.
+        self.assertLessEqual(action_api._max_tokens_for("live_assist"), 800)
+        self.assertGreaterEqual(action_api._max_tokens_for("live_assist"), 600)
         self.assertLessEqual(local_llm._MAX_TOKENS_BY_MODE["live_assist"], 400)
 
 
@@ -62,15 +77,14 @@ class TestBasicFallback(unittest.TestCase):
         self.assertTrue(out.startswith("Latest: We agreed on Friday."))
 
 
-@unittest.skipUnless(_real_qt(), "real PySide6 not importable (stubbed)")
 class TestRollingContext(unittest.TestCase):
     def setUp(self):
-        from ui.live_assist import rolling_context, TAIL_CHARS
+        from live_context import rolling_context, TAIL_CHARS
         self.rc, self.tail = rolling_context, TAIL_CHARS
 
     def test_trims_to_tail_at_sentence_boundary(self):
         text = ("Old stuff nobody needs. " * 400) + "Recent point. Final question?"
-        ctx = self.rc(text)
+        ctx = self.rc(text, output_lang="auto")
         self.assertLessEqual(len(ctx), self.tail + 200)
         self.assertTrue(ctx.endswith("Final question?"))
         body = ctx.split("Conversation (latest part):\n", 1)[1]
@@ -84,6 +98,21 @@ class TestRollingContext(unittest.TestCase):
 
     def test_empty_transcript_is_explicit(self):
         self.assertIn("(nothing transcribed yet)", self.rc(""))
+
+    def test_earlier_answers_ride_along_for_follow_ups(self):
+        history = [("First?", "old answer one"), ("Second?", "answer two " * 60),
+                   ("Third?", "answer three")]
+        ctx = self.rc("And the second part?", question="and the second part?",
+                      history=history)
+        self.assertNotIn("old answer one", ctx)              # only the last turns
+        self.assertIn("Q: Third? A: answer three", ctx)
+        self.assertIn("…", ctx)                              # long answers are clipped
+        self.assertTrue(ctx.endswith("User's question: and the second part?"))
+        self.assertNotIn("earlier answers", self.rc("Hi."))  # nothing when empty
+
+    def test_screen_note(self):
+        self.assertIn("screenshot", self.rc("Hi.", screen=True))
+        self.assertNotIn("screenshot", self.rc("Hi."))
 
 
 @unittest.skipUnless(_real_qt(), "real PySide6 not importable (stubbed)")
@@ -122,9 +151,11 @@ class TestOverlayHelpers(unittest.TestCase):
 
     def test_quick_actions_shape(self):
         labels = [l for l, _ in self.la.QUICK_ACTIONS]
-        self.assertEqual(labels[0], "Say next")
-        self.assertEqual(self.la.QUICK_ACTIONS[0][1], "")     # default = plain Suggest
+        self.assertEqual(labels, ["Answer", "Follow-ups", "Solve screen"])
+        self.assertNotIn("Recap", labels)                     # no summaries here
+        self.assertEqual(self.la.QUICK_ACTIONS[0][1], "")     # default = answer the latest
         self.assertTrue(all(q for _, q in self.la.QUICK_ACTIONS[1:]))
+        self.assertEqual(self.la.QUICK_ACTIONS[2][1], self.la.SOLVE_SCREEN)
 
 
 class TestImagePlumbing(unittest.TestCase):
@@ -132,6 +163,14 @@ class TestImagePlumbing(unittest.TestCase):
             {"role": "user", "content": "example"},
             {"role": "assistant", "content": "ok"},
             {"role": "user", "content": "the real question"}]
+
+    def test_jpeg_screenshots_get_the_right_mime_type(self):
+        jpeg = "/9j/4AAQSkZJRg"
+        url = action_api.openai_messages_with_image(self.MSGS, jpeg)[3]["content"][1]["image_url"]["url"]
+        self.assertTrue(url.startswith("data:image/jpeg;base64,/9j/"))
+        self.assertEqual(action_api.gemini_parts("p", jpeg)[1]["inline_data"]["mime_type"], "image/jpeg")
+        convo = action_api.anthropic_convo_with_image([{"role": "user", "content": "q"}], jpeg)
+        self.assertEqual(convo[0]["content"][0]["source"]["media_type"], "image/jpeg")
 
     def test_openai_attaches_to_last_user_turn_only(self):
         out = action_api.openai_messages_with_image(self.MSGS, "AAAA")
@@ -230,30 +269,529 @@ class TestFastProviderPlumbing(unittest.TestCase):
                          "https://api.cerebras.ai/v1")
 
 
-@unittest.skipUnless(_real_qt(), "real PySide6 not importable (stubbed)")
-class TestAutoScreenContext(unittest.TestCase):
+class TestScreenContext(unittest.TestCase):
     def setUp(self):
-        from ui.live_assist import should_attach_screen
+        from live_context import should_attach_screen
         self.f = should_attach_screen
 
-    def test_question_cues(self):
-        self.assertTrue(self.f("what does this error mean?", ""))
-        self.assertTrue(self.f("summarise the slide", ""))
-        self.assertTrue(self.f("what's on my screen", ""))
-        # A question with no screen reference costs no screenshot.
-        self.assertFalse(self.f("what deadline did they mention?", "look at this chart"))
+    def test_on_means_every_answer_sees_the_screen(self):
+        # No keyword guessing: "how do I solve this?" is about the screen too.
+        self.assertTrue(self.f(True))
+        self.assertFalse(self.f(False))
 
-    def test_conversation_cues_when_no_question(self):
-        self.assertTrue(self.f("", "Speaker 2: as you can see on this slide the numbers dropped."))
-        self.assertTrue(self.f("", "Can you share your screen and show the dashboard?"))
-        self.assertFalse(self.f("", "We agreed to ship on Friday."))
+    def test_solve_screen_forces_it(self):
+        self.assertTrue(self.f(False, force=True))
 
-    def test_only_recent_speech_counts(self):
-        old_cue = "look at this chart. " + ("Then we talked about lunch. " * 40)
-        self.assertFalse(self.f("", old_cue))
 
-    def test_off_switch(self):
-        self.assertFalse(self.f("what is on my screen?", "", auto=False))
+class TestQuestionDetection(unittest.TestCase):
+    def setUp(self):
+        from live_context import looks_like_question, last_question
+        self.q, self.last = looks_like_question, last_question
+
+    def test_punctuated_questions_in_any_language(self):
+        self.assertTrue(self.q("So what would you do differently?"))
+        self.assertTrue(self.q("Ինչպե՞ս ես լուծելու այս խնդիրը։"))      # Armenian ՞
+        self.assertTrue(self.q("Как бы вы это решили?"))
+
+    def test_unpunctuated_speech_recognition(self):
+        self.assertTrue(self.q("tell me about a project you're proud of"))
+        self.assertTrue(self.q("Okay. Walk me through your solution."))
+        self.assertTrue(self.q("could you share the numbers"))
+
+    def test_statements_are_not_questions(self):
+        self.assertFalse(self.q("We shipped the release on Friday."))
+        self.assertFalse(self.q("I think that's fine."))
+        self.assertFalse(self.q(""))
+        # Wh-openers that end with a full stop are statements - e.g. the user
+        # reading the answer aloud must not trigger a new answer.
+        for s in ("When we shipped it, latency dropped by half.",
+                  "What I would do first is add a cache.", "Which is why we moved it.",
+                  "How we solved it was by caching the results.", "Who knows."):
+            self.assertFalse(self.q(s), s)
+
+    def test_unpunctuated_wh_question_still_counts(self):
+        self.assertTrue(self.q("what would you do differently"))
+        self.assertTrue(self.q("Walk me through your solution."))    # a request, full stop or not
+
+    def test_last_question(self):
+        text = "We met on Monday. What is the budget? Thanks. How long will it take?"
+        self.assertEqual(self.last(text), "How long will it take?")
+        self.assertEqual(self.last("No questions here."), "")
+
+
+NO_THINK = {"thinking": False, "enable_thinking": False}
+
+
+class TestSelfHostedModels(unittest.TestCase):
+    """A Modal (vLLM/SGLang) DeepSeek or Qwen turns thinking off via the chat
+    template (older servers reject reasoning_effort); hosted models (Cerebras,
+    OpenRouter) keep reasoning_effort."""
+
+    def test_modal_deepseek_gets_thinking_off_and_its_own_sampling(self):
+        extras = action_api.openai_payload_extras(
+            "deepseek-ai/DeepSeek-V4.1-Flash", "https://ws--deepseek.modal.run/v1", "live_assist")
+        self.assertEqual(extras["chat_template_kwargs"], NO_THINK)
+        self.assertNotIn("reasoning_effort", extras)
+        self.assertEqual((extras["temperature"], extras["top_p"]), (0.6, 0.95))
+        self.assertNotIn("top_k", extras)                       # Qwen-only settings
+        self.assertNotIn("presence_penalty", extras)
+        notes = action_api.openai_payload_extras(
+            "deepseek-ai/DeepSeek-V4.1-Flash", "https://ws--deepseek.modal.run/v1", "meeting_notes")
+        self.assertEqual(notes, {"chat_template_kwargs": NO_THINK})
+        # A short Modal model name still counts; OpenRouter's ids do not.
+        self.assertEqual(action_api.self_hosted_family(
+            "deepseek-v4.1-flash", "https://ws--ds.modal.run/v1"), "deepseek")
+        self.assertIsNone(action_api.self_hosted_family(
+            "deepseek/deepseek-chat", "https://openrouter.ai/api/v1"))
+
+    def test_modal_qwen_gets_template_kwargs(self):
+        extras = action_api.openai_payload_extras(
+            "Qwen/Qwen3.6-35B-A3B", "https://ws--qwen.modal.run/v1", "live_assist")
+        self.assertEqual(extras["chat_template_kwargs"], NO_THINK)
+        self.assertNotIn("reasoning_effort", extras)
+        self.assertEqual(extras["top_k"], 20)                   # model-card sampling, live only
+        plain = action_api.openai_payload_extras(
+            "Qwen/Qwen3.6-35B-A3B", "https://ws--qwen.modal.run/v1", "smart_auto")
+        self.assertNotIn("temperature", plain)                  # other actions stay deterministic
+
+    def test_hosted_models_unchanged(self):
+        self.assertEqual(action_api.openai_payload_extras(
+            "qwen-3.8-27b", "https://api.cerebras.ai/v1", "live_assist"),
+            {"reasoning_effort": "none"})
+        self.assertEqual(action_api.openai_payload_extras(
+            "gpt-4o-mini", "https://api.openai.com/v1", "live_assist"), {})
+
+    def test_warm_up_only_pings_self_hosted_endpoints(self):
+        from unittest.mock import patch
+        modal = {"action_api_provider": action_api.PROVIDER_OPENAI, "action_api_key": "wk-1.ws-2",
+                 "action_api_base_url": "https://ws--qwen.modal.run/v1",
+                 "action_api_model": "Qwen/Qwen3.6-35B-A3B"}
+        with patch.object(action_api.requests, "post") as post:
+            action_api.warm_up(modal)
+        body = post.call_args[1]["json"]
+        self.assertEqual(body["max_tokens"], 1)
+        self.assertEqual(body["chat_template_kwargs"], NO_THINK)
+        cerebras = {"action_api_provider": action_api.PROVIDER_CEREBRAS, "action_api_key": "k"}
+        with patch.object(action_api.requests, "post") as post:
+            action_api.warm_up(cerebras)
+        post.assert_not_called()
+
+
+class TestThinkFilter(unittest.TestCase):
+    """Reasoning a model writes inline must never reach the answer box."""
+
+    def run_filter(self, chunks):
+        f = action_api.ThinkFilter()
+        return "".join(f.feed(c) for c in chunks) + f.flush()
+
+    def test_leading_block_is_hidden_across_chunk_boundaries(self):
+        self.assertEqual(self.run_filter(["<thi", "nk>\nplan it", " out</thi", "nk>\n\nThe ", "answer"]),
+                         "The answer")
+
+    def test_text_after_the_answer_starts_is_untouched(self):
+        self.assertEqual(self.run_filter(["Hello ", "<think>kept</think>"]), "Hello <think>kept</think>")
+        self.assertEqual(self.run_filter(["<", "3 you"]), "<3 you")
+        self.assertEqual(self.run_filter(["a < b"]), "a < b")
+
+    def test_unclosed_block_shows_nothing(self):
+        self.assertEqual(self.run_filter(["<think>still going"]), "")
+
+    def test_strip_think_final_text(self):
+        self.assertEqual(action_api.strip_think("<think>x</think> y"), "y")
+        self.assertEqual(action_api.strip_think(" plain "), "plain")
+        # Only a template-opening family gets the close-tag-only rule.
+        self.assertEqual(action_api.strip_think("reasoning\n</think>\n\nFinal", True), "Final")
+        self.assertEqual(action_api.strip_think("reasoning\n</think>\n\nFinal"),
+                         "reasoning\n</think>\n\nFinal")
+
+    def test_managed_stream_hides_inline_reasoning(self):
+        from unittest.mock import MagicMock, patch
+        resp = MagicMock(status_code=200, headers={"Content-Type": "text/event-stream"})
+        lines = ['data: {"choices":[{"delta":{"content":"<think>hmm"}}]}',
+                 'data: {"choices":[{"delta":{"content":"</think>Use a cache."}}]}',
+                 "data: [DONE]"]
+        resp.iter_lines.return_value = iter(lines)
+        seen = []
+        with patch.object(action_api.requests, "post", return_value=resp):
+            out = action_api.run_managed_action_stream("q", "live_assist", "T", seen.append)
+        self.assertEqual(out, "Use a cache.")
+        self.assertEqual("".join(seen), "Use a cache.")
+
+    def test_reasoning_field_is_never_shown(self):
+        from unittest.mock import MagicMock, patch
+        resp = MagicMock(status_code=200, headers={"Content-Type": "text/event-stream"})
+        resp.iter_lines.return_value = iter([
+            'data: {"choices":[{"delta":{"reasoning_content":"secret plan"}}]}',
+            'data: {"choices":[{"delta":{"content":"Answer"}}]}', "data: [DONE]"])
+        seen = []
+        with patch.object(action_api.requests, "post", return_value=resp):
+            out = action_api.run_managed_action_stream("q", "live_assist", "T", seen.append)
+        self.assertEqual((out, "".join(seen)), ("Answer", "Answer"))
+
+
+class TestThinkFilterTemplateOpened(unittest.TestCase):
+    """Self-hosted DeepSeek (V3.1+/V4/R1) and Qwen3 templates open the block in
+    the prompt: without a reasoning parser the output is
+    "{reasoning}</think>{answer}" - only the close tag, often with no newline.
+    That rule applies ONLY to those families; for everyone else a "</think>"
+    in the text is something the answer is talking about."""
+
+    def stream(self, chunks, template_opened=True):
+        f = action_api.ThinkFilter(template_opened)
+        shown, events = [], []
+        for c in chunks + [None]:
+            d = f.flush() if c is None else f.feed(c)
+            if isinstance(d, action_api.ReplaceText):
+                events.append("replace")
+                shown[:] = [str(d)]
+            elif d:
+                shown.append(d)
+        return "".join(shown), events, f
+
+    def test_deepseek_format_with_no_newline(self):
+        shown, events, f = self.stream(["User wants the budget; they said 40k.</thi", "nk>",
+                                        "Say: **40k for Q3.**"])
+        self.assertEqual((shown, events), ("Say: **40k for Q3.**", ["replace"]))
+        self.assertTrue(f.saw_reasoning)
+
+    def test_reasoning_line_then_answer(self):
+        shown, events, _ = self.stream(["The user asks about the budget.", " I should say 40k.\n</th",
+                                        "ink>\n\n", "Say: **40k**."])
+        self.assertEqual((shown.strip(), events), ("Say: **40k**.", ["replace"]))
+
+    def test_reasoning_that_mentions_fences_or_the_open_tag(self):
+        for reasoning in ["I'll put it in a ```python block for them.",
+                          "They asked about <think> tags, so explain briefly."]:
+            shown, events, _ = self.stream([reasoning, "</think>", "Answer."])
+            self.assertEqual((shown, events), ("Answer.", ["replace"]), reasoning)
+
+    def test_tag_inside_code_is_left_alone(self):
+        for answer in ["Split on the closing tag:\n```python\nanswer = raw.split('</think>')[-1]\n```",
+                       "Use `</think>` as the separator.",
+                       "Use this:\n```\n</think>\n```\nthat's the tag."]:
+            shown, events, _ = self.stream([answer[:10], answer[10:]])
+            self.assertEqual((shown, events), (answer, []), answer)
+            self.assertEqual(action_api.strip_think(answer, True), answer.strip())
+
+    def test_other_models_never_get_the_close_tag_rule(self):
+        for answer in ["DeepSeek's reasoning block closes with </think>",
+                       "It ends with </think>\n- the template opened it for you",
+                       "Models emit </think> when they finish."]:
+            shown, events, f = self.stream([answer[:12], answer[12:]], template_opened=False)
+            self.assertEqual((shown, events), (answer, []), answer)
+            self.assertFalse(f.saw_reasoning)
+            self.assertEqual(action_api.strip_think(answer), answer.strip())
+
+    def test_reasoning_with_no_answer(self):
+        shown, events, f = self.stream(["plan\n</think>"])
+        self.assertEqual(shown, "")
+        self.assertTrue(f.saw_reasoning)
+
+    def test_strip_think_template_opened(self):
+        self.assertEqual(action_api.strip_think("plan\n</think>\n\nFinal", True), "Final")
+        self.assertEqual(action_api.strip_think("plan.</think>Final", True), "Final")
+
+
+class TestAnswerFamily(unittest.TestCase):
+    """The server says which family answered; the app picks the rule from it."""
+
+    class Resp:
+        status_code = 200
+
+        def __init__(self, lines, family=""):
+            self.headers = {"Content-Type": "text/event-stream", "X-Answer-Family": family}
+            self.lines = list(lines)
+
+        def iter_lines(self, *a, **k):
+            return iter(self.lines)
+
+        def close(self):
+            pass
+
+    def run_stream(self, lines, family):
+        from unittest.mock import patch
+        seen = []
+        with patch.object(action_api.requests, "post", return_value=self.Resp(lines, family)):
+            out = action_api.run_managed_action_stream("q", "live_assist", "T", seen.append)
+        return out
+
+    LINES = [b'data: {"choices":[{"delta":{"content":"They want 40k.</think>"}}]}',
+             b'data: {"choices":[{"delta":{"content":"Say: 40k."}}]}', b"data: [DONE]"]
+
+    def test_deepseek_answer_is_cleaned(self):
+        self.assertEqual(self.run_stream(self.LINES, "deepseek"), "Say: 40k.")
+
+    def test_gemini_answer_is_left_alone(self):
+        self.assertEqual(self.run_stream(self.LINES, ""), "They want 40k.</think>Say: 40k.")
+
+    def test_thinking_only_is_a_clear_error(self):
+        from unittest.mock import patch
+        lines = [b'data: {"choices":[{"delta":{"content":"<think>long plan"}}]}', b"data: [DONE]"]
+        with patch.object(action_api.requests, "post", return_value=self.Resp(lines, "")):
+            with self.assertRaises(action_api.ActionAPIError) as ctx:
+                action_api.run_managed_action_stream("q", "live_assist", "T", lambda d: None)
+        self.assertEqual(str(ctx.exception), action_api.THOUGHT_ONLY)
+
+
+class TestStreamRobustness(unittest.TestCase):
+    """Brings its own fake `requests` (other test modules stub the real one)."""
+
+    class FakeRequests:
+        class RequestException(Exception):
+            pass
+
+        def __init__(self, resp):
+            self.resp = resp
+
+        def post(self, *a, **k):
+            return self.resp
+
+    class Resp:
+        status_code = 200
+        headers = {"Content-Type": "text/event-stream"}
+
+        def __init__(self, raw_lines, fail_after=None, exc=None):
+            self.raw_lines, self.fail_after, self.exc = raw_lines, fail_after, exc
+            self.closed = False
+
+        def iter_lines(self, *a, **k):
+            for i, line in enumerate(self.raw_lines):
+                if self.fail_after is not None and i == self.fail_after:
+                    raise self.exc("Response ended prematurely")
+                yield line
+
+        def close(self):
+            self.closed = True
+
+    def run_stream(self, resp):
+        from unittest.mock import patch
+        fake = self.FakeRequests(resp)
+        with patch.object(action_api, "requests", fake):
+            return action_api.run_managed_action_stream("q", "live_assist", "T", lambda d: None)
+
+    def test_a_dropped_connection_keeps_the_partial_answer(self):
+        resp = self.Resp([b'data: {"choices":[{"delta":{"content":"The answer is "}}]}',
+                          b'data: {"choices":[{"delta":{"content":"forty"}}]}',
+                          b'data: {"choices":[{"delta":{"content":"-two"}}]}'],
+                         fail_after=2, exc=self.FakeRequests.RequestException)
+        self.assertEqual(self.run_stream(resp), "The answer is forty")
+        self.assertTrue(resp.closed)
+
+    def test_a_dropped_connection_before_any_text_is_a_plain_error(self):
+        resp = self.Resp([b"data: x"], fail_after=0, exc=self.FakeRequests.RequestException)
+        with self.assertRaises(action_api.ActionAPIError) as ctx:
+            self.run_stream(resp)
+        self.assertIn("interrupted", str(ctx.exception))
+
+    def test_unicode_line_separators_inside_json_survive(self):
+        # JSON leaves U+2028/U+2029/U+0085 unescaped; splitting decoded text
+        # on them cut the event in two and dropped its words. requests'
+        # iter_lines() splits raw bytes with bytes.splitlines(), as here.
+        import json as _json
+        texts = ["Line one", " ", "Next sentence with para break\u0085", " end."]
+        raw = b"".join(b"data: " + _json.dumps({"choices": [{"delta": {"content": t}}]},
+                                               ensure_ascii=False).encode("utf-8") + b"\n\n"
+                       for t in texts) + b"data: [DONE]\n\n"
+        self.assertEqual(self.run_stream(self.Resp(raw.splitlines())), "".join(texts).strip())
+
+
+class TestTextOnlyModels(unittest.TestCase):
+    """A model that refuses the screenshot still answers - from the
+    conversation, without a note claiming a screenshot is attached."""
+
+    class FakeRequests:
+        class RequestException(Exception):
+            pass
+
+        def __init__(self, responses):
+            self.responses, self.bodies = list(responses), []
+
+        def post(self, url, **kw):
+            self.bodies.append(kw.get("json"))
+            return self.responses.pop(0)
+
+    class Resp:
+        def __init__(self, status, payload=None, lines=()):
+            self.status_code, self.payload, self.lines = status, payload, list(lines)
+            self.headers = {"Content-Type": "text/event-stream" if lines else "application/json"}
+
+        def json(self):
+            return self.payload
+
+        def iter_lines(self, *a, **k):
+            return iter(self.lines)
+
+        def close(self):
+            pass
+
+    CFG = {"action_api_provider": action_api.PROVIDER_OPENAI, "action_api_key": "wk-1.ws-2",
+           "action_api_base_url": "https://ws--deepseek.modal.run/v1",
+           "action_api_model": "deepseek-ai/DeepSeek-V4-Flash-0731", "_image_png_b64": "/9j/AAAA"}
+
+    def setUp(self):
+        action_api._NO_VISION.clear()
+        self.addCleanup(action_api._NO_VISION.clear)
+    TEXT = ("Conversation (latest part):\nWhat does this error mean?\n\n"
+            "(A screenshot of the user's screen is attached. Use it as context; solve what it "
+            "shows only when that is what is being asked or nothing was asked.)")
+
+    def test_byo_stream_retries_without_the_screenshot(self):
+        from unittest.mock import patch
+        fake = self.FakeRequests([
+            self.Resp(400, {"object": "error", "message": "This model does not support image input"}),
+            self.Resp(200, lines=[b'data: {"choices":[{"delta":{"content":"It means X."}}]}',
+                                  b"data: [DONE]"])])
+        status = {}
+        with patch.object(action_api, "requests", fake):
+            out = action_api.run_action_stream(self.TEXT, "live_assist",
+                                               dict(self.CFG, _image_status=status), lambda d: None)
+        self.assertEqual(out, "It means X.")
+        first, second = (json.dumps(b) for b in fake.bodies)
+        self.assertIn("image_url", first)
+        self.assertNotIn("image_url", second)
+        self.assertNotIn("screenshot of the user's screen is attached", second)
+        self.assertIn("cannot see the user's screen", second)       # no made-up screen
+        self.assertIn("What does this error mean?", second)
+        self.assertEqual(status, {"dropped": True})                  # the card won't say "screen seen"
+
+    def test_a_refusal_is_remembered(self):
+        from unittest.mock import patch
+        ok = lambda: self.Resp(200, lines=[b'data: {"choices":[{"delta":{"content":"A"}}]}',
+                                           b"data: [DONE]"])
+        fake = self.FakeRequests([self.Resp(400, {"message": "no images"}), ok(), ok()])
+        with patch.object(action_api, "requests", fake):
+            action_api.run_action_stream(self.TEXT, "live_assist", dict(self.CFG), lambda d: None)
+            status = {}
+            action_api.run_action_stream(self.TEXT, "live_assist",
+                                         dict(self.CFG, _image_status=status), lambda d: None)
+        self.assertEqual(len(fake.bodies), 3)
+        self.assertNotIn("image_url", json.dumps(fake.bodies[2]))     # no second failed upload
+        self.assertEqual(status, {"dropped": True})
+
+    def test_byo_non_stream_retries_without_the_screenshot(self):
+        from unittest.mock import patch
+        fake = self.FakeRequests([
+            self.Resp(422, {"detail": "image_url is not supported"}),
+            self.Resp(200, {"choices": [{"message": {"content": "Answer"}}]})])
+        with patch.object(action_api, "requests", fake):
+            out = action_api.run_action(self.TEXT, "live_assist", dict(self.CFG))
+        self.assertEqual(out, "Answer")
+        self.assertNotIn("image_url", json.dumps(fake.bodies[1]))
+
+    def test_old_vllm_error_shape_is_readable(self):
+        resp = self.Resp(400, {"object": "error", "message": "model not found"})
+        with self.assertRaises(action_api.ActionAPIError) as ctx:
+            action_api._json_or_error(resp)
+        self.assertEqual(str(ctx.exception), "model not found")
+
+    def test_without_screenshot_keeps_everything_else(self):
+        msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": self.TEXT}]
+        out = action_api.without_screenshot(msgs)
+        self.assertEqual(out[0], msgs[0])
+        self.assertEqual(out[1]["content"], "Conversation (latest part):\nWhat does this error mean?"
+                         "\n\n" + action_api._NO_SCREEN_NOTE)
+        self.assertIn("attached", msgs[1]["content"])             # the input is untouched
+
+
+class TestLiveEngineChoice(unittest.TestCase):
+    """Live answers need speed and sight: a Pro user must not be stuck on a
+    tiny offline model just because it is set for dictation Smart Actions."""
+
+    def setUp(self):
+        from unittest.mock import patch
+        p = patch.object(actions, "_first_downloaded_local_model", return_value="qwen_tiny")
+        p.start()
+        self.addCleanup(p.stop)
+        self.f = actions.live_engine
+
+    def test_pro_user_with_local_model_gets_the_pro_cloud(self):
+        self.assertEqual(self.f("qwen_tiny", {"_managed_token": "T"}), actions.API_MANAGED_ID)
+
+    def test_privacy_mode_keeps_it_local(self):
+        self.assertEqual(self.f("qwen_tiny", {"_managed_token": "T", "privacy_mode": True}),
+                         "qwen_tiny")
+        # Even with the managed engine selected: a local model, never the server.
+        self.assertEqual(self.f(actions.API_MANAGED_ID,
+                                {"_managed_token": "T", "privacy_mode": True}), "qwen_tiny")
+        self.assertEqual(self.f(actions.API_GEMINI_ID,
+                                {"google_api_key": "G", "privacy_mode": True}), "qwen_tiny")
+
+    def test_warm_up_sends_nothing_in_privacy_mode(self):
+        from unittest.mock import patch
+        with patch.object(action_api, "warm_up_managed") as wm, \
+             patch.object(action_api, "warm_up") as wu:
+            actions.warm_up(actions.API_MANAGED_ID, {"_managed_token": "T", "privacy_mode": True})
+        wm.assert_not_called()
+        wu.assert_not_called()
+
+    def test_without_pro_the_local_model_stays(self):
+        self.assertEqual(self.f("qwen_tiny", {}), "qwen_tiny")
+
+    def test_pro_always_gets_the_pro_cloud(self):
+        cfg = {"_managed_token": "T", "google_api_key": "G"}
+        self.assertEqual(self.f(actions.API_GEMINI_ID, cfg), actions.API_MANAGED_ID)
+
+    def test_without_pro_a_cloud_engine_with_its_own_key_is_kept(self):
+        self.assertEqual(self.f(actions.API_GEMINI_ID, {"google_api_key": "G"}),
+                         actions.API_GEMINI_ID)
+
+    def test_unusable_engines_fall_back_to_a_local_model(self):
+        self.assertEqual(self.f(actions.API_CEREBRAS_ID, {}), "qwen_tiny")       # no key
+        self.assertEqual(self.f(actions.API_MANAGED_ID, {}), "qwen_tiny")        # no Pro token
+        self.assertEqual(self.f(actions.RULE_BASED_ID, {}), "qwen_tiny")
+
+
+class TestManagedStreaming(unittest.TestCase):
+    """Pro answers stream through the server; an older server that still
+    answers in one JSON piece keeps working."""
+
+    class Resp:
+        def __init__(self, status=200, ctype="text/event-stream", lines=(), payload=None):
+            self.status_code = status
+            self.headers = {"Content-Type": ctype}
+            self._lines, self._payload = lines, payload
+            self.encoding = None
+
+        def iter_lines(self, decode_unicode=False):
+            yield from self._lines
+
+        def json(self):
+            return self._payload
+
+    def _run(self, resp):
+        from unittest.mock import patch
+        tokens = []
+        with patch.object(action_api.requests, "post", return_value=resp) as post:
+            out = action_api.run_managed_action_stream(
+                "Conversation (latest part):\nWhat is 2+2?", "live_assist", "TOKEN",
+                tokens.append)
+        return out, tokens, post.call_args[1]["json"]
+
+    def test_event_stream_is_relayed_token_by_token(self):
+        lines = ['data: {"choices":[{"delta":{"content":"Four"}}]}',
+                 'data: {"choices":[{"delta":{"content":"."}}]}', "data: [DONE]"]
+        out, tokens, body = self._run(self.Resp(lines=lines))
+        self.assertEqual((out, tokens), ("Four.", ["Four", "."]))
+        self.assertTrue(body["stream"])
+        self.assertEqual(body["mode"], "live_assist")           # server routes live answers
+
+    def test_old_server_json_answer(self):
+        out, tokens, _ = self._run(self.Resp(ctype="application/json", payload={"text": "Four."}))
+        self.assertEqual((out, tokens), ("Four.", ["Four."]))
+
+    def test_limits_surface_clearly(self):
+        with self.assertRaises(action_api.ActionAPIError):
+            self._run(self.Resp(status=429, ctype="application/json", payload={"error": "quota"}))
+
+    def test_process_stream_uses_the_streaming_path(self):
+        from unittest.mock import patch
+        with patch.object(action_api, "run_managed_action_stream", return_value="ok") as s:
+            out = actions.process_stream("Conversation (latest part):\nhi?",
+                                         actions.ACTION_LIVE_ASSIST, lambda d: None,
+                                         model=actions.API_MANAGED_ID,
+                                         config={"_managed_token": "T"})
+        self.assertEqual(out, "ok")
+        s.assert_called_once()
 
 
 class TestStreamingRobustness(unittest.TestCase):

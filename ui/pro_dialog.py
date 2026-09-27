@@ -206,4 +206,6 @@ class ProDialog(QDialog):
             telemetry.track("checkout_opened", {"plan": self._plan}, self.app.cfg, m.APP_VERSION)
         except Exception:
             pass
+        if hasattr(self.app, "watch_for_upgrade"):
+            self.app.watch_for_upgrade()  # unlock Pro as soon as Stripe confirms
         self.accept()

@@ -38,7 +38,7 @@ It was built especially for **Armenian speakers** who need accurate, native-scri
 | | |
 |---|---|
 | 🎙 **Hotkey recording** | Press any key combo (or mouse button) to start/stop |
-| 🪟 **Live Prompter** | A private liquid-glass copilot over your calls: live transcript, running AI summary, instant streamed suggestions, screen-aware answers - **excluded from screen sharing** |
+| 🪟 **Live Assistance** | A private liquid-glass copilot over your calls: live transcript, instant streamed answers the moment you are asked something, screen-aware answers - **excluded from screen sharing** |
 | 🎧 **Record meetings** | System audio + mic, speaker labels, AI notes with action items, Notion export, resumable sessions, MP3/WAV recordings |
 | 📄 **Transcribe Files** | Drop any audio/video file → a Word document with speaker labels and timestamps |
 | 📋 **Smart paste** | Auto-pastes at your cursor; falls back to clipboard |
@@ -128,14 +128,15 @@ Each meeting is stored in `%APPDATA%\Transcribe\meetings\<timestamp>\` with:
 
 **Settings → History** lists every meeting. Open one for its **Summary** and **Transcript** tabs, **Resume session** (continue the same meeting later - the new part is appended and the notes regenerated), **Save recording** as MP3 or WAV, **Save as Word**, and **Send to Notion**.
 
-### Live Prompter 🪟
+### Live Assistance 🪟
 
-While a meeting is being recorded (or straight from the tray / **Ctrl+Alt+A**), the **Live Prompter** floats over your call as a translucent glass card:
+While a meeting is being recorded (or straight from the tray / **Ctrl+Alt+A**), the **Live Assistance** overlay floats over your call as a translucent glass card:
 
 - **Start** begins live transcription right from the card; a green timer runs, the red button stops and generates the notes.
 - **NOW** shows the last thing said; **SO FAR** a running AI summary.
-- **Say next / Follow-ups / Recap** or any typed question → answers stream in instantly, formatted (bold key phrases, bullets, code blocks).
-- **Screen context (Auto)**: when the conversation or your question refers to what's on screen, a screenshot goes to the AI - the card itself is never in it.
+- **A companion, not a summary**: when someone asks you something, the answer starts streaming on its own; **Answer / Follow-ups / Solve screen** or any typed question work any time. Answers are formatted (bold key phrases, bullets, code blocks).
+- **Screen context**: with **Screen** on, every answer sees the screen under your cursor - the card itself is never in the screenshot.
+- **Engine**: Pro answers come from DeepSeek V4.1 Flash on a Modal endpoint (vision, thinking off for speed), with Gemini Flash and Mistral as automatic fallbacks. Your own Cerebras / OpenAI-compatible / Gemini key works too.
 - **Private**: the card is excluded from screen sharing and recordings on Windows 10 2004+, and the eye badge always reports the real state (it says so when the OS can't guarantee it - e.g. Remote Desktop, macOS).
 
 It is a privacy feature for your own notes during calls; recording-consent guidance applies, and it is not intended for interviews, exams or assessments where assistance is prohibited.
@@ -155,12 +156,12 @@ The summary and action items use whatever action engine you've configured in **S
 | Engine | Notes quality | Cost |
 |---|---|---|
 | **Transcribe Pro** (managed cloud) | Best quality, zero setup | Included in Pro |
-| **Cerebras** (bring your own key) | Fastest - sub-second streamed answers, screen-aware (vision) | ~$0.003 per Live Prompter answer |
+| **Cerebras** (bring your own key) | Fastest - sub-second streamed answers, screen-aware (vision) | ~$0.003 per Live Assistance answer |
 | **Mistral AI** (bring your own key) | Ministral models with image input; the same key runs Voxtral speech and Mistral OCR for screen text | Pennies per meeting |
 | **Local Qwen / Gemma** (1.5B–7B) | Good summarisation, no network required | Free (one-time download) |
 | **OpenAI / Gemini / Anthropic** | Best quality (GPT-5.x, Gemini Flash, Claude 4.x) | Pennies per meeting |
 
-Meetings of any length work with local models too - long transcripts are summarised in stages automatically. The built-in formatter is only a last-resort fallback for final notes; the live features (Live Prompter, running summary) use real AI models or tell you to connect one.
+Meetings of any length work with local models too - long transcripts are summarised in stages automatically. The built-in formatter is only a last-resort fallback for final notes; the live features (Live Assistance, running summary) use real AI models or tell you to connect one.
 
 ---
 
@@ -287,7 +288,7 @@ GitHub Actions builds `TranscribeApp-Windows.zip` and `TranscribeApp-Mac.dmg` an
 - [x] GitHub Actions CI - auto-builds .exe and .dmg on tag
 - [x] Meeting recording with speaker labels, AI notes, Notion export
 - [x] Transcribe Files - audio/video file → Word document
-- [x] Live Prompter - private, screen-share-excluded live copilot with streamed answers
+- [x] Live Assistance - private, screen-share-excluded live copilot with streamed answers
 - [x] Export history to CSV / TXT; meeting recordings to MP3 / WAV
 - [ ] One-click `.dmg` installer (macOS)
 - [ ] Configurable silence detection (auto-stop)

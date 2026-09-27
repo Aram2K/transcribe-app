@@ -1,4 +1,5 @@
 import json
+import re
 
 import requests
 
@@ -12,7 +13,7 @@ PROVIDER_MISTRAL = "mistral"        # OpenAI-compatible wire; reuses the Voxtral
 PROVIDERS = {
     PROVIDER_OPENAI: {
         "label": "OpenAI-compatible API",
-        "description": "Works with OpenAI, OpenRouter, Groq, Together, LM Studio, and compatible servers.",
+        "description": "Works with OpenAI, OpenRouter, Groq, Together, Modal, LM Studio, and compatible servers.",
         "default_base_url": "https://api.openai.com/v1",
         "default_model": "gpt-5.4-mini",
     },
@@ -33,7 +34,7 @@ PROVIDERS = {
         # images as data URIs, and needs reasoning_effort "none" or it thinks
         # for seconds first. Same /chat/completions wire as OpenAI.
         "label": "Cerebras (fastest · vision)",
-        "description": "Sub-second answers for Live Prompter. Key from cloud.cerebras.ai.",
+        "description": "Sub-second answers for Live Assistance. Key from cloud.cerebras.ai.",
         "default_base_url": "https://api.cerebras.ai/v1",
         "default_model": "qwen-3.8-27b",
         "default_recap_model": "gpt-oss-120b",
@@ -97,6 +98,184 @@ def reasoning_effort_for(model, configured=""):
     return val
 
 
+def self_hosted_family(model, base_url):
+    """"qwen" / "deepseek" for a thinking model served by vLLM/SGLang - a Modal
+    endpoint or your own server, addressed by its Hugging Face id
+    ("deepseek-ai/DeepSeek-V4.1-Flash", "Qwen/Qwen3.6-35B-A3B") - else None.
+    Such servers switch thinking off through the chat template, and older ones
+    reject reasoning_effort="none" (hosted APIs like Cerebras/Groq use their
+    own ids and keep reasoning_effort)."""
+    m = model or ""
+    on_modal = "modal.run" in (base_url or "")
+    if m.startswith("deepseek-ai/") or (on_modal and "deepseek" in m.lower()):
+        return "deepseek"
+    if m.startswith("Qwen/") or (on_modal and "qwen" in m.lower()):
+        return "qwen"
+    return None
+
+
+# Recommended non-thinking sampling for live answers, per model card: Qwen3's
+# own numbers; DeepSeek's card gives temperature 1.0 / top_p 0.95 for thinking
+# benchmarks - a little cooler here for short, factual answers.
+_LIVE_SAMPLING = {
+    "qwen": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5},
+    "deepseek": {"temperature": 0.6, "top_p": 0.95},
+}
+
+
+def openai_payload_extras(model, base_url, mode, configured_effort=""):
+    """Provider-specific fields for an OpenAI-compatible chat request."""
+    family = self_hosted_family(model, base_url)
+    if family:
+        # DeepSeek V4.x reads {thinking}, Qwen3 {enable_thinking}; vLLM takes
+        # both as long as they agree. Thinking must be off: DeepSeek thinks by
+        # default, and with a short max_tokens the trace eats the whole budget
+        # and the answer comes back empty.
+        extras = {"chat_template_kwargs": {"thinking": False, "enable_thinking": False}}
+        if mode in ("live_assist", "live_recap"):
+            # The rest of the actions keep the near-deterministic default.
+            extras.update(_LIVE_SAMPLING[family])
+        return extras
+    effort = reasoning_effort_for(model, configured_effort)
+    return {"reasoning_effort": effort} if effort else {}
+
+
+_THINK_OPEN, _THINK_CLOSE = "<think>", "</think>"
+# Self-hosted DeepSeek (V3.1+/V4/R1) and Qwen3 templates OPEN the reasoning
+# block in the prompt, so a server without a reasoning parser returns
+# "{reasoning}</think>{answer}" - only the close tag, often with no newline.
+# Such a model never writes the tag in a normal (non-thinking) answer, so for
+# these families the first tag outside code ends the reasoning. Every other
+# model gets no such guess: a hosted model that mentions "</think>" is talking
+# about it.
+_FENCE = re.compile(r"(?m)^[ \t]*```")
+_PROBE_CHARS = 12000          # past this much visible text, stop looking
+
+
+def _orphan_close_end(text, start=0):
+    """End of a template-opened block's close tag in ``text`` - the first
+    "</think>" outside inline code and ``` fences (fences count only where a
+    line starts, so a fence mentioned mid-sentence doesn't flip them) - or -1."""
+    i = text.find(_THINK_CLOSE, start)
+    while i >= 0:
+        before = text[:i]
+        line = before[before.rfind("\n") + 1:]
+        if len(_FENCE.findall(before)) % 2 == 0 and line.replace("```", "").count("`") % 2 == 0:
+            return i + len(_THINK_CLOSE)
+        i = text.find(_THINK_CLOSE, i + 1)
+    return -1
+
+
+class ReplaceText(str):
+    """A stream delta meaning "replace everything shown so far with this":
+    the reasoning a template-opened block streamed is only recognisable once
+    its close tag arrives."""
+
+
+class ThinkFilter:
+    """Keeps reasoning a model writes inline out of a token stream. Servers
+    with a reasoning parser send reasoning as a separate field, which the
+    parsers here never read; this covers servers without one:
+
+    * a leading ``<think>...</think>`` block is held back and dropped;
+    * with ``template_opened`` (a self-hosted DeepSeek/Qwen - see
+      :func:`self_hosted_family`), a block the template opened is recognised
+      when its close tag arrives, and :meth:`feed` returns a
+      :class:`ReplaceText` with the answer that follows, so the caller can
+      drop what it showed.
+
+    ``saw_reasoning`` tells the caller reasoning was removed, so an empty
+    result means "spent the whole budget thinking", not "had nothing to say".
+    """
+
+    def __init__(self, template_opened=False):
+        self._buf = ""
+        self._inside = False
+        self._started = False
+        self._shown = ""                    # visible text, while probing
+        self._probing = bool(template_opened)
+        self.saw_reasoning = False
+
+    def feed(self, delta):
+        """The visible part of ``delta`` ("" while inside a thinking block or
+        while a possible tag is still incomplete), or a ReplaceText."""
+        if self._started:
+            return self._probe(delta or "")
+        self._buf += delta or ""
+        if self._inside:
+            i = self._buf.find(_THINK_CLOSE)
+            if i < 0:
+                self._buf = self._buf[-(len(_THINK_CLOSE) - 1):]
+                return ""
+            self._inside = False
+            self._probing = False           # the block is over: an answer follows
+            self._buf = self._buf[i + len(_THINK_CLOSE):].lstrip()
+            return self.feed("")
+        head = self._buf.lstrip()
+        if head.startswith(_THINK_OPEN):
+            self._inside = True
+            self.saw_reasoning = True
+            self._buf = head[len(_THINK_OPEN):]
+            return self.feed("")
+        if not head or _THINK_OPEN.startswith(head):
+            return ""                       # whitespace or a partial "<thi" so far
+        self._started = True
+        out, self._buf = self._buf, ""
+        return self._probe(out)
+
+    def _probe(self, out):
+        if not self._probing or not out:
+            return out
+        scan_from = max(0, len(self._shown) - len(_THINK_CLOSE))
+        self._shown += out
+        end = _orphan_close_end(self._shown, scan_from)
+        if end >= 0:
+            self._probing = False
+            self.saw_reasoning = True
+            rest, self._shown = self._shown[end:].lstrip(), ""
+            return ReplaceText(rest)
+        if len(self._shown) > _PROBE_CHARS:
+            self._probing, self._shown = False, ""
+        return out
+
+    def flush(self):
+        """Whatever is still held back when the stream ends."""
+        rest = "" if self._inside else self._buf
+        self._buf = ""
+        return rest
+
+
+def strip_think(text, template_opened=False):
+    """``text`` without its reasoning: a leading ``<think>`` block, or - with
+    ``template_opened`` - a template-opened block that only shows its close
+    tag."""
+    t = text or ""
+    lead = t.lstrip()
+    if lead.startswith(_THINK_OPEN):
+        end = lead.find(_THINK_CLOSE)
+        return "" if end < 0 else lead[end + len(_THINK_CLOSE):].strip()
+    if template_opened:
+        end = _orphan_close_end(t)
+        if end >= 0:
+            return t[end:].strip()
+    return t.strip()
+
+
+THOUGHT_ONLY = ("The AI model spent its whole answer thinking and never answered - "
+                "ask again.")
+
+
+def _emit(delta, parts, on_token):
+    """Pass one filtered delta on: append it, or - for a ReplaceText - start
+    over with the answer that followed the reasoning."""
+    if isinstance(delta, ReplaceText):
+        parts[:] = [str(delta)]
+        on_token(delta)
+    elif delta:
+        parts.append(delta)
+        on_token(delta)
+
+
 def model_for(config, mode, provider_defaults):
     """Model id for this call: an optional cheaper/faster model for the
     rolling recap (action_api_model_recap), else the configured model, else
@@ -125,7 +304,7 @@ def _max_tokens_for(mode):
     if mode == "smart_auto":
         return 600
     if mode == "live_assist":
-        return 320
+        return 700       # room for a complete code solution; the stream shows it as it lands
     if mode == "live_recap":
         return 220
     if mode == "summarize":
@@ -154,8 +333,74 @@ def defaults(provider):
     return PROVIDERS[normalize_provider(provider)]
 
 
+# Live Assistance: who the model is, what it gets, and WHY it must be brief -
+# the brief is the system message (identical on every call, so the endpoint
+# can cache it - cheaper and a faster first word), the user turn carries only
+# live_context.rolling_context's sections.
+LIVE_ASSIST_SYSTEM = (
+    "You are Live Assistance, a real-time companion built into a meeting "
+    "app. The user - the person running the app - is in a live call or "
+    "meeting right now. Whatever you write appears on a small card on their "
+    "screen while they are talking: they read it at a glance, often "
+    "mid-sentence, or say it out loud. Every extra word costs them attention "
+    "and every second counts, so you answer and solve - you never summarise.\n"
+    "\n"
+    "What you receive:\n"
+    "- \"Conversation (latest part)\": the last few minutes, transcribed "
+    "automatically as people speak. It has no speaker labels and mixes the "
+    "user's voice with the other participants'. Words may be misheard, "
+    "missing or cut mid-sentence. Read it like a sharp colleague listening "
+    "in: infer the intended words (names, technical terms) and work out from "
+    "context who is asking whom. You are also called automatically on "
+    "anything that sounds like a question - even the user's own, or the user "
+    "reading your answers aloud.\n"
+    "- Sometimes: the meeting title and attendees (use their exact "
+    "spelling), your latest answers (up to two, clipped; for follow-ups such "
+    "as \"and the second part?\"), and a question the user typed or picked.\n"
+    "- With Screen on, every answer comes with a screenshot of the monitor "
+    "under the mouse, relevant or not; ignore the Live Assistance card if it "
+    "appears in it. If asked about the screen with no screenshot or nothing "
+    "on it to solve, say so in a few words - never guess.\n"
+    "\n"
+    "What to do:\n"
+    "1. If there is a \"User's question\", answer exactly that.\n"
+    "2. Otherwise answer the most recent question or request the user now "
+    "has to respond to, not an earlier one. Speech comes first, the screen "
+    "is context: solve what it shows (code, an error, a form, a question on "
+    "a slide) only when that is what is asked or nothing was asked.\n"
+    "3. Lead with the answer itself, ready to use: the words to say if "
+    "someone asked the user something (1-2 natural spoken sentences, first "
+    "person), else the plain fact, number, command or solution. Then at most "
+    "3 short bullets, only if they add real value (the key reason, a caveat, "
+    "something to double-check). Under ~70 words outside code.\n"
+    "4. Code, commands, queries and spreadsheet formulas go in a fenced code "
+    "block with the language tag - runnable, no TODO stubs; for a fix, only "
+    "the changed lines with enough around them to place them - never retype "
+    "code you can't see.\n"
+    "5. Answer in the language of the \"(Respond in ...)\" line; without "
+    "one, in the conversation's language - not that of these instructions or "
+    "a picked question.\n"
+    "\n"
+    "Never recap the conversation or repeat the question back; no headings, "
+    "tables, LaTeX or preamble. The user may say your words as their own, so "
+    "never invent facts about them or their work (background, experience, "
+    "numbers, dates, commitments) - leave a short [blank] in the words to "
+    "say instead. If nothing needs an answer from the user right now, reply "
+    "with one short line they could say next. Not for exams or assessments "
+    "of the user where outside help isn't allowed: if one is clearly on "
+    "screen or in the talk, say so in one line instead of solving it."
+)
+
+
 def build_messages(text, mode, source_lang="auto", target_lang="en", vocab_block=""):
     text = (text or "").strip()
+    if mode == "live_assist":
+        # The live context is already labelled section by section; the brief
+        # lives in the system message.
+        return [
+            {"role": "system", "content": LIVE_ASSIST_SYSTEM},
+            {"role": "user", "content": text},
+        ]
     if mode == "smart_auto":
         return smart_prompt.build_messages(text, vocab_block=vocab_block)
     if mode == "write_email":
@@ -220,32 +465,6 @@ def build_messages(text, mode, source_lang="auto", target_lang="en", vocab_block
             "developments last and bold the key phrase of each bullet. No headings, "
             "no preamble. Never invent facts or names."
         )
-    elif mode == "live_assist":
-        # Real-time copilot during a call. The input is the TAIL of a live
-        # transcript (imperfect ASR, maybe mid-sentence) plus an optional
-        # question from the user. Short, scannable output - it is read at a
-        # glance while the user is talking to someone.
-        instruction = (
-            "You are a discreet real-time meeting copilot for the user - the person "
-            "running this app - during a live call. The text is the most recent part "
-            "of the conversation (automatic speech recognition, may be imperfect or "
-            "cut mid-sentence), optionally followed by a question from the user.\n"
-            "If the user asked a question, answer it using the conversation.\n"
-            "Otherwise, work out what was MOST RECENTLY asked or expected of the "
-            "user - the last question or request in the text, not an earlier one - "
-            "and give them what to say next.\n"
-            "Format (Markdown, at most ~120 words - it is read at a glance):\n"
-            "**They're asking:** <one line - or **Latest:** if nothing was asked>\n"
-            "- 2 to 4 short, concrete talking points or the direct answer; put the "
-            "key phrase of each point in **bold**\n"
-            "**Watch out:** <one line, only if there is a real risk or open point>\n"
-            "If code, a command or a formula is genuinely what's needed, give it in "
-            "a fenced code block with the language tag; keep prose out of the block.\n"
-            "Be specific to what was actually said. Use ONLY the conversation and any "
-            "meeting details given - never invent facts, numbers or names, and never "
-            "make claims about the user's own background, experience or credentials. "
-            "If the transcript is too thin to help, say so in one line."
-        )
     else:
         instruction = "Rewrite this text clearly while preserving meaning. Output only the result."
     system = "You are a concise assistant. Never add commentary."
@@ -261,7 +480,7 @@ SMART_ACTION_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/smart-
 
 
 def run_managed_action(text, mode, token, source_lang="auto", target_lang="en",
-                       vocab_block="", image_b64=None):
+                       vocab_block="", image_b64=None, image_status=None):
     """Pro Smart Actions via the server (no BYO key): we build the messages here
     and the edge function runs them through the founder's Mistral key.
 
@@ -283,22 +502,127 @@ def run_managed_action(text, mode, token, source_lang="auto", target_lang="en",
         )
     try:
         resp = _post(openai_messages_with_image(messages, image_b64))
-        if image_b64 and resp.status_code in (400, 413, 415, 422):
-            resp = _post(messages)
+        if image_b64 and resp.status_code in _IMAGE_REFUSED:
+            resp = _post(without_screenshot(messages))
+            _image_dropped(image_status)
     except requests.RequestException as e:
         raise ActionAPIError(f"Network error reaching Smart Actions: {e}")
+    _raise_for_managed_status(resp)
+    data = _json_or_error(resp)
+    return strip_think(data.get("text") or "", _answer_family(resp) in ("deepseek", "qwen"))
+
+
+def _raise_for_managed_status(resp):
     if resp.status_code == 403:
         raise ActionAPIError("Pro is required for managed Smart Actions.")
     if resp.status_code == 429:
         raise ActionAPIError("Daily Smart Actions limit reached - try again tomorrow.")
     if resp.status_code == 503:
         raise ActionAPIError("Managed Smart Actions aren't set up on the server yet.")
-    data = _json_or_error(resp)
-    return (data.get("text") or "").strip()
+
+
+def run_managed_action_stream(text, mode, token, on_token, source_lang="auto",
+                              target_lang="en", vocab_block="", image_b64=None,
+                              image_status=None):
+    """Streaming Pro Smart Actions: the server relays the model's event stream,
+    so the first words show as soon as they are generated. A server that
+    predates streaming answers with plain JSON, delivered in one piece."""
+    if not token:
+        raise ActionAPIError("Sign in with Pro to use managed Smart Actions.")
+    messages = build_messages(text, mode, source_lang, target_lang,
+                              vocab_block=vocab_block)
+
+    def _post(msgs):
+        return requests.post(
+            SMART_ACTION_URL,
+            json={"messages": msgs, "max_tokens": _max_tokens_for(mode),
+                  "mode": mode, "stream": True},
+            headers={"Authorization": f"Bearer {token}"},
+            stream=True, timeout=(10, 90),
+        )
+    try:
+        resp = _post(openai_messages_with_image(messages, image_b64))
+        if image_b64 and resp.status_code in _IMAGE_REFUSED:
+            _close(resp)
+            resp = _post(without_screenshot(messages))
+            _image_dropped(image_status)
+    except requests.RequestException as e:
+        raise ActionAPIError(f"Network error reaching Smart Actions: {e}")
+    _raise_for_managed_status(resp)
+    template_opened = _answer_family(resp) in ("deepseek", "qwen")
+    if "text/event-stream" not in (resp.headers.get("Content-Type") or ""):
+        out = strip_think(_json_or_error(resp).get("text") or "", template_opened)
+        if out:
+            on_token(out)
+        return out
+    parts = []
+    think = ThinkFilter(template_opened)
+    try:
+        for data in _sse_data_lines(resp):
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except Exception:
+                continue
+            if obj.get("error"):
+                raise ActionAPIError(str(obj["error"]))
+            _emit(think.feed(((obj.get("choices") or [{}])[0].get("delta") or {}).get("content") or ""),
+                  parts, on_token)
+    except requests.RequestException:
+        _interrupted(parts)
+    finally:
+        _close(resp)                        # also stops the model upstream
+    _emit(think.flush(), parts, on_token)
+    return _final(parts, think, template_opened)
+
+
+def warm_up_managed(token, timeout=5):
+    """Ask the server to wake the live model - a scale-to-zero GPU endpoint
+    can take a while to start - while the user is still settling into the
+    call. Fire-and-forget: errors are ignored."""
+    if not token:
+        return
+    try:
+        requests.post(SMART_ACTION_URL, json={"warmup": True, "mode": "live_assist"},
+                      headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+    except requests.RequestException:
+        pass
+
+
+def warm_up(config, timeout=180):
+    """Wake a self-hosted, scale-to-zero endpoint (a dedicated Modal DeepSeek
+    or Qwen) with a one-token request. Hosted APIs have no cold start, so
+    nothing is sent to them. Blocking - call from a worker thread; errors are
+    ignored."""
+    provider = normalize_provider(config.get("action_api_provider"))
+    key = (config.get("action_api_key") or "").strip()
+    if provider in (PROVIDER_GEMINI, PROVIDER_ANTHROPIC) or not key:
+        return
+    d = defaults(provider)
+    base_url = (config.get("action_api_base_url") or d["default_base_url"]).rstrip("/")
+    model = model_for(config, "live_assist", d)
+    if not self_hosted_family(model, base_url):
+        return
+    payload = {"model": model, "max_tokens": 1,
+               "messages": [{"role": "user", "content": "ping"}]}
+    payload.update(openai_payload_extras(model, base_url, "warmup"))
+    try:
+        requests.post(f"{base_url}/chat/completions", json=payload, timeout=timeout,
+                      headers={"Authorization": f"Bearer {key}",
+                               "Content-Type": "application/json"})
+    except requests.RequestException:
+        pass
+
+
+def _image_mime(b64):
+    # Screenshots are sent as JPEG (smaller, faster upload); older callers and
+    # OCR still pass PNG. Base64 of a JPEG always starts with "/9j/".
+    return "image/jpeg" if (b64 or "").startswith("/9j/") else "image/png"
 
 
 def _image_data_url(b64):
-    return f"data:image/png;base64,{b64}"
+    return f"data:{_image_mime(b64)};base64,{b64}"
 
 
 def openai_messages_with_image(messages, image_b64):
@@ -317,10 +641,64 @@ def openai_messages_with_image(messages, image_b64):
     return out
 
 
+# The note live_context.rolling_context adds when a screenshot rides along;
+# dropped again when the screenshot has to be left out.
+_SCREEN_NOTE = re.compile(r"\n*\(A screenshot of the user's screen is attached\.[^)]*\)")
+_IMAGE_REFUSED = (400, 413, 415, 422)
+
+
+_NO_SCREEN_NOTE = ("(No screenshot could be sent - you cannot see the user's screen. If "
+                   "the question is about the screen, say so in one short line.)")
+
+# (base_url, model) pairs that refused a screenshot in this run: later calls
+# leave the image out instead of paying the failed round trip every time.
+_NO_VISION = set()
+
+
+def without_screenshot(messages):
+    """``messages`` with no screenshot, and the note claiming one is attached
+    replaced by one saying it could not be sent - so a model that refused the
+    image (or a Solve screen request) doesn't answer about a screen it never
+    saw."""
+    out = [dict(m) for m in messages]
+    for m in out:
+        if isinstance(m.get("content"), str):
+            m["content"] = _SCREEN_NOTE.sub("", m["content"])
+    for m in reversed(out):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            m["content"] = f"{m['content']}\n\n{_NO_SCREEN_NOTE}"
+            break
+    return out
+
+
+def _image_dropped(status):
+    """Tell the caller (Live Assistance) its screenshot never reached the model."""
+    if isinstance(status, dict):
+        status["dropped"] = True
+
+
+def _answer_family(resp):
+    """The model family the server says answered ("deepseek"/"qwen"/""), so the
+    thinking filter can use the right rule for a template-opened block."""
+    try:
+        return (resp.headers.get("X-Answer-Family") or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _final(parts, think, template_opened):
+    """The finished answer; an empty one after reasoning was removed means the
+    model never got past thinking - say so rather than show "(no answer)"."""
+    text = strip_think("".join(parts), template_opened)
+    if not text and think.saw_reasoning:
+        raise ActionAPIError(THOUGHT_ONLY)
+    return text
+
+
 def gemini_parts(prompt, image_b64=None):
     parts = [{"text": prompt}]
     if image_b64:
-        parts.append({"inline_data": {"mime_type": "image/png", "data": image_b64}})
+        parts.append({"inline_data": {"mime_type": _image_mime(image_b64), "data": image_b64}})
     return parts
 
 
@@ -333,7 +711,8 @@ def anthropic_convo_with_image(convo, image_b64):
     for i in range(len(out) - 1, -1, -1):
         if out[i].get("role") == "user" and isinstance(out[i].get("content"), str):
             out[i]["content"] = [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                {"type": "image", "source": {"type": "base64",
+                                              "media_type": _image_mime(image_b64),
                                               "data": image_b64}},
                 {"type": "text", "text": out[i]["content"]},
             ]
@@ -344,17 +723,37 @@ def anthropic_convo_with_image(convo, image_b64):
 def _sse_data_lines(resp):
     """Yield the payload of each `data:` line of a server-sent-events stream.
 
-    Event streams are UTF-8 by specification, but `requests` falls back to
-    ISO-8859-1 for any text/* response without a charset - which would garble
-    every non-ASCII token (Armenian, Russian...). Pin the decoding."""
-    resp.encoding = "utf-8"
-    for raw in resp.iter_lines(decode_unicode=True):
+    Lines are split on the raw bytes and decoded one at a time, as UTF-8 (the
+    event-stream charset - `requests` would guess ISO-8859-1 for a text/*
+    response without one and garble every Armenian or Russian token).
+    Decoding first and splitting after would also break lines on U+2028,
+    U+2029 and U+0085, which JSON leaves unescaped, cutting such an event in
+    two and silently dropping its text; CR and LF never occur inside a
+    multi-byte UTF-8 sequence, so byte splitting is exact."""
+    resp.encoding = "utf-8"                 # for anyone reading resp.text
+    for raw in resp.iter_lines():
         if not raw:
             continue
-        line = raw.strip()
+        line = (raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw).strip()
         if not line.startswith("data:"):
             continue
         yield line[5:].strip()
+
+
+def _close(resp):
+    close = getattr(resp, "close", None)
+    if close:
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _interrupted(parts):
+    """The connection dropped mid-stream: keep what already arrived (the
+    caller returns it), or say so plainly when nothing did."""
+    if not parts:
+        raise ActionAPIError("The answer was interrupted - check your connection and try again.")
 
 
 def _prepare(config, mode, source_lang, target_lang):
@@ -383,42 +782,61 @@ def _stream_openai_compatible(text, mode, config, source_lang, target_lang, key,
     provider_defaults = defaults(config.get("action_api_provider"))
     base_url = (config.get("action_api_base_url") or provider_defaults["default_base_url"]).rstrip("/")
     model = model_for(config, mode, provider_defaults)
+    messages = build_messages(text, mode, source_lang, target_lang,
+                              vocab_block=config.get("_vocab_block", ""))
+    image, status = config.get("_image_png_b64"), config.get("_image_status")
+    if image and (base_url, model) in _NO_VISION:
+        image, messages = None, without_screenshot(messages)
+        _image_dropped(status)
+    template_opened = bool(self_hosted_family(model, base_url))
     payload = {
         "model": model,
-        "messages": openai_messages_with_image(
-            build_messages(text, mode, source_lang, target_lang,
-                           vocab_block=config.get("_vocab_block", "")),
-            config.get("_image_png_b64")),
+        "messages": openai_messages_with_image(messages, image),
         "temperature": 0.1,
         "max_tokens": _max_tokens_for(mode),
         "stream": True,
     }
-    effort = reasoning_effort_for(model, config.get("action_api_reasoning_effort"))
-    if effort:
-        payload["reasoning_effort"] = effort
-    try:
-        resp = requests.post(
+    payload.update(openai_payload_extras(model, base_url, mode,
+                                         config.get("action_api_reasoning_effort")))
+
+    def _post(body):
+        return requests.post(
             f"{base_url}/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json=payload, stream=True, timeout=(10, 60),
+            json=body, stream=True, timeout=(10, 60),
         )
+    try:
+        resp = _post(payload)
+        if image and resp.status_code in _IMAGE_REFUSED:
+            # A text-only model (most DeepSeek, many self-hosted ones): answer
+            # from the conversation rather than fail every Screen answer.
+            _close(resp)
+            resp = _post(dict(payload, messages=without_screenshot(messages)))
+            _image_dropped(status)
+            if 200 <= resp.status_code < 300:
+                _NO_VISION.add((base_url, model))
     except requests.RequestException as e:
         raise ActionAPIError(f"Network error reaching the action API: {e}")
     if not (200 <= resp.status_code < 300):
         _json_or_error(resp)
     parts = []
-    for data in _sse_data_lines(resp):
-        if data == "[DONE]":
-            break
-        try:
-            obj = json.loads(data)
-            delta = obj["choices"][0].get("delta", {}).get("content") or ""
-        except Exception:
-            continue
-        if delta:
-            parts.append(delta)
-            on_token(delta)
-    return "".join(parts).strip()
+    think = ThinkFilter(template_opened)
+    try:
+        for data in _sse_data_lines(resp):
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+                delta = think.feed(obj["choices"][0].get("delta", {}).get("content") or "")
+            except Exception:
+                continue
+            _emit(delta, parts, on_token)
+    except requests.RequestException:
+        _interrupted(parts)
+    finally:
+        _close(resp)
+    _emit(think.flush(), parts, on_token)
+    return _final(parts, think, template_opened)
 
 
 def _stream_gemini(text, mode, config, source_lang, target_lang, key, on_token):
@@ -441,16 +859,22 @@ def _stream_gemini(text, mode, config, source_lang, target_lang, key, on_token):
     if not (200 <= resp.status_code < 300):
         _json_or_error(resp)
     parts = []
-    for data in _sse_data_lines(resp):
-        try:
-            obj = json.loads(data)
-            for part in obj.get("candidates", [{}])[0].get("content", {}).get("parts", []):
-                delta = part.get("text") or ""
+    try:
+        for data in _sse_data_lines(resp):
+            try:
+                obj = json.loads(data)
+                deltas = [part.get("text") or "" for part in
+                          obj.get("candidates", [{}])[0].get("content", {}).get("parts", [])]
+            except Exception:
+                continue
+            for delta in deltas:
                 if delta:
                     parts.append(delta)
                     on_token(delta)
-        except Exception:
-            continue
+    except requests.RequestException:
+        _interrupted(parts)
+    finally:
+        _close(resp)
     return "".join(parts).strip()
 
 
@@ -479,18 +903,23 @@ def _stream_anthropic(text, mode, config, source_lang, target_lang, key, on_toke
     if not (200 <= resp.status_code < 300):
         _json_or_error(resp)
     parts = []
-    for data in _sse_data_lines(resp):
-        try:
-            obj = json.loads(data)
-        except Exception:
-            continue
-        if obj.get("type") == "content_block_delta":
-            delta = (obj.get("delta") or {}).get("text") or ""
-            if delta:
-                parts.append(delta)
-                on_token(delta)
-        elif obj.get("type") == "message_stop":
-            break
+    try:
+        for data in _sse_data_lines(resp):
+            try:
+                obj = json.loads(data)
+            except Exception:
+                continue
+            if obj.get("type") == "content_block_delta":
+                delta = (obj.get("delta") or {}).get("text") or ""
+                if delta:
+                    parts.append(delta)
+                    on_token(delta)
+            elif obj.get("type") == "message_stop":
+                break
+    except requests.RequestException:
+        _interrupted(parts)
+    finally:
+        _close(resp)
     return "".join(parts).strip()
 
 
@@ -513,26 +942,37 @@ def _run_openai_compatible(text, mode, config, source_lang, target_lang, key):
     provider_defaults = defaults(config.get("action_api_provider"))
     base_url = (config.get("action_api_base_url") or provider_defaults["default_base_url"]).rstrip("/")
     model = model_for(config, mode, provider_defaults)
+    messages = build_messages(text, mode, source_lang, target_lang,
+                              vocab_block=config.get("_vocab_block", ""))
+    image, status = config.get("_image_png_b64"), config.get("_image_status")
+    if image and (base_url, model) in _NO_VISION:
+        image, messages = None, without_screenshot(messages)
+        _image_dropped(status)
     payload = {
         "model": model,
-        "messages": openai_messages_with_image(
-            build_messages(text, mode, source_lang, target_lang,
-                           vocab_block=config.get("_vocab_block", "")),
-            config.get("_image_png_b64")),
+        "messages": openai_messages_with_image(messages, image),
         "temperature": 0.1,
         "max_tokens": _max_tokens_for(mode),
     }
-    effort = reasoning_effort_for(model, config.get("action_api_reasoning_effort"))
-    if effort:
-        payload["reasoning_effort"] = effort
-    resp = requests.post(
-        f"{base_url}/chat/completions",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=45,
-    )
+    payload.update(openai_payload_extras(model, base_url, mode,
+                                         config.get("action_api_reasoning_effort")))
+
+    def _post(body):
+        return requests.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=body,
+            timeout=45,
+        )
+    resp = _post(payload)
+    if image and resp.status_code in _IMAGE_REFUSED:
+        resp = _post(dict(payload, messages=without_screenshot(messages)))
+        _image_dropped(status)
+        if 200 <= resp.status_code < 300:
+            _NO_VISION.add((base_url, model))
     data = _json_or_error(resp)
-    return (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+    return strip_think(data.get("choices", [{}])[0].get("message", {}).get("content") or "",
+                       bool(self_hosted_family(model, base_url)))
 
 
 def _run_gemini(text, mode, config, source_lang, target_lang, key):
@@ -595,6 +1035,9 @@ def _json_or_error(resp):
     except Exception as e:
         raise ActionAPIError(f"Action API returned HTTP {getattr(resp, 'status_code', 'error')}.") from e
     if not (200 <= getattr(resp, "status_code", 0) < 300):
-        message = data.get("error", {}).get("message") if isinstance(data.get("error"), dict) else data.get("error")
+        err = data.get("error") if isinstance(data, dict) else None
+        message = err.get("message") if isinstance(err, dict) else err
+        if not message and isinstance(data, dict):
+            message = data.get("message") or data.get("detail")   # vLLM / FastAPI shapes
         raise ActionAPIError(str(message or f"Action API returned HTTP {resp.status_code}."))
     return data

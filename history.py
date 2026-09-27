@@ -80,16 +80,21 @@ def export_txt(path, entries=None):
     return len(entries)
 
 
-def save_entry(text, language, backend):
+def save_entry(text, language, backend, audio_dir=None):
+    """``audio_dir``: the meeting folder holding this entry's recording
+    (audio_partN.wav), so History can offer it for download."""
     if not text.strip():
         return
     entries = load()
-    entries.insert(0, {
+    entry = {
         "text":      text,
         "language":  language,
         "backend":   backend,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    })
+    }
+    if audio_dir:
+        entry["audio_dir"] = str(audio_dir)
+    entries.insert(0, entry)
     save_all(entries)
 
 

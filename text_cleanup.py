@@ -393,7 +393,7 @@ def clean_with_report(text, *, options=None):
     """
     opts = options or CleanupOptions()
     report = {"artifacts": 0, "repeats": 0, "hallucinations": 0,
-              "prompt_echo": 0, "replacements": 0}
+              "prompt_echo": 0, "vocabulary": 0, "replacements": 0}
     if not text or not text.strip():
         return "", report
 
@@ -422,6 +422,17 @@ def clean_with_report(text, *, options=None):
         before = out
         out = _strip_prompt_echo(out, opts.vocabulary_terms)
         report["prompt_echo"] = int(before != out)
+
+    if opts.vocabulary_terms:
+        # Near-miss spellings of the user's terms become the term ("Doctolibe"
+        # -> "Doctolib") - whatever engine transcribed. Never inserts a term.
+        try:
+            import vocabulary
+            before = out
+            out = vocabulary.correct_spellings(out, opts.vocabulary_terms)
+            report["vocabulary"] = int(before != out)
+        except Exception:
+            pass
 
     if opts.replacements:
         before = out

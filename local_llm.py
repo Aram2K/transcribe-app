@@ -456,19 +456,16 @@ def _messages_for(mode, text, source_lang, target_lang, vocab_block=""):
         )
     elif mode == "live_assist":
         # Tighter than the cloud prompt - small local models follow short,
-        # direct instructions better. Same output shape.
+        # direct instructions better. Same contract: answer, never summarise.
         instruction = (
-            "You are a real-time meeting copilot for the user during a live call. "
-            "The text is the latest part of the conversation (speech recognition, "
-            "may be imperfect), optionally followed by the user's question.\n"
-            "If there is a question from the user, answer it from the conversation. "
-            "Otherwise take the LAST question or request in the text (ignore earlier "
-            "ones), say what is being asked of the user, and what to say next.\n"
-            "Output Markdown, under 100 words:\n"
-            "**They're asking:** <one line>\n"
-            "- 2-4 short concrete points, key phrase in **bold**\n"
-            "Use a fenced code block only if code or a command is actually needed.\n"
-            "Use only the conversation. Do not invent facts or names, and never make "
+            "You are the user's real-time companion during a live call. The text is "
+            "the latest part of the conversation (speech recognition, may be "
+            "imperfect), optionally followed by the user's question.\n"
+            "Answer the user's question if there is one; otherwise answer the LAST "
+            "question or request in the text. Start with the answer itself - the "
+            "words to say or the solution - then at most 2 short bullets. Put code "
+            "or commands in a fenced code block.\n"
+            "No summary, no recap, no headings. Do not invent facts, and never make "
             "claims about the user's own background or experience."
         )
     else:

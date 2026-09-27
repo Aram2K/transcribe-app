@@ -1,4 +1,4 @@
-"""Windows window effects for the Live Assist overlay: capture exclusion,
+"""Windows window effects for the Live Assistance overlay: capture exclusion,
 backdrop blur ("liquid glass"), rounded corners, click-through.
 
 Every function is a safe no-op off Windows or on failure, and reports what it
@@ -46,6 +46,9 @@ WS_EX_LAYERED = 0x00080000
 
 
 _bound = False
+# ctypes.windll.user32 is shared and drops GetLastError, so every failure used
+# to log "err 0". This handle keeps the real code for ctypes.get_last_error().
+_user32_le = None
 
 
 def _bind():
@@ -53,9 +56,12 @@ def _bind():
     int HWND as a 32-bit C int - fine in practice (handles stay 32-bit safe)
     but wrong in principle - and reads HRESULTs as unsigned. Also picks the
     *LongPtr* ex-style APIs on 64-bit."""
-    global _bound
+    global _bound, _user32_le
     if _bound or not IS_WINDOWS:
         return
+    _user32_le = ctypes.WinDLL("user32", use_last_error=True)
+    _user32_le.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    _user32_le.SetWindowDisplayAffinity.restype = ctypes.c_int
     u, d = ctypes.windll.user32, ctypes.windll.dwmapi
     u.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     u.SetWindowDisplayAffinity.restype = ctypes.c_int
@@ -134,9 +140,9 @@ def exclude_from_capture(widget, enabled=True):
     try:
         user32 = ctypes.windll.user32
         want = WDA_EXCLUDEFROMCAPTURE if enabled else WDA_NONE
-        if not user32.SetWindowDisplayAffinity(hwnd, want):
-            logger.warning("SetWindowDisplayAffinity failed (err %s)",
-                           ctypes.get_last_error())
+        if not _user32_le.SetWindowDisplayAffinity(hwnd, want):
+            err = ctypes.get_last_error()   # read before anything else can reset it
+            logger.warning("SetWindowDisplayAffinity failed (err %s, hwnd=%#x)", err, hwnd)
             return False
         got = ctypes.c_uint(0)
         user32.GetWindowDisplayAffinity(hwnd, ctypes.byref(got))

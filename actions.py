@@ -79,7 +79,7 @@ ACTION_MODELS = {
     },
     API_CEREBRAS_ID: {
         "label": "Cerebras API (fastest · vision)",
-        "description": "Sub-second streamed answers - the engine Live Prompter is built for. "
+        "description": "Sub-second streamed answers - the engine Live Assistance is built for. "
                        "Key from cloud.cerebras.ai.",
         "available": True,
         "kind": "cloud",
@@ -214,8 +214,10 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
     # The user's custom vocabulary, so the LLM can repair proper nouns the
     # decoder mangled. Injected as an ephemeral config key (same convention as
     # _managed_token) so the BYO-key engines pick it up without new signatures.
-    # vocabulary.py returns "" when privacy mode or the opt-out is set.
-    vocab_block = vocabulary.spelling_authority_block(config or {})
+    # vocabulary.py returns "" when privacy mode or the opt-out is set. Not for
+    # the live recap: it's the model's own summary, not a transcript repair.
+    vocab_block = ("" if mode == ACTION_LIVE_RECAP
+                   else vocabulary.spelling_authority_block(config or {}))
     if vocab_block and config is not None:
         config = {**config, "_vocab_block": vocab_block}
 
@@ -352,7 +354,7 @@ def process_stream(text, mode, on_token, source_lang="auto", target_lang="en",
     Deliberately has NO rule-based fallback - a live copilot that quietly
     degrades to keyword extraction is worse than one that says it needs an
     engine. Raises ActionError with NO_ENGINE_MESSAGE when nothing real can
-    run. Managed (Pro) calls are single-shot today, delivered in one callback."""
+    run. Managed (Pro) calls stream through the server too."""
     mode = normalize_action_mode(mode)
     model = normalize_action_model(model)
     kind = ACTION_MODELS.get(model, {}).get("kind")
@@ -365,7 +367,11 @@ def process_stream(text, mode, on_token, source_lang="auto", target_lang="en",
     if model == RULE_BASED_ID or kind is None:
         raise ActionError(NO_ENGINE_MESSAGE)
 
-    vocab_block = vocabulary.spelling_authority_block(config or {})
+    # The glossary fixes spellings when a transcript is REWRITTEN (notes,
+    # emails...). Live answers and recaps are the model's own words - a list of
+    # names there only tempts it to drop them in.
+    vocab_block = ("" if mode in (ACTION_LIVE_ASSIST, ACTION_LIVE_RECAP)
+                   else vocabulary.spelling_authority_block(config or {}))
     if vocab_block and config is not None:
         config = {**config, "_vocab_block": vocab_block}
 
@@ -391,19 +397,58 @@ def process_stream(text, mode, on_token, source_lang="auto", target_lang="en",
                 raise ActionError("Sign in with your Transcribe Pro account to use the "
                                   "Pro AI engine - or add your own API key in Settings "
                                   "→ AI Actions.")
-            out = action_api.run_managed_action(
-                text, mode, token, source_lang=source_lang, target_lang=target_lang,
-                vocab_block=vocab_block, image_b64=(config or {}).get("_image_png_b64"))
-            if out:
-                on_token(out)
-            return out
+            return action_api.run_managed_action_stream(
+                text, mode, token, on_token, source_lang=source_lang,
+                target_lang=target_lang, vocab_block=vocab_block,
+                image_b64=(config or {}).get("_image_png_b64"),
+                image_status=(config or {}).get("_image_status"))
     except (local_llm.LocalLLMError, action_api.ActionAPIError) as e:
         raise ActionError(str(e)) from e
     raise ActionError(NO_ENGINE_MESSAGE)
 
 
+def live_engine(engine, config):
+    """The engine for the Live Assistance's answers, from the Smart Actions
+    engine resolved for this user (``config`` carries ``_managed_token`` for
+    Pro). Live answers need speed and sight, so a Pro user ALWAYS gets the Pro
+    cloud engine (fast streaming models, vision) whatever is set for Smart
+    Actions; only Privacy Mode keeps it local. Without Pro: a cloud engine with
+    its own key, else a downloaded local model; None when nothing real can run
+    (there's no rule-based answer)."""
+    config = config or {}
+    kind = ACTION_MODELS.get(engine, {}).get("kind")
+    if config.get("privacy_mode"):
+        # On-device only: a local model or nothing - never the server.
+        return engine if kind == "local_llm" else _first_downloaded_local_model()
+    has_token = bool(config.get("_managed_token"))
+    if has_token:
+        return API_MANAGED_ID
+    if (engine == RULE_BASED_ID or kind is None
+            or (kind == "cloud" and not engine_has_key(engine, config))
+            or (kind == "managed" and not has_token)):
+        return _first_downloaded_local_model()
+    return engine
+
+
+def warm_up(model, config):
+    """Wake the engine a live session will use, so the first answer isn't a
+    cold start. Blocking (worker thread only); never raises. Nothing leaves
+    the device in Privacy Mode."""
+    if (config or {}).get("privacy_mode"):
+        return
+    try:
+        model = normalize_action_model(model)
+        kind = ACTION_MODELS.get(model, {}).get("kind")
+        if kind == "managed":
+            action_api.warm_up_managed((config or {}).get("_managed_token"))
+        elif kind == "cloud" and config:
+            action_api.warm_up(cloud_api_config(model, config))
+    except Exception:
+        pass
+
+
 def _live_assist_basic(text):
-    """No-LLM fallback for Live Assist: point at the last question asked in
+    """No-LLM fallback for Live Assistance: point at the last question asked in
     the conversation tail and echo the freshest points. Says plainly that it
     is basic mode - a user who expects AI suggestions must not mistake this
     for them. Input is the context built by ui.live_assist.rolling_context."""

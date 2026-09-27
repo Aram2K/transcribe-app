@@ -21,6 +21,22 @@ logger = logging.getLogger("transcribe")
 _SPEAKER_RE = re.compile(r"^(Speaker (?:\d+|\?)|You):")
 
 
+def recording_save_path(parent, stem):
+    """Ask where to save a meeting recording (MP3 by default, or WAV).
+    Returns the path with the right extension, or "" if cancelled. Shared by
+    the meeting detail view, the Live Assistance and History."""
+    suggested = os.path.join(os.path.expanduser("~"), f"{docx_export.safe_filename(stem)}.mp3")
+    path, chosen = QFileDialog.getSaveFileName(
+        parent, "Save recording", suggested, "MP3 audio (*.mp3);;WAV audio (*.wav)")
+    if not path:
+        return ""
+    if "wav" in chosen.lower() and not path.lower().endswith(".wav"):
+        path += ".wav"
+    elif not path.lower().endswith((".mp3", ".wav")):
+        path += ".mp3"
+    return path
+
+
 def transcript_html(transcript):
     """Bold slate speaker labels, readable line spacing."""
     rows = []
@@ -165,16 +181,9 @@ class MeetingDetailDialog(QDialog):
     def _save_recording(self):
         if not self.parts:
             return
-        suggested = os.path.join(os.path.expanduser("~"), f"{self._default_stem()}.mp3")
-        path, chosen = QFileDialog.getSaveFileName(
-            self, "Save recording", suggested,
-            "MP3 audio (*.mp3);;WAV audio (*.wav)")
+        path = recording_save_path(self, self._default_stem())
         if not path:
             return
-        if "wav" in chosen.lower() and not path.lower().endswith(".wav"):
-            path += ".wav"
-        elif not path.lower().endswith((".mp3", ".wav")):
-            path += ".mp3"
         self.btn_audio.setEnabled(False)
         self.lbl_status.setText("Exporting recording…")
         parts = list(self.parts)

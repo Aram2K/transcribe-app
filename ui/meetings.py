@@ -100,6 +100,7 @@ class MeetingsWindow(QDialog):
         self._chunks = []
         self._chunks_lock = threading.Lock()
         self._record_started_at = None
+        self._record_stopped_at = None
         self._meeting_dir = None
         # Resume-session state (set by resume_meeting, cleared when notes land).
         self._resume_dir = None
@@ -111,6 +112,10 @@ class MeetingsWindow(QDialog):
         self._meeting_title = ""
         self._meeting_attendees = ""
         self._summary_downgraded = False
+        # Caveats about the transcript/recording itself (a part that couldn't
+        # be transcribed, the recording cap) - shown above the notes on the
+        # Done page, kept across Retry Summary.
+        self._transcript_notices = []
 
         # Live-transcript + rolling-summary state.
         self._live_text = ""
@@ -142,6 +147,9 @@ class MeetingsWindow(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
+        # The window is built once at launch; Settings may have changed the
+        # models since. Read-only - showing the window never writes the config.
+        self._sync_setup_from_cfg()
         from ui.winfit import settle_on_screen, size_to_screen
         if not getattr(self, "_fit_positioned", False):
             size_to_screen(self, 0.44, 0.64, 680, 520, 900, 820)
@@ -221,6 +229,9 @@ class MeetingsWindow(QDialog):
         d_lay.addWidget(QLabel("Meeting Recording Mode", dev_frame))
         from ui.mode_combo import MeetingModeComboBox
         self.combo_device = MeetingModeComboBox(dev_frame)
+        # ``activated`` fires only for a user pick, never for the programmatic
+        # re-sync from Settings - so only a real choice here is saved.
+        self.combo_device.activated.connect(self._on_mode_picked)
         d_lay.addWidget(self.combo_device)
 
         d_lay.addWidget(QLabel("Spoken Language", dev_frame))
@@ -236,6 +247,7 @@ class MeetingsWindow(QDialog):
         # Transcription model (local Whisper sizes) - the speech-to-text engine.
         d_lay.addWidget(QLabel("Transcription model", dev_frame))
         self.combo_whisper = QComboBox(dev_frame)
+        self.combo_whisper.activated.connect(self._on_whisper_picked)
         d_lay.addWidget(self.combo_whisper)
 
         # Summary & notes AI - rule-based (local), a local LLM, or cloud. Rows
@@ -244,6 +256,7 @@ class MeetingsWindow(QDialog):
         d_lay.addWidget(QLabel("Summary & notes AI", dev_frame))
         self.combo_action = QComboBox(dev_frame)
         self.combo_action.currentIndexChanged.connect(self._on_action_engine_changed)
+        self.combo_action.activated.connect(self._on_action_engine_picked)
         d_lay.addWidget(self.combo_action)
 
         # Shown only for bring-your-own-key cloud engines.
@@ -341,7 +354,7 @@ class MeetingsWindow(QDialog):
 
         # Bottom Recording Control row
         btn_lay = QHBoxLayout()
-        btn_assist = QPushButton("Live Prompter", self.page_recording)
+        btn_assist = QPushButton("Live Assistance", self.page_recording)
         btn_assist.setToolTip(
             "A private floating prompter: the last thing said, the running summary "
             "and AI suggestions - kept out of your screen share.")
@@ -561,10 +574,75 @@ class MeetingsWindow(QDialog):
             self.app.cfg["action_api_provider"] = info["provider"]
         self.app.save_config()
 
+    def _sync_setup_from_cfg(self):
+        """Point the recording-mode / model / engine pickers at the current
+        settings. They're filled once at launch, and Start used to save them
+        back - silently reverting anything changed in Settings since. Never
+        writes the config; a pick the user makes HERE is saved as it's made
+        (the _on_*_picked handlers)."""
+        if not self.app:
+            return
+        cfg = self.app.cfg
+
+        def _select(combo, value):
+            idx = combo.findData(value) if value else -1
+            if idx >= 0 and idx != combo.currentIndex():
+                combo.blockSignals(True)
+                combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
+            return idx
+
+        try:
+            # A mode this system can't capture isn't listed: keep the healed
+            # pick from _populate_audio_devices.
+            if getattr(self, "combo_device", None) is not None:
+                _select(self.combo_device, cfg.get("meeting_audio_mode"))
+            if getattr(self, "combo_whisper", None) is not None:
+                _select(self.combo_whisper, cfg.get("whisper_model"))
+            if getattr(self, "combo_action", None) is not None:
+                # Rule-based isn't offered here - same fallback as the populate.
+                if _select(self.combo_action,
+                           actions.normalize_action_model(cfg.get("action_model"))) < 0:
+                    _select(self.combo_action, self._default_engine_id())
+                self._on_action_engine_changed()
+        except Exception as e:
+            logger.debug("meeting setup re-sync failed: %s", e)
+
+    def _stage_pick(self, key, value):
+        if self.app and value and self.app.cfg.get(key) != value:
+            self.app.cfg[key] = value
+            self.app.save_config()
+
+    def _on_mode_picked(self, *_):
+        self._stage_pick("meeting_audio_mode", self.combo_device.currentData())
+
+    def _on_whisper_picked(self, *_):
+        self._stage_pick("whisper_model", self.combo_whisper.currentData())
+
+    def _on_action_engine_picked(self, *_):
+        self._stage_pick("action_model", self.combo_action.currentData())
+
     # ── State Machine Triggers ──
-    def _start_meeting(self):
+    def _start_meeting(self, language=None, *, resume=False):
+        """``language``: this session's transcription language (Live
+        Assistance passes its own) - never written to the saved settings.
+        ``resume``: set only by resume_meeting; every other Start is a NEW
+        meeting."""
         if not self.app or not self.app.recorder:
             return
+        # The previous meeting may still be saving/transcribing on its worker:
+        # restarting the shared recorder now would hand it this session's audio
+        # (the old recording is lost) and leave the new one unstoppable.
+        if self.state in (self.STATE_RECORDING, self.STATE_PROCESSING):
+            return
+
+        # A Done page - notably a resumed meeting whose summary failed - keeps
+        # its resume state for Retry. A fresh Start (the Live Assistance card
+        # starts straight from there) must not record into that old folder or
+        # inherit its transcript. (Its title/attendees were already cleared
+        # when it reached the Done page - see _clear_setup_inputs.)
+        if not resume:
+            self._clear_resume_state()
 
         # One-time legal notice: recording other participants may require their
         # consent. Must be acknowledged before the first recording ever starts.
@@ -595,18 +673,17 @@ class MeetingsWindow(QDialog):
         self._meeting_title = self.input_title.text().strip() or "Untitled Meeting"
         self._meeting_attendees = self.input_attendees.text().strip()
 
+        # The pickers may predate a Settings change: read them from the config
+        # first. The Whisper model and notes engine aren't written back here -
+        # a pick made in this window was already saved when it was made.
+        self._sync_setup_from_cfg()
+
         # Capture configurations. This is the meeting capture mode
         # ("smart_meeting"/"default_mic"), stored under its own key so it stays
-        # independent of the dictation input device.
+        # independent of the dictation input device. Still written: it differs
+        # from the config only when the saved mode can't be captured here.
         meeting_mode = self.combo_device.currentData()
-        self.app.cfg["meeting_audio_mode"] = meeting_mode
-        # Apply the in-meeting model picks (these set the app-wide defaults, same
-        # as the recording-mode selector does).
-        if hasattr(self, "combo_whisper") and self.combo_whisper.currentData():
-            self.app.cfg["whisper_model"] = self.combo_whisper.currentData()
-        if hasattr(self, "combo_action") and self.combo_action.currentData():
-            self.app.cfg["action_model"] = self.combo_action.currentData()
-        self.app.save_config()
+        self._stage_pick("meeting_audio_mode", meeting_mode)
 
         # Build local timestamp folder for auto-save recovery (a resumed
         # meeting keeps writing into its original folder).
@@ -615,10 +692,17 @@ class MeetingsWindow(QDialog):
             if getattr(self, "_resume_dir", None) is not None:
                 self._meeting_dir = self._resume_dir
             else:
-                self._meeting_dir = storage.path_for("meetings") / timestamp
+                # A new meeting never shares a folder - not even with one
+                # started (or aborted) within the same second.
+                base = storage.path_for("meetings") / timestamp
+                self._meeting_dir, n = base, 2
+                while self._meeting_dir.exists():
+                    self._meeting_dir = base.with_name(f"{timestamp}_{n}")
+                    n += 1
             self._meeting_dir.mkdir(parents=True, exist_ok=True)
             self._chunks_path = self._meeting_dir / "chunks.jsonl"
         except OSError as e:
+            self.app.track("meeting_recording_failed", {"reason": "folder"})
             QMessageBox.critical(self, "Recording Error",
                                  f"Could not create the meeting folder:\n{e}")
             return
@@ -645,12 +729,8 @@ class MeetingsWindow(QDialog):
         self._final_transcript = ""
         self._final_notes = ""
         self._summary_downgraded = False
-        la = getattr(self.app, "live_assist", None)
-        if la is not None:
-            la.set_meeting_active(True, self._meeting_title, self._meeting_attendees)
-            prior = getattr(self, "_resume_prior", "")
-            if prior:
-                la.feed_transcript(prior[-1500:])     # earlier context for suggestions
+        self._transcript_notices = []
+        self._record_stopped_at = None
         self._live_text = ""
         self._live_summary_text = ""
         self._last_summary_at = time.time()
@@ -664,8 +744,8 @@ class MeetingsWindow(QDialog):
         # Start recording - guard against device-open failures (busy mic, no
         # loopback device, driver errors) so a failure never crashes the app or
         # leaves the window stuck in a fake "recording" state.
-        meeting_lang = (self.combo_lang.currentData()
-                        if hasattr(self, "combo_lang") else None)
+        meeting_lang = language or (self.combo_lang.currentData()
+                                    if hasattr(self, "combo_lang") else None)
         try:
             self.app.recorder.start_recording(capture_mode=meeting_mode,
                                               language=meeting_lang)
@@ -674,6 +754,7 @@ class MeetingsWindow(QDialog):
             self.state = self.STATE_IDLE
             self._record_started_at = None
             self.container.setCurrentIndex(0)
+            self.app.track("meeting_recording_failed", {"reason": "device"})
             QMessageBox.critical(
                 self, "Recording Error",
                 f"Could not start the meeting recording:\n\n{e}\n\n"
@@ -681,6 +762,15 @@ class MeetingsWindow(QDialog):
                 "device and try again."
             )
             return
+
+        # Only now that the device is open does the overlay go live (a failed
+        # start used to leave it showing a running timer and a dead Stop).
+        la = getattr(self.app, "live_assist", None)
+        if la is not None:
+            la.set_meeting_active(True, self._meeting_title, self._meeting_attendees)
+            prior = getattr(self, "_resume_prior", "")
+            if prior:
+                la.feed_transcript(prior[-1500:], answer=False)   # earlier context only
 
         # Swap view tab
         self.container.setCurrentIndex(1)
@@ -782,7 +872,12 @@ class MeetingsWindow(QDialog):
         SUMMARY_INTERVAL = 20.0
         now = time.time()
         grown = len(self._live_text) - getattr(self, "_summary_len_at_last", 0)
+        # Not during a Live Assistance session: nothing shows the recap there,
+        # and every recap call would compete with the answers for the engine.
+        live_prompter = bool(getattr(self.app.recorder, "fast_live_chunks", False)) \
+            if self.app else False
         if (not self._summary_running
+                and not live_prompter
                 and self._live_text.strip()
                 and grown >= 160
                 and now - self._last_summary_at >= SUMMARY_INTERVAL):
@@ -845,6 +940,12 @@ class MeetingsWindow(QDialog):
     def _stop_meeting(self):
         if not self.app or self.state != self.STATE_RECORDING:
             return
+        started = self._record_started_at
+        # Stop time, not "whenever the notes land": the saved duration must not
+        # include processing (or time spent on the Done page before a Retry).
+        self._record_stopped_at = time.time()
+        self._meeting_minutes = (round((self._record_stopped_at - started) / 60, 1)
+                                 if started else None)
         la = getattr(self.app, "live_assist", None)
         if la is not None:
             la.set_meeting_active(False)
@@ -855,6 +956,17 @@ class MeetingsWindow(QDialog):
         # Read the in-meeting notepad on the GUI thread (touching the QTextEdit
         # from a worker is unsafe).
         self._user_notes = self.input_live_notes.toPlainText().strip()
+        # The notes run with the engine this window shows. When the saved one
+        # isn't offered here (rule-based - the default, and after a Pro
+        # sign-out or Privacy Mode) the shown engine is used for THIS meeting,
+        # as 1.9.0 did by saving it at Start - without changing the settings.
+        self._notes_engine = None
+        combo = getattr(self, "combo_action", None)
+        if combo is not None and self.app:
+            shown = combo.currentData()
+            saved = actions.normalize_action_model(self.app.cfg.get("action_model"))
+            if shown and combo.findData(saved) < 0:
+                self._notes_engine = shown
 
         # Everything heavy - stopping the recorder (which joins the recording
         # thread for up to 5s), transcription, diarization and summary - runs on
@@ -892,37 +1004,100 @@ class MeetingsWindow(QDialog):
         except Exception as e:
             logger.warning("Could not save meeting audio: %s", e)
 
+    def _write_meta(self):
+        """meta.json - title, attendees, total duration - for History and
+        Resume. Best-effort: never turns a meeting into an error."""
+        try:
+            if not self._meeting_dir:
+                return
+            started = self._record_started_at
+            stopped = getattr(self, "_record_stopped_at", None) or time.time()
+            duration = max(int(stopped - started), 0) if started else 0
+            with open(self._meeting_dir / "meta.json", "w", encoding="utf-8") as f:
+                json.dump({
+                    "title": self._meeting_title,
+                    "attendees": self._meeting_attendees,
+                    "duration_sec": duration + int(getattr(self, "_resume_prior_duration", 0) or 0),
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                }, f)
+        except Exception:
+            logger.warning("Could not save meeting details", exc_info=True)
+
+    def _chunks_transcript(self):
+        """This segment's live chunks in spoken order, and their most common
+        language - the fallback when the recorder's final pass reports an
+        error (it then hands back no text at all)."""
+        with self._chunks_lock:
+            chunks = sorted(self._chunks, key=lambda c: c.get("index") or 0)
+        texts = [(c.get("text") or "").strip() for c in chunks]
+        langs = [c.get("language") for c in chunks if c.get("language")]
+        lang = max(set(langs), key=langs.count) if langs else ""
+        # The recorder's own record is complete - it includes chunks that
+        # finished after Stop (dropped by the live chunk callback) and the
+        # final tail; the live chunk list is only the fallback.
+        rec = getattr(self.app, "recorder", None) if self.app else None
+        partial = (getattr(rec, "partial_text", "") or "").strip()
+        if partial:
+            return partial, lang
+        return " ".join(t for t in texts if t), lang
+
+    def _recording_cap_notice(self):
+        import meeting_store
+        cap = getattr(self.app.recorder, "_full_audio_max", None) if self.app else None
+        secs = (cap / diarization.SAMPLE_RATE
+                if isinstance(cap, (int, float)) and cap > 0 else 2 * 3600)
+        return (f"The saved recording ends at about {meeting_store.format_duration(secs)} "
+                "- the most one session keeps. The transcript and notes still cover the "
+                "whole meeting (without speaker labels).")
+
     def _process_meeting_notes(self):
         try:
+            self._transcript_notices = []
             self._save_recording_segment()
+            # Title/attendees/duration now, not only once notes succeed: a
+            # meeting whose transcription or summary fails must still show up
+            # in History under its own name.
+            self._write_meta()
             self._emit_status("Finalizing transcript…")
-            # 1. Wait briefly to drain active audio queue and transcription threads
-            text, detected_lang = self.app.recorder.transcribe()
-            self._final_lang = detected_lang if not str(detected_lang).startswith("!") else ""
+            rec = self.app.recorder
+            prior = getattr(self, "_resume_prior", "")
+            # 1. Drain the chunk threads and transcribe the tail. ``text`` is
+            # every chunk's result in spoken order, tail included - the ONE
+            # source of this segment's transcript (self._chunks is in completion
+            # order and misses the tail; adding both doubled the transcript).
+            text, detected_lang = rec.transcribe()
+            text = (text or "").strip()
 
             # A "!"-prefixed lang is the recorder reporting a real failure
-            # (device error, cloud error, transcription exception). Show THAT
-            # instead of letting it masquerade as an empty meeting.
+            # (device error, cloud error, transcription exception) - and it then
+            # returns no text at all, even if only one chunk failed. Rebuild from
+            # the chunks that DID transcribe and say what's missing; only a
+            # session with nothing to show reports the error on its own.
+            failure = ""
+            capture_failed = False
             if str(detected_lang).startswith("!"):
-                friendly = str(detected_lang).split(":", 1)[-1].strip() or "Audio capture failed."
-                self.proc_signals.finished.emit("", friendly)
-                return
-
-            # Combine transcript chunk lists
-            full_chunks_text = []
-            with self._chunks_lock:
-                for c in self._chunks:
-                    full_chunks_text.append(c.get("text", ""))
-
-            if text and text not in full_chunks_text:
-                full_chunks_text.append(text)
-
-            self._final_transcript = "\n\n".join(full_chunks_text).strip()
+                failure = str(detected_lang).split(":", 1)[-1].strip() or "Audio capture failed."
+                capture_failed = str(detected_lang).startswith("!audio")
+                text, detected_lang = self._chunks_transcript()
+                if not text and not prior:
+                    self._final_lang = ""
+                    self.proc_signals.finished.emit("", failure)
+                    return
+                logger.warning("Meeting transcription incomplete (%s); keeping %d chars "
+                               "from the live chunks", failure, len(text))
+                self._emit_status("Part of the audio couldn't be transcribed - "
+                                  "keeping everything that was…")
+            elif not text:
+                # Nothing joined yet chunks arrived (shouldn't happen - every
+                # live chunk is in transcribe()'s result): never call it empty.
+                text = self._chunks_transcript()[0]
+            self._final_lang = detected_lang or ""
+            self._final_transcript = text
 
             # A resumed session with no NEW speech still has its earlier
             # transcript - regenerate the notes from that instead of calling
             # the meeting empty (which would also reset the resume state).
-            if not self._final_transcript and not getattr(self, "_resume_prior", ""):
+            if not self._final_transcript and not prior:
                 msg = "No transcription recorded. The meeting is empty."
                 # In a system-audio mode, a dead-silent loopback means the
                 # sound the user heard was playing on a DIFFERENT output
@@ -939,19 +1114,45 @@ class MeetingsWindow(QDialog):
                 self.proc_signals.finished.emit("", msg)
                 return
 
-            # Upgrade to a speaker-attributed transcript when local diarization
-            # is available: re-transcribe the full audio with timestamps, diarize
-            # it, and label each segment ("Speaker 1/2/3: ..."). Falls back
-            # silently to the plain chunk transcript on any failure.
-            try:
-                attributed = self._build_attributed_transcript()
-                if attributed:
-                    self._final_transcript = attributed
-            except Exception as e:
-                logger.warning("Speaker attribution failed, using plain transcript: %s", e)
+            if getattr(rec, "_full_audio_truncated", False) is True:
+                # The recorder stops keeping full audio at its memory cap
+                # (~2 h). Speaker labels come from that audio, so they would
+                # REPLACE the complete live transcript with one that ends at the
+                # cap - keep the complete one (and skip the long diarization).
+                self._transcript_notices.append(self._recording_cap_notice())
+                self._emit_status("Long meeting - keeping the full transcript "
+                                  "(the saved recording ends at the 2-hour cap)…")
+            else:
+                # Upgrade to a speaker-attributed transcript when local
+                # diarization is available: re-transcribe the full audio with
+                # timestamps, diarize it, and label each segment ("Speaker 1/2/3:
+                # ..."). Falls back silently to the plain transcript on failure.
+                try:
+                    attributed = self._build_attributed_transcript()
+                    if attributed:
+                        self._final_transcript = attributed
+                        # That pass re-transcribed ALL the retained audio, so
+                        # chunks that failed live are covered now; audio a dead
+                        # device never captured still isn't.
+                        if not capture_failed:
+                            failure = ""
+                except Exception as e:
+                    logger.warning("Speaker attribution failed, using plain transcript: %s", e)
+
+            if failure:
+                reason = failure.rstrip(". ")
+                marker, notice = (
+                    ("The recording stopped here",
+                     f"The recording stopped early: {reason}. The transcript and "
+                     "notes cover what was captured.")
+                    if capture_failed else
+                    ("Part of the audio couldn't be transcribed",
+                     f"Part of the audio couldn't be transcribed: {reason}. The "
+                     "transcript and notes cover the rest."))
+                self._final_transcript = f"{self._final_transcript}\n\n— {marker} —".strip()
+                self._transcript_notices.insert(0, notice)
 
             # A resumed meeting continues its earlier transcript.
-            prior = getattr(self, "_resume_prior", "")
             if prior:
                 new_part = self._final_transcript.strip()
                 self._final_transcript = (
@@ -962,10 +1163,11 @@ class MeetingsWindow(QDialog):
             # so a summary failure (missing key, network, server error) can never
             # lose the recording. This is the durable copy alongside chunks.jsonl.
             try:
-                with open(self._meeting_dir / "transcript.txt", "w", encoding="utf-8") as f:
-                    f.write(self._final_transcript)
-            except OSError:
-                pass
+                if self._meeting_dir:
+                    with open(self._meeting_dir / "transcript.txt", "w", encoding="utf-8") as f:
+                        f.write(self._final_transcript)
+            except Exception:
+                logger.warning("Could not save the meeting transcript", exc_info=True)
 
             # 2. Summarize as a separate step so the Done page's "Retry Summary"
             # can re-run just this part on the saved transcript (no re-record).
@@ -1023,7 +1225,8 @@ class MeetingsWindow(QDialog):
             # configured engine is cloud-without-a-key, degrade to the local
             # rule-based summary so notes always generate instead of erroring
             # (which used to strand the whole recording).
-            engine, engine_config = self.app._resolve_action_engine()
+            engine, engine_config = self.app._resolve_action_engine(
+                action_model=getattr(self, "_notes_engine", None))
             # Guarantee the summary can actually run rather than erroring (which
             # would strand the notes): if the resolved engine is a cloud model
             # with no key, or managed with no token (e.g. a Pro session whose
@@ -1072,16 +1275,9 @@ class MeetingsWindow(QDialog):
                 if self._meeting_dir:
                     with open(self._meeting_dir / "notes.md", "w", encoding="utf-8") as f:
                         f.write(notes)
-                    with open(self._meeting_dir / "meta.json", "w", encoding="utf-8") as f:
-                        json.dump({
-                            "title": self._meeting_title,
-                            "attendees": self._meeting_attendees,
-                            "duration_sec": (int(time.time() - self._record_started_at) if self._record_started_at else 0)
-                                            + int(getattr(self, "_resume_prior_duration", 0) or 0),
-                            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-                        }, f)
             except Exception:
                 logger.warning("Could not save meeting artifacts", exc_info=True)
+            self._write_meta()
 
             self.proc_signals.finished.emit(notes, "")
         except Exception as e:
@@ -1091,16 +1287,23 @@ class MeetingsWindow(QDialog):
         transcript = getattr(self, "_final_transcript", "") or ""
 
         if error_msg:
+            if self.app:
+                self.app.track("meeting_notes_failed", {
+                    "minutes": getattr(self, "_meeting_minutes", None),
+                    "transcript_kept": bool(transcript.strip()),
+                })
             # If a transcript exists, the recording is NOT lost: land on the Done
             # page showing the transcript + a Retry, instead of _reset() wiping
             # everything (the old data-loss bug). Only a true capture failure
             # (nothing transcribed) falls back to the error dialog + reset.
             if transcript.strip():
                 self.state = self.STATE_DONE
+                self._clear_setup_inputs()
                 self._final_notes = ""
                 self.lbl_done_title.setText(self._meeting_title or "Meeting Notes")
+                notices = "".join(f"⚠️ {n}\n\n" for n in self._notices())
                 self.txt_summary.setPlainText(
-                    f"⚠️ The AI summary couldn't be generated:\n{error_msg}\n\n"
+                    f"{notices}⚠️ The AI summary couldn't be generated:\n{error_msg}\n\n"
                     "Your full transcript is safe - it's shown on the right and "
                     f"saved to:\n{self._meeting_dir}\n\n"
                     'Click "Retry Summary" above to try again.'
@@ -1109,12 +1312,21 @@ class MeetingsWindow(QDialog):
                 self._show_retry_summary(True)
                 self.container.setCurrentIndex(3)
             else:
+                saved = ""
+                try:
+                    import meeting_store
+                    if self._meeting_dir and meeting_store.audio_parts(self._meeting_dir):
+                        saved = ("\n\nThe recording itself was saved - find it under "
+                                 "Settings → History → Meetings.")
+                except Exception:
+                    pass
                 QMessageBox.critical(self, "AI Summary Error",
-                                     f"Could not generate meeting notes: {error_msg}")
+                                     f"Could not generate meeting notes: {error_msg}{saved}")
                 self._reset()
             return
 
         self.state = self.STATE_DONE
+        self._clear_setup_inputs()
         self._final_notes = notes
         self._clear_resume_state()
         # Keep Retry (and its engine picker) visible when the notes were
@@ -1124,11 +1336,14 @@ class MeetingsWindow(QDialog):
 
         self.lbl_done_title.setText(self._meeting_title or "Meeting Notes")
         # The notes are markdown - render them as such (headings, bullets,
-        # checkboxes) instead of showing raw ## and - [ ] markers.
+        # checkboxes) instead of showing raw ## and - [ ] markers. Transcript/
+        # recording caveats go above them on screen only - they're about the
+        # recording, so they stay out of the exported/copied notes.
+        shown = "".join(f"> ⚠️ {n}\n\n" for n in self._notices()) + notes
         try:
-            self.txt_summary.setMarkdown(notes)
+            self.txt_summary.setMarkdown(shown)
         except Exception:
-            self.txt_summary.setPlainText(notes)
+            self.txt_summary.setPlainText(shown)
         self._render_transcript(transcript)
 
         self.container.setCurrentIndex(3)
@@ -1142,12 +1357,15 @@ class MeetingsWindow(QDialog):
                 import history as hist
                 entry = (f"{self._meeting_title} - Meeting Notes\n\n{notes}"
                          f"\n\n--- Full Transcript ---\n\n{self._final_transcript}")
-                hist.save_entry(entry, getattr(self, "_final_lang", "") or "", "meeting")
+                hist.save_entry(entry, getattr(self, "_final_lang", "") or "", "meeting",
+                                audio_dir=self._meeting_dir)
         except Exception:
             pass
 
         from main import APP_VERSION
-        telemetry.track("meeting_notes_completed", {}, self.app.cfg, APP_VERSION)
+        telemetry.track("meeting_notes_completed",
+                        {"minutes": getattr(self, "_meeting_minutes", None)},
+                        self.app.cfg, APP_VERSION)
 
     def resume_meeting(self, folder):
         """Continue a saved meeting from History: same folder, the new segment
@@ -1172,7 +1390,7 @@ class MeetingsWindow(QDialog):
         self.show()
         self.raise_()
         self.activateWindow()
-        self._start_meeting()
+        self._start_meeting(resume=True)
         if self.state != self.STATE_RECORDING:
             self._resume_dir, self._resume_prior, self._resume_prior_duration = None, "", 0
 
@@ -1180,6 +1398,18 @@ class MeetingsWindow(QDialog):
         self._resume_dir = None
         self._resume_prior = ""
         self._resume_prior_duration = 0
+
+    def _clear_setup_inputs(self):
+        """Empty the setup page's title/attendees once a session is done. The
+        finished meeting keeps its own copy (_meeting_title/_attendees) for the
+        Done page, Retry and Notion; the fields are for the NEXT meeting - and
+        the Live Assistance card names its session only when the title is
+        empty."""
+        self.input_title.clear()
+        self.input_attendees.clear()
+
+    def _notices(self):
+        return list(getattr(self, "_transcript_notices", None) or [])
 
     def _render_transcript(self, transcript):
         """Readable transcript: bold slate speaker labels and real line spacing
@@ -1295,6 +1525,8 @@ class MeetingsWindow(QDialog):
     def _on_notion_done(self, url, err):
         self.btn_notion.setEnabled(True)
         self.btn_notion.setText("Send to Notion")
+        if self.app:
+            self.app.track("meeting_exported", {"target": "notion", "ok": not err})
         if err:
             QMessageBox.warning(self, "Notion",
                                 f"Couldn't send to Notion:\n\n{err}")
@@ -1309,6 +1541,8 @@ class MeetingsWindow(QDialog):
     def _copy_markdown(self):
         clipboard = QApplication.clipboard()
         clipboard.setText(self._final_notes)
+        if self.app:
+            self.app.track("meeting_exported", {"target": "clipboard", "ok": True})
         QMessageBox.information(self, "Copied", "AI Meeting notes copied to clipboard in Markdown formatting.")
 
     def _save_to_file(self):
@@ -1321,6 +1555,8 @@ class MeetingsWindow(QDialog):
             try:
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(self._final_notes)
+                if self.app:
+                    self.app.track("meeting_exported", {"target": "markdown", "ok": True})
                 QMessageBox.information(self, "Saved", f"Successfully saved meeting notes to {os.path.basename(path)}")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to save notes: {e}")
@@ -1397,14 +1633,31 @@ class MeetingsWindow(QDialog):
         self._clear_resume_state()
         self.input_title.clear()
         self.input_attendees.clear()
-        self.combo_device.setCurrentIndex(0)
+        # Back to the saved settings (index 0 used to flip the recording mode
+        # to "System sound + Microphone", which the next Start then saved).
+        self._sync_setup_from_cfg()
         self.container.setCurrentIndex(0)
 
     def _abort(self):
+        # Tell the overlay the session is over (it resets its fast pieces and
+        # live state) - but a discarded session has no recording to offer.
+        la = getattr(self.app, "live_assist", None) if self.app else None
+        if la is not None and self.state == self.STATE_RECORDING:
+            la.set_meeting_active(False)
+            la.discard_session_audio()
+        # A NEW meeting's folder holds only this session's live chunks - keep
+        # them out of History (it lists chunk-only folders so a crashed
+        # meeting stays recoverable). A resumed meeting's folder is untouched.
+        discarded = (self._meeting_dir
+                     if self.state == self.STATE_RECORDING and self._resume_dir is None
+                     else None)
         if self.app and self.app.recorder:
             self.app.recorder.stop_recording()
             self._restore_recorder_callbacks()
         self._reset()
+        if discarded:
+            import meeting_store
+            meeting_store.mark_discarded(discarded)
 
     def closeEvent(self, event):
         if self.state == self.STATE_RECORDING:

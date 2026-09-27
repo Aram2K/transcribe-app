@@ -42,7 +42,7 @@ import text_cleanup
 import vocabulary
 
 # ── Version ───────────────────────────────────────────────────────────────────
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 
 # ── Managed cloud transcription (Pro moat) ────────────────────────────────────
 MANAGED_PROXY_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-proxy"
@@ -134,12 +134,15 @@ DEFAULT = {
     # token + the page the notes land under. Plain-config like mistral_api_key.
     "notion_api_key": "",
     "notion_parent_page": "",
-    # Live Assist overlay (ui/live_assist.py): private copilot during calls.
+    # Live Assistance overlay (ui/live_assist.py): private copilot during calls.
     "live_assist_hotkey": "ctrl+alt+a",
     "live_assist_private": True,     # excluded from screen capture
     "live_assist_opacity": 0.96,
     "live_assist_theme": "light",
-    "live_assist_auto": False,       # auto-refresh suggestions while people talk
+    # Answer automatically when someone asks a question. A new key on purpose:
+    # 1.9.0 stored "live_assist_auto": false (its periodic refresh, off by
+    # default) in every config.json, which would keep this off after updating.
+    "live_assist_auto_answer": True,
     "live_assist_pos": None,
     "live_assist_language": "en",         # transcription language for prompter sessions
     "live_assist_output_language": "en",  # language of the suggestions
@@ -327,6 +330,21 @@ def acquire_single_instance_lock():
         sock.close()
         return None
 
+IPC_ACTIONS = ("show_settings", "show_onboarding", "show_meeting", "live_prompter")
+
+
+def launch_action(argv):
+    """What a second launch asks the running instance to do: the action named
+    on the command line, nothing for the quiet Windows-startup launch (the app
+    is already running), otherwise open Settings."""
+    for arg in argv[1:]:
+        if arg in IPC_ACTIONS:
+            return arg
+    if "--background" in argv:
+        return None
+    return "show_settings"
+
+
 def signal_running_instance(action="show_settings"):
     try:
         with socket.create_connection(("127.0.0.1", SINGLE_INSTANCE_PORT), timeout=1) as s:
@@ -342,8 +360,7 @@ def start_ipc_server(server_sock, on_action):
             try:
                 conn, _ = server_sock.accept()
                 data = conn.recv(64).decode("utf-8", errors="ignore").strip()
-                if data in ("show_settings", "show_onboarding", "show_meeting",
-                            "live_prompter"):
+                if data in IPC_ACTIONS:
                     conn.sendall(b"transcribe-ok")
                 conn.close()
                 if data:
@@ -676,6 +693,7 @@ class AudioRecorder:
         
         self._chunk_frames    = []
         self._chunk_results   = {}
+        self.partial_text     = ""   # what transcribed when a pass failed
         self._chunk_idx       = 0
         self._chunk_lock      = threading.Lock()
         self._samples_in_chunk= 0
@@ -694,6 +712,7 @@ class AudioRecorder:
         # selector). None = use the global cfg["language"] default.
         self.language_override = None
         self._capture_mode = None     # smart_meeting/system_only/default_mic; None = dictation
+        self.fast_live_chunks = False  # Live Assistance session: short pieces (see _record_loop)
         self._loopback_peak = 0.0     # loudest loopback sample this session (0 = no system audio)
 
     @staticmethod
@@ -987,6 +1006,7 @@ class AudioRecorder:
         with self._chunk_lock:
             self._chunk_frames     = []
             self._chunk_results    = {}
+            self.partial_text      = ""
             self._chunk_idx        = 0
             self._samples_in_chunk = 0
             self._chunk_errors     = []
@@ -1167,6 +1187,14 @@ class AudioRecorder:
         # hallucination-prone silence to Whisper.
         meeting_cadence = self._capture_mode is not None
         MEETING_CHUNK_SEC = 10.0
+        if self.fast_live_chunks and meeting_cadence:   # meetings only, never dictation
+            # Live Assistance: answers can only be as live as the transcript, so
+            # cut short pieces - at a brief pause or every 5 s. The meeting's
+            # final transcript is re-done over the full recording afterwards,
+            # so the shorter context costs the notes nothing.
+            MEETING_CHUNK_SEC = 5.0
+            silence_trigger_sec = min(silence_trigger_sec, 0.6)
+            min_speech_sec = min(min_speech_sec, 1.0)
         buffered_sec = 0.0
         chunk_peak = 0.0
 
@@ -1404,9 +1432,12 @@ class AudioRecorder:
             return "", "!aborted:Cancelled."
         if self._record_error:
             return "", self._record_error
+        # A failed chunk still fails this pass (callers show the error), but
+        # the tail is transcribed anyway and everything that DID transcribe is
+        # kept in partial_text - a meeting can then keep its notes.
+        self.partial_text = ""
         with self._chunk_lock:
-            if self._chunk_errors:
-                return "", self._chunk_errors[0]
+            chunk_error = self._chunk_errors[0] if self._chunk_errors else ""
 
         remaining = np.frombuffer(b"".join(self._chunk_frames), dtype=np.float32).copy()
         last_text, detected = "", ""
@@ -1433,8 +1464,9 @@ class AudioRecorder:
             else:
                 last_text, detected = self._run_local(remaining)
 
+        tail_error = ""
         if detected and (detected.startswith("!google:") or detected.startswith("!mistral:") or detected.startswith("!managed:")):
-            return "", detected
+            tail_error, last_text, detected = detected, "", ""
 
         with self._chunk_lock:
             if last_text:
@@ -1445,6 +1477,10 @@ class AudioRecorder:
                 if i in self._chunk_results and self._chunk_results[i]
             ]
             full_text = " ".join(parts)
+
+        if chunk_error or tail_error:
+            self.partial_text = full_text.strip()
+            return "", chunk_error or tail_error
 
         if detected and self.on_lang_detected:
             self.on_lang_detected(detected, LANG_NAMES.get(detected, detected.upper()))
@@ -1490,11 +1526,15 @@ class AudioRecorder:
             return []
         lang_setting = language or self._lang_setting()
         lang_arg = None if lang_setting in ("auto", "multi", "", None) else lang_setting
-        prompt = cfg.get("initial_prompt", "").strip() or None
+        # No glossary prompt on long audio: with condition_on_previous_text off
+        # it only ever reached the first 30 s window - where it could write the
+        # terms into silence or unclear speech. Instead every segment gets its
+        # near-miss spellings snapped to the terms, from start to finish.
+        terms = vocabulary.load_terms(cfg)
         try:
             with self._infer_lock:
                 segs, _info = model.transcribe(
-                    audio, language=lang_arg, initial_prompt=prompt,
+                    audio, language=lang_arg, initial_prompt=None,
                     beam_size=4,
                     # Anti-hallucination (meeting re-transcription): VAD + restored
                     # confidence/no-speech thresholds + no carry-over context, so
@@ -1514,7 +1554,7 @@ class AudioRecorder:
                         return None
                     if s.text.strip():
                         out.append({"start": float(s.start), "end": float(s.end),
-                                    "text": s.text.strip()})
+                                    "text": vocabulary.correct_spellings(s.text.strip(), terms)})
                     if on_progress is not None:
                         try:
                             on_progress(min(float(s.end), total), total)
@@ -1598,22 +1638,39 @@ class AudioRecorder:
             # push-to-talk dictation, where the user is deliberately speaking and
             # VAD could clip a short utterance.
             is_meeting = getattr(self, "_capture_mode", None) is not None
-            segs, info = model.transcribe(
-                audio,
-                language=lang_arg,
-                initial_prompt=prompt,
-                beam_size=4,
-                vad_filter=is_meeting,
-                vad_parameters=dict(min_silence_duration_ms=500),
-                condition_on_previous_text=False,
-                compression_ratio_threshold=2.4,
-                log_prob_threshold=-1.0,
-                no_speech_threshold=0.6,
-                repetition_penalty=1.3,
-                no_repeat_ngram_size=5,
-                temperature=[0.0, 0.2, 0.4, 0.6, 0.8],
-            )
-            text = " ".join(s.text for s in segs)
+
+            def _decode(initial_prompt):
+                segs, _info = model.transcribe(
+                    audio,
+                    language=lang_arg,
+                    initial_prompt=initial_prompt,
+                    beam_size=4,
+                    vad_filter=is_meeting,
+                    vad_parameters=dict(min_silence_duration_ms=500),
+                    condition_on_previous_text=False,
+                    compression_ratio_threshold=2.4,
+                    log_prob_threshold=-1.0,
+                    no_speech_threshold=0.6,
+                    repetition_penalty=1.3,
+                    no_repeat_ngram_size=5,
+                    temperature=[0.0, 0.2, 0.4, 0.6, 0.8],
+                )
+                return " ".join(s.text for s in segs)
+
+            text = _decode(prompt)
+            # Vocabulary evidence check: on short or unclear audio the glossary
+            # prompt makes Whisper WRITE the terms in. When a term shows up,
+            # decode again without the prompt; if that shows no trace of the
+            # term, the prompt invented it - use the honest decode (with
+            # near-miss spellings snapped to the terms). Costs a second pass
+            # only for pieces that contain a term.
+            terms = vocabulary.load_terms(cfg)
+            if prompt and terms and vocabulary.evidence_trigger(text, terms):
+                plain = _decode(None)
+                invented = vocabulary.unsupported_terms(text, plain, terms)
+                if invented:
+                    logger.info("[vocab] glossary insertion dropped (%d term(s))", len(invented))
+                    text = vocabulary.correct_spellings(plain, terms)
         return text, lang_arg
 
     def _run_google(self, audio):
@@ -1689,7 +1746,10 @@ class AudioRecorder:
             except Exception:
                 token = None
             if not token:
-                return "", "!managed:Sign in to use managed cloud transcription."
+                # Offline (the access token can't be refreshed) or signed out:
+                # the local model keeps the dictation instead of losing it.
+                return self._fallback_to_local_or_error(
+                    audio, "managed", "Pro cloud unavailable - sign in or check your connection.")
 
             wav_bytes = self._float_to_wav(audio)  # full WAV; the proxy sends it to Gemini
             b64_data = base64.b64encode(wav_bytes).decode("utf-8")
@@ -1715,8 +1775,6 @@ class AudioRecorder:
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=30,
             )
-            if resp.status_code == 403:
-                return "", "!managed:Pro required for managed cloud transcription."
             if resp.status_code == 429:
                 # Monthly cloud allowance used up - transparently fall back to the
                 # local model so the user keeps working. Flag it so the UI can
@@ -1856,6 +1914,8 @@ class AppController(QObject):
     sig_escape = Signal()
     sig_update_available = Signal(str)  # tag of newer version
     sig_auth_changed = Signal()         # auth/entitlement state changed (from worker threads)
+    sig_ipc_action = Signal(str)        # a second launch handed us an action (socket thread)
+    sig_quit = Signal()                 # quit from a worker thread (after launching the installer)
 
     def __init__(self, qapp):
         super().__init__()
@@ -1908,6 +1968,9 @@ class AppController(QObject):
         self.auth = auth.AuthManager(on_state_changed=self.sig_auth_changed.emit)
         # Let the recorder fetch a fresh access token for managed cloud transcription.
         self.recorder.get_auth_token = lambda: self.auth.get_access_token()
+        # Every analytics event carries the account tier (never the account).
+        telemetry.set_context_provider(self._analytics_context)
+        self._tracked_settings = self._settings_snapshot()
 
         # Initialize UI Dialog Windows (modularly split!)
         from ui.overlay import Overlay
@@ -1936,6 +1999,8 @@ class AppController(QObject):
         self.sig_escape.connect(self._on_escape, Qt.QueuedConnection)
         self.sig_update_available.connect(self._prompt_update, Qt.QueuedConnection)
         self.sig_auth_changed.connect(self._on_auth_changed, Qt.QueuedConnection)
+        # A QTimer started on a plain thread never fires: the updater hops here.
+        self.sig_quit.connect(self.qapp.quit, Qt.QueuedConnection)
         self._update_prompt_open = False
 
         # Register the configured hotkey (keyboard combo or mouse button).
@@ -1945,21 +2010,10 @@ class AppController(QObject):
         self._setup_tray()
 
         # Restore any saved login + Pro entitlement in the background.
-        threading.Thread(target=self.auth.load_session, daemon=True).start()
+        threading.Thread(target=self._restore_session, daemon=True).start()
 
         # Check updates in background
         threading.Thread(target=self._background_check_updates, daemon=True).start()
-        
-        telemetry.track(
-            "app_started",
-            {
-                "privacy_mode": self.cfg.get("privacy_mode", False),
-                "backend": self.cfg.get("backend", "local"),
-                "output_action": self.cfg.get("output_action", "transcribe_only"),
-            },
-            self.cfg,
-            APP_VERSION,
-        )
 
         # Onboarding wizard trigger on first launch. Existing users (already
         # onboarded before accounts existed) get a one-time account gate instead,
@@ -1978,6 +2032,10 @@ class AppController(QObject):
         # immediately - don't wait for the network check to confirm. (The
         # background check still runs and will clear the flag if no update.)
         cached_pending = self.cfg.get("pending_update_version", "")
+        if cached_pending and not self._is_newer(cached_pending):
+            # Declined the popup, then installed that version another way.
+            self.cfg["pending_update_version"] = cached_pending = ""
+            self.save_config()
         if cached_pending and self.cfg.get("onboarding_done", False):
             QTimer.singleShot(1500, lambda: self.sig_update_available.emit(cached_pending))
 
@@ -2045,11 +2103,17 @@ class AppController(QObject):
         action_rec_meet.triggered.connect(self.show_meeting)
         menu.addAction(action_rec_meet)
 
+        # Audio file -> Word document. Free and Pro alike (the tab applies the
+        # per-plan length limits), so no Pro badge here.
+        action_files = QAction("Transcribe Files...", self)
+        action_files.triggered.connect(self.show_file_transcribe)
+        menu.addAction(action_files)
+
         # Label shows the hotkey only if it actually registered (it is skipped
         # when it collides with the dictation hotkey).
         assist_key = self._registered_assist_hotkey or ""
         action_assist = QAction(
-            "Live Prompter overlay" + (f"   ({assist_key})" if assist_key else ""), self)
+            "Live Assistance overlay" + (f"   ({assist_key})" if assist_key else ""), self)
         action_assist.triggered.connect(self.toggle_live_assist)
         menu.addAction(action_assist)
 
@@ -2093,12 +2157,80 @@ class AppController(QObject):
         except Exception:
             return entitlements.TIER_GUEST
 
+    # ── Usage analytics ──────────────────────────────────────────────────────
+    # Settings whose changes are reported. Their values are engines, models,
+    # languages and switches - never keys, paths or text.
+    _TRACKED_SETTINGS = (
+        "backend", "whisper_model", "action_model", "output_action", "language",
+        "translate_target", "meeting_audio_mode", "save_history",
+        "cleanup_enabled", "restore_clipboard",
+    )
+
+    def track(self, event, props=None):
+        """Record an anonymous usage event (a no-op when analytics is off)."""
+        telemetry.track(event, props, self.cfg, APP_VERSION)
+
+    def _analytics_context(self):
+        # The REAL server entitlement, not the admin force-tier preview, and
+        # "admin" for the founder so their own usage can be filtered out.
+        a = getattr(self, "auth", None)
+        if a is None:
+            return {}
+        if getattr(a, "is_admin", False):
+            tier = "admin"
+        elif getattr(a, "is_pro", False):
+            tier = "pro"
+        elif getattr(a, "is_authenticated", False):
+            # Signed in, but the server hasn't said Pro or not yet (the first
+            # second after launch): don't guess "free".
+            tier = "free" if getattr(a, "entitlement_known", True) else "unknown"
+        else:
+            tier = "guest"
+        return {"tier": tier}
+
+    def _restore_session(self):
+        """Restore the saved login, then report the start - afterwards, so the
+        event carries the user's real tier rather than 'guest'."""
+        try:
+            self.auth.load_session()
+        except Exception:
+            logger.debug("session restore failed", exc_info=True)
+        self.track("app_started", {
+            "privacy_mode": self.cfg.get("privacy_mode", False),
+            "backend": self.cfg.get("backend", "local"),
+            "output_action": self.cfg.get("output_action", "transcribe_only"),
+        })
+
+    def _settings_snapshot(self):
+        return {k: self.cfg.get(k) for k in self._TRACKED_SETTINGS}
+
+    def _track_setting_changes(self):
+        prev = getattr(self, "_tracked_settings", None)
+        now = self._settings_snapshot()
+        self._tracked_settings = now
+        if prev is None:
+            return
+        changed = [k for k in self._TRACKED_SETTINGS if now[k] != prev.get(k)]
+        if not changed:
+            return
+        if "backend" in changed:
+            self.track("backend_selected", {"backend": now["backend"]})
+        props = {"changed": ",".join(changed)}
+        props.update({k: now[k] for k in changed})
+        self.track("settings_saved", props)
+
     def _user_secret_id(self):
         return entitlements.user_secret_id(getattr(self, "auth", None))
 
     def _reconcile_user_secrets(self):
         """Keep BYO API keys + cloud-engine config scoped per user. Returns True if
         the active keys were swapped for a different user (so callers refresh UI)."""
+        a = getattr(self, "auth", None)
+        if a is not None and a.is_authenticated and not getattr(a, "user_id", None):
+            # Signed in but offline at launch: the account isn't known yet, and
+            # swapping to the guest bucket would hide this user's keys and Pro
+            # engine for the whole session. Wait for the session to load.
+            return False
         current = self._user_secret_id()
         if self.cfg.get("secrets_owner") == current:
             return False  # same user (or same guest session) - nothing to do
@@ -2133,6 +2265,51 @@ class AppController(QObject):
         self.save_config()
         self.sig_auth_changed.emit()
 
+    def _track_pro_activation(self, now_pro, known):
+        """Fire pro_activated once, when an account last seen as free is now Pro.
+
+        The last real answer is kept per account in config, so the upgrade
+        counts whether it shows up mid-session (the checkout watcher) or on the
+        next launch. An account never seen before is recorded silently -
+        otherwise every existing Pro user would "activate" on every launch."""
+        uid = getattr(self.auth, "user_id", None)
+        if not (known and uid):
+            return
+        seen = self.cfg.get("last_known_pro")
+        if not isinstance(seen, dict):
+            seen = {}
+        prev = seen.get(uid)
+        if now_pro and prev is False:
+            self.track("pro_activated", {"plan": getattr(self.auth, "plan", "") or ""})
+        if prev is not now_pro:
+            seen[uid] = now_pro
+            self.cfg["last_known_pro"] = seen
+            self.save_config()
+
+    def watch_for_upgrade(self, minutes=10, every=30):
+        """After the Stripe checkout opens, re-check the entitlement for a while
+        so a purchase unlocks Pro (and is counted) without restarting the app."""
+        if getattr(self, "_upgrade_watch", None) is not None:
+            return
+        stop = threading.Event()
+        self._upgrade_watch = stop
+
+        def _loop():
+            try:
+                deadline = time.monotonic() + minutes * 60
+                while time.monotonic() < deadline and not stop.wait(every):
+                    if not self.auth.is_authenticated:
+                        return
+                    self.auth.refresh_entitlement()
+                    if getattr(self.auth, "is_pro", False):
+                        return
+            except Exception:
+                logger.debug("upgrade watch failed", exc_info=True)
+            finally:
+                self._upgrade_watch = None
+
+        threading.Thread(target=_loop, name="upgrade-watch", daemon=True).start()
+
     def _on_auth_changed(self):
         # Runs on the GUI thread (QueuedConnection). Refresh tray + any open UI.
         # First: swap in/out the per-user API keys if the signed-in user changed,
@@ -2147,15 +2324,15 @@ class AppController(QObject):
         # admin force-tier preview) so toggling the preview never fires the
         # activation funnel or wipes the managed-engine choice during a preview.
         now_pro = bool(getattr(self.auth, "is_pro", False))
-        if now_pro and not getattr(self, "_was_pro", False):
-            try:
-                telemetry.track("pro_activated", {"plan": getattr(self.auth, "plan", "") or ""}, self.cfg, APP_VERSION)
-            except Exception:
-                pass
-        self._was_pro = now_pro
+        known = bool(getattr(self.auth, "entitlement_known", False))
+        self._track_pro_activation(now_pro, known)
         # If Pro lapsed while a keyless managed engine/backend was selected, fall
         # back to local so the UI and behavior stay consistent (managed = Pro).
-        if not now_pro:
+        # Only on a real server answer: offline or while Supabase is slow the
+        # entitlement is merely unknown, and wiping the choice then lost a Pro
+        # user's engine for good (the managed path already falls back per
+        # request when the server says no).
+        if not now_pro and known:
             _changed = False
             if self.cfg.get("backend") == "managed":
                 self.cfg["backend"] = "local"
@@ -2164,6 +2341,9 @@ class AppController(QObject):
                 self.cfg["action_model"] = actions.RULE_BASED_ID
                 _changed = True
             if _changed:
+                # An automatic fallback, not a user choice: keep it out of the
+                # backend_selected / settings_saved analytics.
+                self._tracked_settings = self._settings_snapshot()
                 self.save_config()
         # Remember the signed-in email so the sign-in form can prefill it next time
         # (convenience only - the real session is restored from the encrypted
@@ -2194,14 +2374,23 @@ class AppController(QObject):
 
     def start_google_login(self):
         def _run():
+            ok = False
             try:
-                self.auth.sign_in_with_google()
+                ok = self.auth.sign_in_with_google()
             except Exception:
                 logger.debug("google login failed", exc_info=True)
+            if ok:
+                self.track("login_succeeded", {"method": "google"})
+            else:
+                self.track("login_failed", {
+                    "method": "google",
+                    "reason": getattr(self.auth, "last_error", "") or "unknown",
+                })
         threading.Thread(target=_run, daemon=True).start()
         self.show_tray_hint("Sign in", "Opening your browser to sign in with Google…")
 
     def sign_out(self):
+        self.track("signed_out")
         threading.Thread(target=self.auth.sign_out, daemon=True).start()
 
     def open_billing(self):
@@ -2225,6 +2414,7 @@ class AppController(QObject):
         if on:
             self.cfg["backend"] = "local"   # privacy = on-device only
         self.save_config()
+        self.track("privacy_mode_enabled" if on else "privacy_mode_disabled")
         if notify:
             self.show_tray_hint(
                 "Privacy Mode ON" if on else "Privacy Mode OFF",
@@ -2344,7 +2534,9 @@ class AppController(QObject):
                 tag = data.get("tag_name", "")
 
                 from main import _parse_version
-                if tag and _parse_version(tag) > _parse_version(APP_VERSION):
+                available = bool(tag and _parse_version(tag) > _parse_version(APP_VERSION))
+                self.track("update_check_result", {"manual": False, "available": available})
+                if available:
                     self.cfg["pending_update_version"] = tag
                     self.save_config()
                     # Emit signal - handled on main thread via QueuedConnection.
@@ -2353,8 +2545,11 @@ class AppController(QObject):
                     if self.cfg.get("pending_update_version"):
                         self.cfg["pending_update_version"] = ""
                         self.save_config()
+            else:
+                self.track("update_check_result", {"manual": False, "failed": True})
         except Exception as e:
             logger.debug("Background update check failed: %s", e)
+            self.track("update_check_result", {"manual": False, "failed": True})
 
     def _prompt_update(self, tag):
         # Runs on Qt main thread. Pops up a modal asking the user to install
@@ -2363,6 +2558,11 @@ class AppController(QObject):
         if self._update_prompt_open:
             return
         if not tag:
+            return
+        if not self._is_newer(tag):
+            if self.cfg.get("pending_update_version") == tag:
+                self.cfg["pending_update_version"] = ""
+                self.save_config()
             return
         # Skip if user is mid-recording - don't interrupt them.
         if self.is_rec:
@@ -2377,12 +2577,18 @@ class AppController(QObject):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
             )
             if reply == QMessageBox.Yes:
+                self.track("update_install_started", {"manual": False, "to": tag})
                 threading.Thread(
                     target=self._download_and_install_update,
                     args=(tag,), daemon=True,
                 ).start()
         finally:
             self._update_prompt_open = False
+
+    @staticmethod
+    def _is_newer(tag):
+        """True when release ``tag`` is newer than the running version."""
+        return _parse_version(tag) > _parse_version(APP_VERSION)
 
     def _download_and_install_update(self, tag):
         # Background-thread installer fetch. Identical to the Settings → About
@@ -2402,11 +2608,14 @@ class AppController(QObject):
             os.startfile(dest_path)
             self.cfg["pending_update_version"] = ""
             self.save_config()
+            # Queued on disk, so it's delivered by the next run if not now.
+            self.track("update_install_result", {"manual": False, "ok": True})
             # Give the installer a moment to launch before we exit.
             time.sleep(1.5)
-            QTimer.singleShot(0, self.qapp.quit)
+            self.sig_quit.emit()
         except Exception as e:
             logger.warning("Update download failed: %s", e)
+            self.track("update_install_result", {"manual": False, "ok": False})
 
     # ── Modular Window Surface Triggers (Main thread-safe wrappers) ──
     @staticmethod
@@ -2422,10 +2631,19 @@ class AppController(QObject):
 
     def show_settings(self):
         self._bring_to_front(self.settings_win)
+        self.track("settings_opened")
+
+    def show_file_transcribe(self):
+        """Settings, opened on the Transcribe Files tab (the tray shortcut)."""
+        tab = getattr(self.settings_win, "file_tab", None)
+        if tab is not None:
+            self.settings_win.tabs.setCurrentWidget(tab)
+        self.show_settings()
 
     def show_history(self):
         self.history_win.refresh_list()
         self._bring_to_front(self.history_win)
+        self.track("history_opened")
 
     def show_meeting(self):
         # Meeting recording + AI notes are Pro-only.
@@ -2536,6 +2754,7 @@ class AppController(QObject):
 
     def save_config(self):
         save_config(self.cfg)
+        self._track_setting_changes()
         self.update_tray_icon()
         
         # Propagate color settings to window panels
@@ -2610,7 +2829,7 @@ class AppController(QObject):
         return True
 
     def _setup_assist_hotkey(self, hotkey):
-        """Second global hotkey: toggles the Live Assist overlay. Kept apart
+        """Second global hotkey: toggles the Live Assistance overlay. Kept apart
         from the dictation hotkey's bookkeeping so re-registering one never
         tears down the other."""
         if self._registered_assist_hotkey is not None:
@@ -2646,14 +2865,14 @@ class AppController(QObject):
                 listener.daemon = True
                 listener.start()
                 self._assist_listener = listener
-            logger.info("Registered Live Assist hotkey: %s", hotkey)
+            logger.info("Registered Live Assistance hotkey: %s", hotkey)
             return True
         except Exception as e:
-            logger.warning("Could not register Live Assist hotkey %s: %s", hotkey, e)
+            logger.warning("Could not register Live Assistance hotkey %s: %s", hotkey, e)
             return False
 
     def toggle_live_assist(self):
-        """Show/hide the private Live Assist overlay (tray item + hotkey)."""
+        """Show/hide the private Live Assistance overlay (tray item + hotkey)."""
         try:
             if self.live_assist is None:
                 from ui.live_assist import LiveAssistOverlay
@@ -2667,12 +2886,13 @@ class AppController(QObject):
                         self.live_assist.set_meeting_active(
                             True, getattr(mw, "_meeting_title", ""),
                             getattr(mw, "_meeting_attendees", ""))
-                        self.live_assist.feed_transcript(getattr(mw, "_live_text", ""))
+                        self.live_assist.feed_transcript(getattr(mw, "_live_text", ""),
+                                                         answer=False)
                         self.live_assist.set_summary(getattr(mw, "_live_summary_text", ""))
             self.live_assist.toggle()
         except Exception as e:
-            logger.warning("Live Prompter failed: %s", e, exc_info=True)
-            self.show_tray_hint("Live Prompter", f"Couldn't open the overlay: {e}")
+            logger.warning("Live Assistance failed: %s", e, exc_info=True)
+            self.show_tray_hint("Live Assistance", f"Couldn't open the overlay: {e}")
 
     def _unregister_kbd_hotkey(self):
         if self._registered_kbd_hotkey is not None:
@@ -3397,7 +3617,9 @@ def main():
     lock_sock = acquire_single_instance_lock()
     if not lock_sock:
         # Another instance is running, wake it and exit
-        signal_running_instance("show_settings")
+        action = launch_action(sys.argv)
+        if action:
+            signal_running_instance(action)
         sys.exit(0)
 
     # 2. Standard Qt Setup
@@ -3432,8 +3654,11 @@ def main():
             controller.show_meeting()
         else:
             controller.show_settings()
-    start_ipc_server(lock_sock, lambda action: QTimer.singleShot(
-        0, lambda a=action: _ipc_dispatch(a)))
+    # The listener runs on a plain thread with no Qt event loop, so a QTimer
+    # started there never fired and a second launch did nothing: hop to the GUI
+    # thread through a queued signal instead.
+    controller.sig_ipc_action.connect(_ipc_dispatch, Qt.QueuedConnection)
+    start_ipc_server(lock_sock, controller.sig_ipc_action.emit)
 
     # The Settings panel IS the app - show it on every launch. The only quiet
     # launch is the Windows-startup shortcut (--background), and the first run

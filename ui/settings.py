@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QTabWidget, QWidget, QLineEdit, QTextEdit, QFrame, QScrollArea,
     QMessageBox, QGridLayout, QProgressBar, QStackedWidget, QRadioButton,
     QButtonGroup, QSizePolicy, QStyledItemDelegate, QStyle,
-    QTableWidget, QTableWidgetItem,
+    QTableWidget, QTableWidgetItem, QFileDialog,
 )
 from PySide6.QtGui import QFont, QColor, QIcon
 import local_llm
@@ -101,6 +101,7 @@ class Settings(QDialog):
     feedback_finished = Signal(bool, str)
     account_delete_finished = Signal(bool, str)
     specs_ready = Signal(str)  # GPU name detected on a worker thread
+    update_install_finished = Signal(bool, str)  # installer launched / download error
 
     def __init__(self, parent=None, main_app=None):
         super().__init__(parent)
@@ -148,6 +149,7 @@ class Settings(QDialog):
         self.feedback_finished.connect(self._on_feedback_finished)
         self.account_delete_finished.connect(self._on_account_delete_finished)
         self.specs_ready.connect(self._on_specs_ready)
+        self.update_install_finished.connect(self._on_update_install_finished)
         
         # Whisper model card controls references
         self.whisper_cards = {}
@@ -182,6 +184,23 @@ class Settings(QDialog):
     # while the header still showed PRO, re-locking Pro features behind the
     # paywall.
     _LIVE_APP_KEYS = ("admin_tier_override",)
+
+    # Keys the app changes in the background while this window is open - the
+    # signed-in account's key bucket, sign-in history, Pro history, the update
+    # flag. The window may READ them from its snapshot, but must never write a
+    # stale copy back: that lost or leaked BYO keys across a sign-out/in, and
+    # re-counted a Pro activation.
+    _BACKGROUND_KEYS = frozenset((
+        "secrets_owner", "user_secrets", "last_known_pro", "known_emails",
+        "last_signin_email", "pending_update_version", "account_gate_seen",
+        "onboarding_done",
+    ))
+
+    def _staged_settings(self):
+        """What Save commits to app.cfg: this window's own settings only.
+        Live Assistance keys are written by the overlay itself."""
+        return {k: v for k, v in self.cfg_working.items()
+                if not k.startswith("live_assist_") and k not in self._BACKGROUND_KEYS}
 
     def _snapshot_cfg(self):
         import copy
@@ -309,14 +328,32 @@ class Settings(QDialog):
         if hasattr(self, "_dirty_timer"):
             self._dirty_timer.start()
 
+    def _tabs_fit_width(self):
+        """Window width at which the whole tab bar fits (styled tab sizes,
+        the shiny tab included) plus the window's side margins."""
+        bar = self.tabs.tabBar()
+        bar.ensurePolished()
+        m = self.layout().contentsMargins() if self.layout() else None
+        side = (m.left() + m.right()) if m else 40
+        return bar.sizeHint().width() + side + 24   # tab-pane frame + a little air
+
     def _fit_on_screen(self):
         from ui.winfit import settle_on_screen, size_to_screen
         if not getattr(self, "_fit_positioned", False):
             # First open: ~38% of the work-area width, ~72% of its height -
             # comfortable on laptops, not a tower on big monitors.
             size_to_screen(self, 0.38, 0.72, 640, 540, 780, 880)
+            # ...but always wide enough that every tab shows in full - never
+            # squeezed behind the tab bar's scroll arrows. Also the minimum,
+            # so dragging narrower can't bring the arrows back either.
+            need = self._tabs_fit_width()
+            self.setMinimumWidth(max(self.minimumWidth(), need))
+            if self.width() < need:
+                self.resize(need, self.height())
         # settle (not just fit): re-clamp on the next tick so a first open never
         # lands with its top above the screen before the frame size is known.
+        # On a screen too narrow for every tab this also lowers the minimum,
+        # and the arrows remain the fallback.
         settle_on_screen(self)
         for name in list(self.whisper_cards.keys()):
             self._update_whisper_card_ui(name)
@@ -341,7 +378,7 @@ class Settings(QDialog):
             if hasattr(self, "mistral_key_input"):
                 mistral_key = self.mistral_key_input.text().strip()
             if not mistral_key:
-                self.tabs.setCurrentIndex(1)  # Switch to 'Models' tab
+                self.tabs.setCurrentWidget(self.models_tab)
                 if hasattr(self, "mistral_key_input"):
                     self.mistral_key_input.setFocus()
                     self.mistral_key_input.setStyleSheet("border: 2px solid #ef4444; background-color: #fef2f2;")
@@ -353,7 +390,7 @@ class Settings(QDialog):
                 )
                 return False
             if getattr(self, "_mistral_key_verified", False) is False:
-                self.tabs.setCurrentIndex(1)
+                self.tabs.setCurrentWidget(self.models_tab)
                 if hasattr(self, "mistral_key_input"):
                     self.mistral_key_input.setFocus()
                     self.mistral_key_input.setStyleSheet("border: 2px solid #ef4444; background-color: #fef2f2;")
@@ -369,7 +406,7 @@ class Settings(QDialog):
             if hasattr(self, "google_key_input"):
                 google_key = self.google_key_input.text().strip()
             if not google_key:
-                self.tabs.setCurrentIndex(1)  # Switch to 'Models' tab
+                self.tabs.setCurrentWidget(self.models_tab)
                 if hasattr(self, "google_key_input"):
                     self.google_key_input.setFocus()
                     self.google_key_input.setStyleSheet("border: 2px solid #ef4444; background-color: #fef2f2;")
@@ -381,7 +418,7 @@ class Settings(QDialog):
                 )
                 return False
             if getattr(self, "_google_key_verified", False) is False:
-                self.tabs.setCurrentIndex(1)
+                self.tabs.setCurrentWidget(self.models_tab)
                 if hasattr(self, "google_key_input"):
                     self.google_key_input.setFocus()
                     self.google_key_input.setStyleSheet("border: 2px solid #ef4444; background-color: #fef2f2;")
@@ -394,11 +431,10 @@ class Settings(QDialog):
                 return False
 
         if self.app:
-            # Keys owned by live UI (the Live Prompter overlay writes them
+            # Keys owned by live UI (the Live Assistance overlay writes them
             # straight to app.cfg while this window is open) must not be
             # reverted from this window's older snapshot on Save.
-            self.app.cfg.update({k: v for k, v in self.cfg_working.items()
-                                 if not k.startswith("live_assist_")})
+            self.app.cfg.update(self._staged_settings())
             self.app.save_config()
             self.app.apply_tray_bindings()
         # Save no longer closes the window - just confirm with a small toast.
@@ -586,7 +622,8 @@ class Settings(QDialog):
         except Exception as e:
             import logging
             logging.getLogger("transcribe").warning("File tab unavailable: %s", e)
-        self.tabs.addTab(self._create_models_tab(), "Models")
+        self.models_tab = self._create_models_tab()
+        self.tabs.addTab(self.models_tab, "Models")
         self.tabs.addTab(self._create_actions_tab(), "AI Actions")
         self.tabs.addTab(self._create_history_tab(), "History")
         
@@ -599,6 +636,7 @@ class Settings(QDialog):
         # Keep the Pro-state UI (Smart Actions counter, badges, locks) fresh
         # whenever the user switches tabs.
         self.tabs.currentChanged.connect(lambda _i: self.refresh_pro_state())
+        self.tabs.currentChanged.connect(self._track_tab_opened)
         layout.addWidget(self.tabs)
 
         # Bottom row - Save stays open + shows a small toast; Close dismisses.
@@ -682,13 +720,13 @@ class Settings(QDialog):
         hk_lay.addWidget(self.btn_hotkey)
         layout.addWidget(hotkey_frame)
 
-        # Live Prompter - the private call assistant. These controls write
+        # Live Assistance - the private call assistant. These controls write
         # straight to app.cfg and apply immediately: the overlay owns the
         # live_assist_* keys, which the Save write-back deliberately skips.
         lp_frame = QFrame(tab)
         lp_frame.setObjectName("cardFrame")
         lp_lay = QVBoxLayout(lp_frame)
-        lp_lay.addWidget(QLabel("Live Prompter  ·  private call assistant", lp_frame))
+        lp_lay.addWidget(QLabel("Live Assistance  ·  private call assistant", lp_frame))
         lp_desc = QLabel(
             "A floating glass prompter for calls: the last thing said, a running "
             "summary and instant AI suggestions - kept out of your screen share. "
@@ -697,7 +735,7 @@ class Settings(QDialog):
         lp_desc.setWordWrap(True)
         lp_lay.addWidget(lp_desc)
         lp_row = QHBoxLayout()
-        btn_lp_open = QPushButton("Open Live Prompter", lp_frame)
+        btn_lp_open = QPushButton("Open Live Assistance", lp_frame)
         btn_lp_open.setObjectName("heroButton")
         btn_lp_open.clicked.connect(lambda: self.app and self.app.toggle_live_assist())
         lp_row.addWidget(btn_lp_open)
@@ -707,7 +745,7 @@ class Settings(QDialog):
         # then press the combination you want.
         self.btn_lp_hotkey = QPushButton(self._lp_hotkey_label(), lp_frame)
         self.btn_lp_hotkey.setToolTip("Click, then press the key combination you want "
-                                      "to open/close Live Prompter.")
+                                      "to open/close Live Assistance.")
         self.btn_lp_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; "
                                          "min-width: 160px; border-color: #3b82f6;")
         self.btn_lp_hotkey.clicked.connect(self._toggle_lp_capture)
@@ -719,9 +757,9 @@ class Settings(QDialog):
             bool(self.app.cfg.get("live_assist_private", True)) if self.app else True)
         self.chk_lp_private.toggled.connect(self._apply_lp_private)
         lp_lay.addWidget(self.chk_lp_private)
-        self.chk_lp_auto = QCheckBox("Auto-refresh suggestions while people talk", lp_frame)
+        self.chk_lp_auto = QCheckBox("Answer automatically when someone asks a question", lp_frame)
         self.chk_lp_auto.setChecked(
-            bool(self.app.cfg.get("live_assist_auto", False)) if self.app else False)
+            bool(self.app.cfg.get("live_assist_auto_answer", True)) if self.app else True)
         self.chk_lp_auto.toggled.connect(self._apply_lp_auto)
         lp_lay.addWidget(self.chk_lp_auto)
         layout.addWidget(lp_frame)
@@ -786,7 +824,7 @@ class Settings(QDialog):
         self.chk_cleanup.stateChanged.connect(self._save_general_configs)
         fix_lay.addWidget(self.chk_cleanup)
 
-        self.chk_fillers = QCheckBox("Also remove filler words (um, uh, you know)", fix_frame)
+        self.chk_fillers = QCheckBox("Remove filler words (um, uh, you know)", fix_frame)
         self.chk_fillers.setChecked(bool(self.cfg_working.get("cleanup_remove_fillers", False)))
         self.chk_fillers.setToolTip("Off by default - this edits your actual words.")
         self.chk_fillers.stateChanged.connect(self._save_general_configs)
@@ -1000,11 +1038,10 @@ class Settings(QDialog):
             return
         self._save_general_configs()
         if self.app:
-            # Keys owned by live UI (the Live Prompter overlay writes them
+            # Keys owned by live UI (the Live Assistance overlay writes them
             # straight to app.cfg while this window is open) must not be
             # reverted from this window's older snapshot on Save.
-            self.app.cfg.update({k: v for k, v in self.cfg_working.items()
-                                 if not k.startswith("live_assist_")})
+            self.app.cfg.update(self._staged_settings())
             self.app.save_config()
             self.app.apply_tray_bindings()
             # Settings stays open behind the meeting window - closing it here
@@ -1030,6 +1067,24 @@ class Settings(QDialog):
             return gap.join(parts)
         except Exception:
             return "System information unavailable."
+
+    def _on_update_install_finished(self, ok, err):
+        if self.app:
+            self.app.track("update_install_result", {"manual": True, "ok": bool(ok)})
+        if ok:
+            if self.app:
+                self.app.cfg["pending_update_version"] = ""
+                self.app.save_config()
+                self.app.qapp.quit()
+            return
+        from main import PROJECT_GITHUB_URL
+        self.btn_update.setText("Check for Updates")
+        self.btn_update.setEnabled(True)
+        QMessageBox.critical(
+            self, "Update Error",
+            f"Failed to download the update automatically:\n{err}\n\n"
+            f"Please update manually from:\n{PROJECT_GITHUB_URL}/releases"
+        )
 
     def _on_specs_ready(self, gpu):
         if hasattr(self, "_specs_label"):
@@ -1175,9 +1230,9 @@ class Settings(QDialog):
         scroll_lay.addWidget(section_mistral)
 
         mistral_notice = QLabel(
-            "Cloud transcription. Pro: no key needed. Free: add your Mistral key below.  "
-            "Best for English and major European languages; for Armenian, use local "
-            "Whisper (Recommended) or Gemini.")
+            "Cloud transcription. Pro: no key needed. Free: add your Mistral API key in "
+            "the model card.  Best for English and major European languages; for "
+            "Armenian, use local Whisper (Recommended) or Gemini.")
         mistral_notice.setWordWrap(True)
         mistral_notice.setObjectName("subtitleLabel")
         mistral_notice.setStyleSheet("margin-bottom: 8px;")
@@ -1195,8 +1250,10 @@ class Settings(QDialog):
             },
         }
         
-        for name, info in self.mistral_model_catalog.items():
-            card = self._build_mistral_card(name, info)
+        for i, (name, info) in enumerate(self.mistral_model_catalog.items()):
+            # One Mistral key serves every Voxtral model: its field lives in
+            # the first card.
+            card = self._build_mistral_card(name, info, with_key=(i == 0))
             self.mistral_cards[name] = card
             scroll_lay.addWidget(card)
             self._update_mistral_card_ui(name)
@@ -1211,89 +1268,72 @@ class Settings(QDialog):
             "name": "Google Gemini Speech",
             "badge": "AI Studio key",
             "specs": "Fast cloud transcription  ·  120+ languages",
-            "description": "Uses your free Google AI Studio (Gemini) API key. Paste it in Cloud API Credentials below."
+            "description": "Uses your free Google AI Studio (Gemini) API key."
         }
         self.google_card = self._build_google_card(google_info)
         scroll_lay.addWidget(self.google_card)
         self._update_google_card_ui()
-        
-        # Section 4: Cloud API Key Credentials
-        section_keys = QLabel("Cloud API Credentials")
-        section_keys.setFont(QFont("Segoe UI", 12, QFont.Bold))
-        section_keys.setStyleSheet("color: #3b82f6; margin-top: 18px; margin-bottom: 2px;")
-        scroll_lay.addWidget(section_keys)
-        
-        self.keys_frame = QFrame(scroll_content)
-        self.keys_frame.setObjectName("cardFrame")
-        kf_lay = QVBoxLayout(self.keys_frame)
-        kf_lay.setContentsMargins(14, 14, 14, 14)
-        kf_lay.setSpacing(10)
-        
-        kf_lay.addWidget(QLabel("Mistral API Key", self.keys_frame))
-        self.mistral_key_input = QLineEdit(self.keys_frame)
-        self.mistral_key_input.setPlaceholderText("mistral-key...")
-        self.mistral_key_input.setEchoMode(QLineEdit.Password)
-        self.mistral_key_input.setText(self.cfg_working.get("mistral_api_key", ""))
-        self.mistral_key_input.textChanged.connect(self._save_general_configs)
-        kf_lay.addWidget(self.mistral_key_input)
-        
-        m_test_lay = QHBoxLayout()
-        self.btn_test_mistral = QPushButton("Test", self.keys_frame)
-        self.btn_test_mistral.setObjectName("secondaryButton")
-        self.btn_test_mistral.setStyleSheet("padding: 4px 10px; font-size: 11px;")
-        self.btn_test_mistral.clicked.connect(self._test_mistral_key)
-        self.lbl_status_mistral = QLabel("Not Tested", self.keys_frame)
-        self.lbl_status_mistral.setWordWrap(True)
-        self.lbl_status_mistral.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self.lbl_status_mistral.setStyleSheet("color: #64748b; font-size: 11px;")
-        _m_copy, _m_save = self._make_key_tool_buttons(
-            self.keys_frame, self.mistral_key_input, self.lbl_status_mistral,
-            lambda: self._save_single_key("mistral_api_key", self.mistral_key_input, self.lbl_status_mistral))
-        m_test_lay.addWidget(_m_copy)
-        m_test_lay.addWidget(self.btn_test_mistral)
-        m_test_lay.addWidget(_m_save)
-        m_test_lay.addWidget(self.lbl_status_mistral)
-        kf_lay.addLayout(m_test_lay)
-        
-        kf_lay.addWidget(QLabel("Google AI Studio (Gemini) API Key", self.keys_frame))
-        google_hint = QLabel(
-            "Get a free key at aistudio.google.com/apikey (this is a Gemini key, "
-            "not a Google Cloud Speech key).", self.keys_frame)
-        google_hint.setObjectName("subtitleLabel")
-        google_hint.setWordWrap(True)
-        kf_lay.addWidget(google_hint)
-        self.google_key_input = QLineEdit(self.keys_frame)
-        self.google_key_input.setPlaceholderText("AIzaSy...")
-        self.google_key_input.setEchoMode(QLineEdit.Password)
-        self.google_key_input.setText(self.cfg_working.get("google_api_key", ""))
-        self.google_key_input.textChanged.connect(self._save_general_configs)
-        kf_lay.addWidget(self.google_key_input)
 
-        g_test_lay = QHBoxLayout()
-        self.btn_test_google = QPushButton("Test", self.keys_frame)
-        self.btn_test_google.setObjectName("secondaryButton")
-        self.btn_test_google.setStyleSheet("padding: 4px 10px; font-size: 11px;")
-        self.btn_test_google.clicked.connect(self._test_google_key)
-        self.lbl_status_google = QLabel("Not Tested", self.keys_frame)
-        self.lbl_status_google.setWordWrap(True)
-        self.lbl_status_google.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self.lbl_status_google.setStyleSheet("color: #64748b; font-size: 11px;")
-        _g_copy, _g_save = self._make_key_tool_buttons(
-            self.keys_frame, self.google_key_input, self.lbl_status_google,
-            lambda: self._save_single_key("google_api_key", self.google_key_input, self.lbl_status_google))
-        g_test_lay.addWidget(_g_copy)
-        g_test_lay.addWidget(self.btn_test_google)
-        g_test_lay.addWidget(_g_save)
-        g_test_lay.addWidget(self.lbl_status_google)
-        kf_lay.addLayout(g_test_lay)
-        
-        scroll_lay.addWidget(self.keys_frame)
-            
         scroll.setWidget(scroll_content)
         layout.addWidget(scroll)
         return tab
 
-    def _build_mistral_card(self, name, info):
+    def _build_card_key_box(self, card, provider):
+        """The provider's API-key controls, shown inside its model card: the key
+        field (with the eye toggle), Copy · Test · Save and a status line.
+        Returns (box, field, test_button, status_label)."""
+        if provider == "mistral":
+            title, cfg_key, placeholder = "Mistral API key", "mistral_api_key", "mistral-key..."
+            hint, on_test = None, self._test_mistral_key
+        else:
+            title, cfg_key, placeholder = ("Google AI Studio (Gemini) API key",
+                                           "google_api_key", "AIzaSy...")
+            hint = ("Get a free key at aistudio.google.com/apikey (a Gemini key, "
+                    "not a Google Cloud Speech key).")
+            on_test = self._test_google_key
+
+        box = QWidget(card)
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 6, 0, 0)
+        lay.setSpacing(6)
+        card.key_title = title
+        card.lbl_key = QLabel(title, box)
+        card.lbl_key.setStyleSheet("font-weight: 600;")
+        lay.addWidget(card.lbl_key)
+        if hint:
+            lbl_hint = QLabel(hint, box)
+            lbl_hint.setObjectName("subtitleLabel")
+            lbl_hint.setWordWrap(True)
+            lay.addWidget(lbl_hint)
+
+        field = QLineEdit(box)
+        field.setPlaceholderText(placeholder)
+        field.setEchoMode(QLineEdit.Password)
+        field.setText(self.cfg_working.get(cfg_key, ""))
+        field.textChanged.connect(self._save_general_configs)
+        lay.addWidget(field)
+
+        row = QHBoxLayout()
+        btn_test = QPushButton("Test", box)
+        btn_test.setObjectName("secondaryButton")
+        btn_test.setStyleSheet("padding: 4px 10px; font-size: 11px;")
+        btn_test.clicked.connect(on_test)
+        status = QLabel("Not Tested", box)
+        status.setWordWrap(True)
+        status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        status.setStyleSheet("color: #64748b; font-size: 11px;")
+        btn_copy, btn_save = self._make_key_tool_buttons(
+            box, field, status, lambda: self._save_single_key(cfg_key, field, status))
+        row.addWidget(btn_copy)
+        row.addWidget(btn_test)
+        row.addWidget(btn_save)
+        row.addWidget(status)
+        lay.addLayout(row)
+
+        card.key_box = box
+        return box, field, btn_test, status
+
+    def _build_mistral_card(self, name, info, with_key=False):
         card = QFrame()
         card.setObjectName("cardFrame")
         card_lay = QVBoxLayout(card)
@@ -1331,10 +1371,15 @@ class Settings(QDialog):
         lbl_desc.setObjectName("subtitleLabel")
         card_lay.addWidget(lbl_desc)
 
+        if with_key:
+            (box, self.mistral_key_input, self.btn_test_mistral,
+             self.lbl_status_mistral) = self._build_card_key_box(card, "mistral")
+            card_lay.addWidget(box)
+
         # Action Buttons
         btn_lay = QHBoxLayout()
         btn_lay.addStretch()
-        
+
         btn_action = QPushButton("Use Model", card)
         btn_action.clicked.connect(lambda: self._use_mistral(name))
         card.btn_action = btn_action
@@ -1349,8 +1394,8 @@ class Settings(QDialog):
         box = QMessageBox(self)
         box.setWindowTitle("Cloud transcription")
         box.setText(
-            f"To use {provider_name} cloud transcription, add your API key below in "
-            f"Cloud API Credentials.\n\nOr upgrade to Pro to use it with no key - we "
+            f"To use {provider_name} cloud transcription, add your API key in its "
+            f"model card.\n\nOr upgrade to Pro to use it with no key - we "
             f"handle the cloud for you.")
         up = box.addButton("Upgrade to Pro", QMessageBox.AcceptRole)
         addk = box.addButton("Add my key", QMessageBox.RejectRole)
@@ -1409,6 +1454,9 @@ class Settings(QDialog):
         card.setStyleSheet("")
         card.btn_action.setStyleSheet("")
         card.btn_action.setEnabled(True)
+        if hasattr(card, "key_box"):
+            card.key_box.setEnabled(True)
+            card.lbl_key.setText(card.key_title + ("  ·  optional with Pro" if pro else ""))
 
         if is_active:
             card.setObjectName("activeCardFrame")
@@ -1449,8 +1497,10 @@ class Settings(QDialog):
         """Clean, readable 'deactivated' look for a cloud STT card: pale card, muted
         state, and a clearly disabled (non-clickable) button - no dashed borders."""
         card.setObjectName("cardFrame")
-        card.setEnabled(True)  # keep the text readable; only the button is disabled
+        card.setEnabled(True)  # keep the text readable; only the controls are disabled
         card.setStyleSheet("QFrame#cardFrame { background-color: #f8fafc; border: 1px solid #e9eef5; }")
+        if hasattr(card, "key_box"):
+            card.key_box.setEnabled(False)
         if hasattr(card, "lbl_state"):
             card.lbl_state.setText(state_text)
             card.lbl_state.setStyleSheet("color: #94a3b8; font-weight: 600;")
@@ -1517,10 +1567,14 @@ class Settings(QDialog):
         lbl_desc.setObjectName("subtitleLabel")
         card_lay.addWidget(lbl_desc)
 
+        (box, self.google_key_input, self.btn_test_google,
+         self.lbl_status_google) = self._build_card_key_box(card, "google")
+        card_lay.addWidget(box)
+
         # Action Buttons
         btn_lay = QHBoxLayout()
         btn_lay.addStretch()
-        
+
         btn_action = QPushButton("Use Model", card)
         btn_action.clicked.connect(self._use_google)
         card.btn_action = btn_action
@@ -1609,11 +1663,10 @@ class Settings(QDialog):
         by provider) immediately + confirm."""
         self._save_action_configs()
         if self.app:
-            # Keys owned by live UI (the Live Prompter overlay writes them
+            # Keys owned by live UI (the Live Assistance overlay writes them
             # straight to app.cfg while this window is open) must not be
             # reverted from this window's older snapshot on Save.
-            self.app.cfg.update({k: v for k, v in self.cfg_working.items()
-                                 if not k.startswith("live_assist_")})
+            self.app.cfg.update(self._staged_settings())
             self._mark_secrets_owner()
             self.app.save_config()
         self._set_key_status(getattr(self, "_cloud_key_status", None), "Saved", "#16a34a")
@@ -2806,10 +2859,11 @@ class Settings(QDialog):
             return
         backend = (self.cfg_working or {}).get("backend", "local")
         if backend == "mistral":
-            msg = ("Mistral transcription can't take vocabulary hints - use the "
-                   "Corrections table below to fix these terms after the fact.")
+            msg = ("Mistral can't take hints, but near-miss spellings of these words "
+                   "are still corrected. They're never added where they weren't said.")
         else:
-            msg = "Guides the recognizer, and the AI uses it as the correct spelling."
+            msg = ("Fixes the spelling of these words when they're actually said - "
+                   "they're never added where they weren't.")
         self.lbl_vocab_scope.setText(msg)
 
     def _load_replacements_table(self):
@@ -2968,8 +3022,9 @@ class Settings(QDialog):
         if getattr(self, "google_card", None):
             self._update_google_card_ui()
 
-        # Cloud API credentials + cloud action config frames: clean pale lock.
-        for attr in ("keys_frame", "card_cloud"):
+        # Cloud action config frame: clean pale lock. (The cloud STT cards lock
+        # their own key fields in _apply_disabled_cloud_card.)
+        for attr in ("card_cloud",):
             frame = getattr(self, attr, None)
             if frame:
                 frame.setEnabled(not is_private)
@@ -3223,16 +3278,82 @@ class Settings(QDialog):
             QMessageBox.warning(self, "Meeting", f"Couldn't open this meeting:\n{e}")
         self._populate_history_list()
 
+    def _active_meeting_dir(self):
+        """Folder of a meeting still being recorded/processed - never deleted."""
+        mw = getattr(self.app, "meetings_win", None) if self.app else None
+        if mw is not None and getattr(mw, "state", None) in (
+                getattr(mw, "STATE_RECORDING", "recording"),
+                getattr(mw, "STATE_PROCESSING", "processing")):
+            return getattr(mw, "_meeting_dir", None)
+        return None
+
     def _clear_all_history(self):
-        reply = QMessageBox.question(
-            self, "Clear History",
-            "Are you sure you want to permanently delete all transcription history?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        )
-        if reply == QMessageBox.Yes:
-            hist.clear()
-            self._populate_history_list()
-            QMessageBox.information(self, "Success", "History has been cleared successfully.")
+        # The list shows meetings AND dictations; clearing only the dictations
+        # left every meeting on screen, so it looked like nothing happened.
+        import meeting_store
+        dictations = len(hist.load())
+        active = self._active_meeting_dir()
+
+        def _norm(p):
+            return os.path.normcase(os.path.abspath(str(p)))
+
+        meetings = [m for m in meeting_store.list_meetings()
+                    if not active or _norm(m["dir"]) != _norm(active)]
+        if not dictations and not meetings:
+            QMessageBox.information(self, "Clear History", "History is already empty.")
+            return
+
+        def plural(n, word):
+            return f"{n} {word}{'' if n == 1 else 's'}"
+
+        what = " and ".join(p for p in (plural(dictations, "dictation") if dictations else "",
+                                        plural(len(meetings), "meeting") if meetings else "") if p)
+        box = QMessageBox(self)
+        box.setWindowTitle("Clear History")
+        box.setIcon(QMessageBox.Warning)
+        box.setText(f"Permanently delete {what}?")
+        btn_all = btn_dictations = None
+        if meetings:
+            box.setInformativeText("Deleting meetings also deletes their notes, transcripts "
+                                   "and recordings. This can't be undone.")
+            btn_all = box.addButton("Delete everything", QMessageBox.DestructiveRole)
+            if dictations:
+                btn_dictations = box.addButton("Only dictations", QMessageBox.AcceptRole)
+        else:
+            box.setInformativeText("This can't be undone.")
+            btn_dictations = box.addButton("Delete", QMessageBox.DestructiveRole)
+        # Enter / Space / Esc all cancel: a destructive button must be clicked.
+        cancel = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is None or clicked not in (btn_all, btn_dictations):
+            return
+
+        hist.clear()
+        meetings_deleted = 0
+        if clicked is btn_all:
+            meeting_store.delete_all_meetings(keep=active)
+            # Count what actually disappeared: a meeting whose recording is
+            # locked by another app survives rmtree, and the active meeting may
+            # or may not be listed yet.
+            after = {_norm(m["dir"]) for m in meeting_store.list_meetings()}
+            meetings_deleted = sum(1 for m in meetings if _norm(m["dir"]) not in after)
+        self._populate_history_list()
+        if self.app:
+            self.app.track("history_cleared", {"count": dictations, "meetings": meetings_deleted,
+                                               "from": "settings"})
+        done = " and ".join(p for p in (plural(dictations, "dictation") if dictations else "",
+                                        plural(meetings_deleted, "meeting") if meetings_deleted else "")
+                            if p) or "nothing"
+        note = ""
+        if clicked is btn_all and meetings_deleted < len(meetings):
+            note = ("\n\nSome meetings couldn't be deleted - a recording may be open in "
+                    "another app. Close it and try again.")
+        if active:
+            note += "\n\nThe meeting that's still being recorded was kept."
+        QMessageBox.information(self, "History cleared", f"Deleted {done}.{note}")
 
     def _export_history(self, fmt):
         default_name = f"transcribe_history.{fmt}"
@@ -3248,6 +3369,8 @@ class Settings(QDialog):
                     count = hist.export_csv(path)
                 else:
                     count = hist.export_txt(path)
+                if self.app:
+                    self.app.track("history_exported", {"format": fmt, "count": count, "from": "settings"})
                 QMessageBox.information(self, "Success", f"Exported {count} entries successfully!")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to export history: {e}")
@@ -3267,6 +3390,11 @@ class Settings(QDialog):
         if not self.app:
             return
         self.cfg_working["analytics_enabled"] = self.chk_telemetry.isChecked()
+
+    def _track_tab_opened(self, index):
+        if self.app:
+            # "About (Update v1.9.1!)" -> "About"
+            self.app.track("settings_tab_opened", {"tab": self.tabs.tabText(index).split(" (")[0]})
 
     # ── TAB 5: About & Updates ───────────────────────────────────────────────
     def _create_about_tab(self):
@@ -3800,6 +3928,8 @@ class Settings(QDialog):
         if ok:
             self._fb_text.clear()
             self._fb_clear_images()
+            if self.app:
+                self.app.track("feedback_sent", {"category": "feedback"})
 
     def _acct_delete_account(self):
         """GDPR right-to-erasure: double confirmation (typed DELETE), then the
@@ -4240,7 +4370,9 @@ class Settings(QDialog):
         self._model_states[name] = "downloading"
         self._model_progress[name] = {"percent": 0}
         self._update_whisper_card_ui(name)
-        
+        if self.app:
+            self.app.track("model_download_started", {"kind": "whisper", "model": name})
+
         def _on_prog(pct, got, total):
             self.downloader_signals.progress.emit(name, pct or 0, got, total)
             
@@ -4266,6 +4398,8 @@ class Settings(QDialog):
                 self.app.recorder.unload_model(name)
             ok = remove_whisper_model(name)
             if ok:
+                if self.app:
+                    self.app.track("model_removed", {"kind": "whisper", "model": name})
                 self._model_states[name] = "missing"
                 self._update_whisper_card_ui(name)
                 QMessageBox.information(self, "Success", f"Whisper {name.upper()} removed successfully.")
@@ -4285,7 +4419,9 @@ class Settings(QDialog):
         self._local_llm_states[name] = "downloading"
         self._local_llm_progress[name] = {"percent": 0}
         self._update_llm_card_ui(name)
-        
+        if self.app:
+            self.app.track("model_download_started", {"kind": "llm", "model": name})
+
         def _on_prog(pct, got, total):
             self.downloader_signals.progress.emit(f"llm:{name}", pct or 0, got, total)
             
@@ -4306,6 +4442,8 @@ class Settings(QDialog):
         )
         if reply == QMessageBox.Yes:
             local_llm.remove_model(name)
+            if self.app:
+                self.app.track("model_removed", {"kind": "llm", "model": name})
             self._local_llm_states[name] = "missing"
             self._update_llm_card_ui(name)
             QMessageBox.information(self, "Success", "Local model files removed successfully.")
@@ -4325,6 +4463,12 @@ class Settings(QDialog):
         if model_name == "update":
             self.btn_update.setEnabled(True)
             self.btn_update.setText("Check for Updates")
+            if self.app:
+                if state.startswith("available:") or state == "latest":
+                    self.app.track("update_check_result", {
+                        "manual": True, "available": state != "latest"})
+                else:
+                    self.app.track("update_check_result", {"manual": True, "failed": True})
             if state.startswith("available:"):
                 tag = state.split(":")[1]
                 reply = QMessageBox.question(
@@ -4336,7 +4480,9 @@ class Settings(QDialog):
                 if reply == QMessageBox.Yes:
                     self.btn_update.setText("Downloading Update...")
                     self.btn_update.setEnabled(False)
-                    
+                    if self.app:
+                        self.app.track("update_install_started", {"manual": True, "to": tag})
+
                     def _download_and_install():
                         import urllib.request
                         import tempfile
@@ -4364,26 +4510,14 @@ class Settings(QDialog):
                             # Execute the setup.exe natively
                             os.startfile(dest_path)
                             
-                            # Clear pending update from configuration
-                            if self.app:
-                                self.app.cfg["pending_update_version"] = ""
-                                self.app.save_config()
-                            
-                            # Quit the running instance so that the installer can overwrite the files
-                            if self.app:
-                                QTimer.singleShot(0, self.app.qapp.quit)
+                            # Back on the GUI thread (a QTimer started from this
+                            # worker thread never fires): clear the pending
+                            # update and quit so the installer can replace files.
+                            self.update_install_finished.emit(True, "")
+
                         except Exception as e:
                             logging.error("Failed to download and execute update installer: %s", e)
-                            # Show error in main thread
-                            def _show_err():
-                                self.btn_update.setText("Check for Updates")
-                                self.btn_update.setEnabled(True)
-                                QMessageBox.critical(
-                                    self, "Update Error",
-                                    f"Failed to download the update automatically:\n{e}\n\n"
-                                    f"Please update manually from:\n{PROJECT_GITHUB_URL}/releases"
-                                )
-                            QTimer.singleShot(0, _show_err)
+                            self.update_install_finished.emit(False, str(e))
                             
                     threading.Thread(target=_download_and_install, daemon=True).start()
             elif state == "latest":
@@ -4391,6 +4525,13 @@ class Settings(QDialog):
             else:
                 QMessageBox.warning(self, "Error", "Could not reach GitHub updates API. Try again later.")
             return
+
+        if self.app:
+            is_llm = model_name.startswith("llm:")
+            self.app.track(
+                "model_download_completed" if state == "downloaded" else "model_download_failed",
+                {"kind": "llm" if is_llm else "whisper",
+                 "model": model_name.replace("llm:", "")})
 
         if model_name.startswith("llm:"):
             name = model_name.replace("llm:", "")
@@ -4427,7 +4568,7 @@ class Settings(QDialog):
                 return True # swallow event
         return super().eventFilter(obj, event)
 
-    # ── Live Prompter controls (apply immediately, bypass cfg_working) ──
+    # ── Live Assistance controls (apply immediately, bypass cfg_working) ──
     @staticmethod
     def _norm_hotkey(combo):
         """'Alt + E' -> 'alt+e' (the form the keyboard library and the tray
@@ -4474,7 +4615,7 @@ class Settings(QDialog):
             QMessageBox.information(
                 self, "Already used",
                 f"{self._fmt_hotkey(None, combo)} is your dictation hotkey. "
-                "Pick a different combination for Live Prompter.")
+                "Pick a different combination for Live Assistance.")
             self._reset_lp_capture_button()
             return
         self.app.cfg["live_assist_hotkey"] = combo
@@ -4499,7 +4640,7 @@ class Settings(QDialog):
     def _apply_lp_auto(self, on):
         if not self.app:
             return
-        self.app.cfg["live_assist_auto"] = bool(on)
+        self.app.cfg["live_assist_auto_answer"] = bool(on)
         self.app.save_config()
         la = getattr(self.app, "live_assist", None)
         if la is not None and hasattr(la, "btn_auto"):

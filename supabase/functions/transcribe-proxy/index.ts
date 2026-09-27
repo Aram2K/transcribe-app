@@ -7,12 +7,11 @@
 // open source.
 //
 // Provider routing: the client may request `provider: "gemini" | "mistral"`.
-// Gemini (Google AI Studio key) is the default and always available. Mistral
-// Voxtral is used only when MISTRAL_STT_KEY is set; otherwise we fall back to
-// Gemini so transcription never hard-fails.
+// We use whichever key is actually configured (honoring the request when its
+// key exists), so STT works with EITHER GOOGLE_STT_KEY or MISTRAL_STT_KEY set.
 //
-// Secrets: GOOGLE_STT_KEY (required, a Google AI Studio / Gemini key),
-//          MISTRAL_STT_KEY (optional, enables the Mistral provider).
+// Secrets: GOOGLE_STT_KEY or GEMINI_KEY (Google AI Studio / Gemini key) and/or
+//          MISTRAL_STT_KEY. At least one must be set or the proxy returns 503.
 // Auto-provided by Supabase: SUPABASE_URL, SUPABASE_ANON_KEY.
 // Deploy with verify_jwt=false; we validate the token via auth.getUser().
 
@@ -20,7 +19,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
-const GOOGLE_KEY = Deno.env.get("GOOGLE_STT_KEY") ?? "";
+const GOOGLE_KEY = Deno.env.get("GOOGLE_STT_KEY") || Deno.env.get("GEMINI_KEY") || ""; // either name works
 const MISTRAL_KEY = Deno.env.get("MISTRAL_STT_KEY") ?? "";
 const DAILY_CAP = 3000; // requests/user/day
 

@@ -861,7 +861,7 @@ class TestSettingsValidation(unittest.TestCase):
             Settings._on_save_clicked(dialog)
             
             dialog._sync_action_settings_from_widgets.assert_called_once()
-            dialog.tabs.setCurrentIndex.assert_called_once_with(1)
+            dialog.tabs.setCurrentWidget.assert_called_once_with(dialog.models_tab)
             dialog.mistral_key_input.setFocus.assert_called_once()
             dialog.mistral_key_input.setStyleSheet.assert_called_once_with(
                 "border: 2px solid #ef4444; background-color: #fef2f2;"
@@ -884,7 +884,7 @@ class TestSettingsValidation(unittest.TestCase):
             Settings._on_save_clicked(dialog)
             
             dialog._sync_action_settings_from_widgets.assert_called_once()
-            dialog.tabs.setCurrentIndex.assert_called_once_with(1)
+            dialog.tabs.setCurrentWidget.assert_called_once_with(dialog.models_tab)
             dialog.google_key_input.setFocus.assert_called_once()
             dialog.google_key_input.setStyleSheet.assert_called_once_with(
                 "border: 2px solid #ef4444; background-color: #fef2f2;"
@@ -913,7 +913,7 @@ class TestSettingsValidation(unittest.TestCase):
         dialog.app.save_config.assert_called_once()
         dialog._show_saved_toast.assert_called_once()
         dialog.accept.assert_not_called()
-        dialog.tabs.setCurrentIndex.assert_not_called()
+        dialog.tabs.setCurrentWidget.assert_not_called()
 
     def test_save_clicked_invalid_mistral_key(self):
         from ui.settings import Settings
@@ -930,7 +930,7 @@ class TestSettingsValidation(unittest.TestCase):
         with patch.object(QMessageBox, "warning") as mock_warning:
             Settings._on_save_clicked(dialog)
             
-            dialog.tabs.setCurrentIndex.assert_called_once_with(1)
+            dialog.tabs.setCurrentWidget.assert_called_once_with(dialog.models_tab)
             dialog.mistral_key_input.setFocus.assert_called_once()
             mock_warning.assert_called_once()
             dialog.accept.assert_not_called()

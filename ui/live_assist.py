@@ -1,4 +1,4 @@
-"""Live Prompter: a private, liquid-glass copilot overlay for live calls.
+"""Live Assistance: a private, liquid-glass copilot overlay for live calls.
 
 What it is (product contract):
 * Floats above Zoom/Teams/Meet/anything, always on top, draggable, with a
@@ -16,8 +16,9 @@ What it is (product contract):
   BEHIND it can be sampled (QScreen.grabWindow honours the exclusion) and
   rendered back through the shape - real blur, an edge refraction ring, a
   cursor-tracked specular highlight, rim light and a soft shadow. Where
-  sampling isn't safe (exclusion unconfirmed, macOS, RDP) it falls back to
-  the OS acrylic backdrop, then to a painted translucent plate.
+  sampling isn't safe (Visible mode, exclusion unconfirmed, macOS, RDP) it
+  paints a darker rounded plate instead - never the OS acrylic, which blurs
+  the whole square window and shows as a rectangle around the card.
 
 Threading: suggestion requests run on a worker thread and report back via
 signals; every widget touch happens on the GUI thread.
@@ -28,10 +29,10 @@ import re
 import threading
 import time
 
-from PySide6.QtCore import Qt, QBuffer, QIODevice, QPointF, QRect, QRectF, QTimer, Signal
+from PySide6.QtCore import Qt, QBuffer, QIODevice, QPointF, QRect, QRectF, QSize, QTimer, Signal
 from PySide6.QtGui import (
-    QBrush, QColor, QCursor, QFont, QImage, QLinearGradient, QPainter, QPainterPath,
-    QPen, QRadialGradient,
+    QBrush, QColor, QCursor, QFont, QIcon, QImage, QLinearGradient, QPainter, QPainterPath,
+    QPen, QPixmap, QRadialGradient,
 )
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
@@ -39,6 +40,10 @@ from PySide6.QtWidgets import (
 )
 
 import actions
+from live_context import (  # noqa: F401 - re-exported for callers of this module
+    HISTORY_TURNS, SOLVE_SCREEN, TAIL_CHARS, last_question, looks_like_question,
+    rolling_context, should_attach_screen,
+)
 from ui import glass
 
 logger = logging.getLogger("transcribe")
@@ -50,24 +55,24 @@ CARD_W = 480
 # collapse/expand never jumps sideways.
 EXPANDED_W, EXPANDED_H = CARD_W + 2 * SHADOW, 560 + 2 * SHADOW
 COMPACT_W, COMPACT_H = CARD_W + 2 * SHADOW, 52 + 2 * SHADOW
-TAIL_CHARS = 2600                # ~3-4 minutes of speech fed to the model
-AUTO_SUGGEST_EVERY_SEC = 25      # when Auto is on and new speech arrived
 SAMPLE_MS_REST, SAMPLE_MS_DRAG = 150, 40
 
 _THEMES = {
     "light": {
-        "tint_liquid": QColor(255, 255, 255, 108),  # over the sampled backdrop
-        "tint_blur": QColor(255, 255, 255, 150),    # over OS acrylic
-        "tint_flat": QColor(255, 255, 255, 228),    # painted fallback
+        # Cool slate rather than milky white: darker glass, and what's behind
+        # doesn't bleed through the text.
+        "tint_liquid": QColor(214, 222, 233, 165),  # over the sampled backdrop
+        "tint_blur": QColor(214, 222, 233, 190),    # (OS acrylic - no longer used)
+        "tint_flat": QColor(206, 215, 227, 242),    # painted plate (Visible mode)
         "border": QColor(15, 23, 42, 40),
         "text": "#0f172a", "muted": "#475569", "faint": "#64748b",
         "card": "rgba(255,255,255,0.72)", "card_border": "rgba(15,23,42,0.10)",
         "accent": "#2563eb", "spec": 95,
     },
     "dark": {
-        "tint_liquid": QColor(17, 24, 39, 128),
-        "tint_blur": QColor(17, 24, 39, 150),
-        "tint_flat": QColor(17, 24, 39, 232),
+        "tint_liquid": QColor(17, 24, 39, 160),
+        "tint_blur": QColor(17, 24, 39, 180),
+        "tint_flat": QColor(15, 20, 33, 240),
         "border": QColor(255, 255, 255, 46),
         "text": "#f8fafc", "muted": "#cbd5e1", "faint": "#94a3b8",
         "card": "rgba(17,24,39,0.62)", "card_border": "rgba(255,255,255,0.14)",
@@ -75,11 +80,15 @@ _THEMES = {
     },
 }
 
+# After an answer the user asked for, how long an automatic one waits before
+# it may replace it (they are still reading it, or saying it).
+USER_ANSWER_HOLD_S = 12
+
 QUICK_ACTIONS = (
-    ("Say next", ""),
+    ("Answer", ""),
     ("Follow-ups", "Give me 3 sharp follow-up questions I could ask right now, "
                    "one line each."),
-    ("Recap", "Recap the last few minutes of the conversation in 3 short bullets."),
+    ("Solve screen", SOLVE_SCREEN),
 )
 
 
@@ -112,40 +121,6 @@ def private_state(wanted, supported, remote, excluded):
     if excluded:
         return "on", "PRIVATE · not in share"
     return "failed", "NOT PRIVATE · visible"
-
-
-_LANG_NAMES = {"en": "English", "de": "German", "fr": "French", "es": "Spanish",
-               "it": "Italian", "pt": "Portuguese", "nl": "Dutch", "ru": "Russian",
-               "hy": "Armenian", "tr": "Turkish", "zh": "Chinese", "ja": "Japanese"}
-
-
-def rolling_context(live_text, question="", title="", attendees="",
-                    tail_chars=TAIL_CHARS, screen=False, output_lang="en"):
-    """The text handed to the model: recent conversation + optional question.
-    Pure, so it is unit-testable. Cuts at a sentence boundary when it can so
-    the model doesn't start mid-word."""
-    tail = (live_text or "").strip()
-    if len(tail) > tail_chars:
-        tail = tail[-tail_chars:]
-        cut = re.search(r"[.!?]\s+", tail)
-        if cut and cut.end() < len(tail) // 2:
-            tail = tail[cut.end():]
-    parts = []
-    if title or attendees:
-        meta = []
-        if title:
-            meta.append(f"Meeting: {title}")
-        if attendees:
-            meta.append(f"Attendees: {attendees}")
-        parts.append("\n".join(meta))
-    parts.append("Conversation (latest part):\n" + (tail or "(nothing transcribed yet)"))
-    if screen:
-        parts.append("(A screenshot of the user's screen is attached - use it as context.)")
-    if output_lang and output_lang != "auto":
-        parts.append(f"(Respond in {_LANG_NAMES.get(output_lang, output_lang)}.)")
-    if (question or "").strip():
-        parts.append("User's question: " + question.strip())
-    return "\n\n".join(parts)
 
 
 def _looks_like_capture_hole(small_img, black_max=12, band_frac=0.14):
@@ -189,31 +164,11 @@ def render_markdown(text_edit, md):
         text_edit.setPlainText(md or "")
 
 
-_SCREEN_CUES = re.compile(
-    r"\b(screen|slides?|deck|chart|graph|diagram|table|dashboard|spreadsheet|figure|"
-    r"image|picture|photo|screenshot|this code|the code|error|stack ?trace|terminal|"
-    r"console|this page|the page|this doc(ument)?|the doc(ument)?|shown|showing|"
-    r"displayed|on my screen|on the screen|on screen|share(d)? my screen|"
-    r"what (do|does) (this|that|it) (say|mean|show)|(see|look at) (this|that|here|my))\b",
-    re.I)
-
-
-def should_attach_screen(question="", live_tail="", auto=True):
-    """Auto screen context: attach a screenshot only when it plausibly helps -
-    the user's question refers to something on screen, or the last thing said
-    in the call does ("as you can see on this slide"). A typed question with
-    no such cue gets no screenshot (tokens, latency, privacy)."""
-    if not auto:
-        return False
-    q = (question or "").strip()
-    if q:
-        return bool(_SCREEN_CUES.search(q))
-    return bool(_SCREEN_CUES.search((live_tail or "")[-400:]))
-
-
-def capture_screen_png_b64(screen, max_w=1280):
-    """Screenshot of ``screen`` as base64 PNG, downscaled for upload. The
-    overlay itself is absent when capture exclusion is active."""
+def capture_screen_b64(screen, max_w=1600, quality=80):
+    """Screenshot of ``screen`` as base64 JPEG, downscaled for upload - a
+    third of the PNG size, so it reaches the model faster, yet sharp enough
+    for code and small UI text. The overlay itself is absent when capture
+    exclusion (Private) is active."""
     try:
         pm = screen.grabWindow(0)
         if pm.isNull():
@@ -222,11 +177,50 @@ def capture_screen_png_b64(screen, max_w=1280):
             pm = pm.scaledToWidth(max_w, Qt.SmoothTransformation)
         buf = QBuffer()
         buf.open(QIODevice.WriteOnly)
-        pm.save(buf, "PNG")
+        pm.save(buf, "JPG", quality)
         return base64.b64encode(bytes(buf.data())).decode("ascii")
     except Exception as e:
         logger.debug("screen capture failed: %s", e)
         return ""
+
+
+def screen_to_capture(overlay_screen):
+    """The monitor the user is working on: the one under the mouse, since a
+    question about "this" is about what they're looking at - not necessarily
+    the monitor the overlay sits on."""
+    try:
+        return QApplication.screenAt(QCursor.pos()) or overlay_screen \
+            or QApplication.primaryScreen()
+    except Exception:
+        return overlay_screen or QApplication.primaryScreen()
+
+
+def _send_icon(size=18, color="#ffffff"):
+    """A chat-style send icon (paper plane pointing right), painted as a path
+    so it's crisp at any DPI."""
+    scale = 3                                   # draw big, let Qt scale down smoothly
+    pm = QPixmap(size * scale, size * scale)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.scale(size * scale / 24.0, size * scale / 24.0)
+    path = QPainterPath(QPointF(3.4, 20.4))     # the classic send glyph on a 24 grid
+    path.lineTo(QPointF(21.0, 12.0))
+    path.lineTo(QPointF(3.4, 3.6))
+    path.lineTo(QPointF(3.4, 10.2))
+    path.lineTo(QPointF(15.0, 12.0))
+    path.lineTo(QPointF(3.4, 13.8))
+    path.closeSubpath()
+    p.fillPath(path, QColor(color))
+    p.end()
+    pm.setDevicePixelRatio(scale)
+    return QIcon(pm)
+
+
+class _Superseded(BaseException):
+    """Raised from a stream's token callback when a newer question took over.
+    A BaseException so the providers' per-chunk ``except Exception`` parsing
+    can't swallow it - the stale stream stops at its next token."""
 
 
 class _IconButton(QPushButton):
@@ -347,9 +341,12 @@ class _DragBar(QFrame):
 
 
 class LiveAssistOverlay(QWidget):
-    sig_suggestion = Signal(str, str)     # text, error
-    sig_status = Signal(str)              # short footer note from the worker
-    sig_partial = Signal(str)             # streamed text so far
+    # The int is the request generation: a newer question supersedes an answer
+    # still streaming, and the stale one's late signals are dropped.
+    sig_suggestion = Signal(str, str, int)   # text, error, generation
+    sig_status = Signal(str)                 # short footer note from the worker
+    sig_partial = Signal(str, int)           # streamed text so far, generation
+    sig_export_done = Signal(str, str)       # saved path, error
 
     def __init__(self, main_app=None):
         super().__init__()
@@ -359,7 +356,14 @@ class LiveAssistOverlay(QWidget):
         if self._theme_name not in _THEMES:
             self._theme_name = "light"
         self._private = bool(cfg.get("live_assist_private", True))
-        self._auto = bool(cfg.get("live_assist_auto", False))
+        # Auto = answer the moment someone asks a question (on by default: an
+        # instant companion is the point of the feature).
+        self._auto = bool(cfg.get("live_assist_auto_answer", True))
+        self._gen = 0                      # bumped by every request
+        self._pending_auto = False
+        self._qa_history = []              # (asked, answer) of this session
+        self._audio_folder = None          # last session's meeting folder
+        self._audio_ready = False
         self._blur_mode = ""
         self._glass_mode = "flat"          # "liquid" | "acrylic" | "flat"
         self._bd_body = None               # sampled backdrop, strong blur
@@ -384,12 +388,13 @@ class LiveAssistOverlay(QWidget):
         # macOS hides Qt.Tool windows when the app loses focus - which is
         # exactly when the user is in Zoom. No-op elsewhere.
         self.setAttribute(Qt.WA_MacAlwaysShowToolWindow, True)
-        self.setWindowTitle("Live Prompter")
+        self.setWindowTitle("Live Assistance")
         self.setFixedSize(EXPANDED_W, EXPANDED_H)
 
         self.sig_suggestion.connect(self._on_suggestion)
         self.sig_status.connect(self._set_status)
         self.sig_partial.connect(self._on_partial)
+        self.sig_export_done.connect(self._on_export_done)
         self._first_token_at = 0.0
         self._build()
         self._richify_tooltips()
@@ -425,7 +430,7 @@ class LiveAssistOverlay(QWidget):
         bl = QHBoxLayout(self.bar)
         bl.setContentsMargins(4, 2, 0, 2)
         bl.setSpacing(8)
-        self.lbl_title = QLabel("Live Prompter", self.bar)
+        self.lbl_title = QLabel("Live Assistance", self.bar)
         bl.addWidget(self.lbl_title)
         # Idle: a solid Start button. Live: a green timer + a red stop button.
         self.btn_start = QPushButton("Start", self.bar)
@@ -450,17 +455,14 @@ class LiveAssistOverlay(QWidget):
         self.btn_private.setCursor(Qt.PointingHandCursor)
         self.btn_private.clicked.connect(lambda: self.set_private(not self._private))
         bl.addWidget(self.btn_private)
-        # Screen context, AUTO by default: the app attaches a screenshot only
-        # when the question or the conversation refers to what's on screen.
-        self.btn_screen = _IconButton(
-            "screen", self.bar,
-            "Screen context: Auto. A screenshot of your screen (this card left out) "
-            "is attached when you or the other side refer to what's on screen - "
-            "a slide, an error, 'as you can see'. Needs a cloud AI engine. Click to turn off.")
+        # Screen context, ON by default: every answer sees the screen you're
+        # working on (the tooltip text is set by _on_screen_toggled).
+        self.btn_screen = _IconButton("screen", self.bar, "")
         self.btn_screen.setCheckable(True)
         self.btn_screen.setChecked(
             bool((self.app.cfg if self.app else {}).get("live_assist_screen_auto", True)))
         self.btn_screen.toggled.connect(self._on_screen_toggled)
+        self._set_screen_tooltip(self.btn_screen.isChecked())
         bl.addWidget(self.btn_screen)
         bl.addStretch()
         self.btn_theme = _IconButton("theme", self.bar, "Light / dark glass")
@@ -490,18 +492,20 @@ class LiveAssistOverlay(QWidget):
         self.lbl_now_head.hide()
         self.txt_now.hide()
 
-        self.lbl_sum_head = QLabel("SO FAR", self.body)
+        # The live transcript itself (not a summary): what was just said, so
+        # the answer below can be checked against it at a glance.
+        self.lbl_sum_head = QLabel("LIVE TRANSCRIPT", self.body)
         body.addWidget(self.lbl_sum_head)
         self.txt_summary = QTextEdit(self.body)
         self.txt_summary.setReadOnly(True)
         self.txt_summary.setObjectName("laCard")
         self.txt_summary.setMaximumHeight(110)
+        self.txt_summary.setPlaceholderText("Press Start - what's said appears here.")
         body.addWidget(self.txt_summary)
 
         head_row = QHBoxLayout()
-        self.lbl_sug_head = QLabel("SUGGESTION", self.body)
-        self.lbl_sug_head.setToolTip("AI suggestions can be wrong - treat them as notes, "
-                                     "not facts.")
+        self.lbl_sug_head = QLabel("ANSWER", self.body)
+        self.lbl_sug_head.setToolTip("AI answers can be wrong - check anything important.")
         head_row.addWidget(self.lbl_sug_head)
         head_row.addStretch()
         # One-tap actions: each is a canned question through the same path.
@@ -510,14 +514,14 @@ class LiveAssistOverlay(QWidget):
             b = QPushButton(label, self.body)
             b.setFixedHeight(22)
             b.setCursor(Qt.PointingHandCursor)
-            b.clicked.connect(lambda _=False, q=question: self.suggest(q))
+            b.clicked.connect(lambda _=False, q=question: self.suggest(
+                q, force_screen=(q == SOLVE_SCREEN)))
             head_row.addWidget(b)
             self.quick_buttons.append(b)
         self.btn_auto = QPushButton("Auto", self.body)
         self.btn_auto.setCheckable(True)
         self.btn_auto.setChecked(self._auto)
-        self.btn_auto.setToolTip("Refresh the suggestion by itself every ~25 s while "
-                                 "people talk (uses your notes AI engine).")
+        self.btn_auto.setToolTip("Answer automatically the moment someone asks a question.")
         self.btn_auto.toggled.connect(self._on_auto_toggled)
         self.btn_auto.setFixedHeight(22)
         head_row.addWidget(self.btn_auto)
@@ -526,30 +530,48 @@ class LiveAssistOverlay(QWidget):
         self.txt_suggestion.setReadOnly(True)
         self.txt_suggestion.setObjectName("laCard")
         self.txt_suggestion.setPlaceholderText(
-            "Say next answers what was just asked of you; Follow-ups and Recap do "
-            "what they say; or type a question below. Turn on Screen to include "
-            "what's on your screen.")
+            "Answers appear here the moment someone asks you something. Answer "
+            "re-answers the latest question, Solve screen solves what's on your "
+            "screen - or type your own question below.")
         body.addWidget(self.txt_suggestion, 1)
 
         ask_row = QHBoxLayout()
         ask_row.setSpacing(8)
         self.input_ask = QLineEdit(self.body)
-        self.input_ask.setPlaceholderText("Ask about the conversation or your screen…")
+        self.input_ask.setPlaceholderText("Ask anything about the call or your screen…")
         self.input_ask.returnPressed.connect(self._ask)
         ask_row.addWidget(self.input_ask, 1)
-        self.btn_suggest = QPushButton("Suggest", self.body)
+        # A round send button with a paper-plane icon, like a chat app.
+        self.btn_suggest = QPushButton("", self.body)
         self.btn_suggest.setObjectName("laSuggest")
         self.btn_suggest.setCursor(Qt.PointingHandCursor)
-        self.btn_suggest.clicked.connect(lambda: self.suggest(""))
+        self.btn_suggest.setIcon(_send_icon(18))
+        self.btn_suggest.setIconSize(QSize(18, 18))
+        self.btn_suggest.setFixedSize(34, 34)
+        self.btn_suggest.setToolTip("Send (Enter) - with nothing typed, answers the "
+                                    "latest question")
+        self.btn_suggest.clicked.connect(self._ask_or_answer)
         ask_row.addWidget(self.btn_suggest)
         body.addLayout(ask_row)
 
+        foot_row = QHBoxLayout()
+        foot_row.setSpacing(8)
         self.lbl_status = QLabel("", self.body)
         self.lbl_status.setObjectName("laFoot")
         # Wrap: a long note must never widen the layout past the card.
         self.lbl_status.setWordWrap(True)
         self.lbl_status.setMaximumHeight(32)
-        body.addWidget(self.lbl_status)
+        foot_row.addWidget(self.lbl_status, 1)
+        # Appears once a session's recording is on disk.
+        self.btn_audio = QPushButton("Download audio", self.body)
+        self.btn_audio.setFixedHeight(22)
+        self.btn_audio.setCursor(Qt.PointingHandCursor)
+        self.btn_audio.setToolTip("Save this session's recording (MP3 or WAV). It's also "
+                                  "kept with the meeting in History.")
+        self.btn_audio.clicked.connect(self._save_audio)
+        self.btn_audio.hide()
+        foot_row.addWidget(self.btn_audio)
+        body.addLayout(foot_row)
 
         root.addWidget(self.body, 1)
         cfg = self.app.cfg if self.app else {}
@@ -593,8 +615,11 @@ class LiveAssistOverlay(QWidget):
             QPushButton:hover {{ border-color: {accent}; }}
             QPushButton:checked {{ background: {accent}; color: white; border-color: {accent}; }}
             QPushButton#laSuggest {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3b82f6, stop:1 #8b5cf6);
-                color: white; font-weight: bold; border: none; padding: 7px 18px; border-radius: 15px;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #3b82f6, stop:1 #8b5cf6);
+                border: none; padding: 0; border-radius: 17px;
+            }}
+            QPushButton#laSuggest:hover {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2563eb, stop:1 #7c3aed);
             }}
             QPushButton#laSuggest:disabled {{ background: #94a3b8; }}
             QPushButton#laStart {{
@@ -649,13 +674,17 @@ class LiveAssistOverlay(QWidget):
             self._sample_timer.start()
             self._spec_timer.start()
         else:
+            # Visible in shares (or exclusion unavailable): the backdrop can't be
+            # sampled, so paint a darker rounded plate ourselves. Not the OS
+            # acrylic - Windows blurs the whole square window, shadow margin
+            # included, which drew a rectangle around the rounded card.
             self._sample_timer.stop()
             self._spec_timer.stop()
             self._bd_body = self._bd_ring = self._bd_refr = self._bd_glow = None
-            t = _THEMES[self._theme_name]
-            tint = (t["tint_blur"].red(), t["tint_blur"].green(), t["tint_blur"].blue(), 0x20)
-            self._blur_mode = glass.apply_backdrop_blur(self, tint)
-            self._glass_mode = "acrylic" if self._blur_mode else "flat"
+            if self._blur_mode:
+                glass.remove_backdrop_blur(self)
+                self._blur_mode = ""
+            self._glass_mode = "flat"
         self.update()
 
     def _apply_private(self):
@@ -756,7 +785,8 @@ class LiveAssistOverlay(QWidget):
 
     # ── liquid glass: sample what is behind the window ──
     def _sample_backdrop(self):
-        if self._glass_mode != "liquid" or not self.isVisible():
+        # Keeps sampling during a video hole too, so it returns to liquid glass.
+        if self._glass_mode not in ("liquid", "liquid-video") or not self.isVisible():
             return
         try:
             scr = self.screen() or QApplication.primaryScreen()
@@ -775,20 +805,15 @@ class LiveAssistOverlay(QWidget):
             if _looks_like_capture_hole(body):
                 # Hardware-accelerated video (a call's webcam strip, a player)
                 # comes back from BitBlt as solid BLACK. Refracting that paints
-                # a black bar through the glass. Let DWM's acrylic compose those
-                # frames instead; the next sample re-tests.
+                # a black bar through the glass. Paint the plain rounded plate
+                # while it's there (not the OS acrylic: that blurs the square
+                # window and shows a rectangle); the next sample re-tests.
                 if self._glass_mode == "liquid":
-                    self._glass_mode = "acrylic-video"
-                    t = _THEMES[self._theme_name]
-                    tint = (t["tint_blur"].red(), t["tint_blur"].green(),
-                            t["tint_blur"].blue(), 0x20)
-                    self._blur_mode = glass.apply_backdrop_blur(self, tint)
+                    self._glass_mode = "liquid-video"
                     self._bd_body = self._bd_ring = self._bd_refr = self._bd_glow = None
                     self.update()
                 return
-            if self._glass_mode == "acrylic-video":
-                glass.remove_backdrop_blur(self)
-                self._blur_mode = ""
+            if self._glass_mode == "liquid-video":
                 self._glass_mode = "liquid"
             body = body.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
             ring = img.scaled(max(1, w // 5), max(1, h // 5), Qt.IgnoreAspectRatio,
@@ -968,6 +993,8 @@ class LiveAssistOverlay(QWidget):
             self.hide_overlay()
         else:
             self.show_overlay()
+            if self.app:
+                self.app.track("live_prompter_opened")
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -989,29 +1016,61 @@ class LiveAssistOverlay(QWidget):
             self._set_status("Meeting recorder isn't available.")
             return
         try:
-            if getattr(mw, "state", None) == mw.STATE_RECORDING:
+            state = getattr(mw, "state", None)
+            if state == mw.STATE_RECORDING:
+                return
+            if state == getattr(mw, "STATE_PROCESSING", "processing"):
+                # Restarting the shared recorder now would lose the last recording.
+                self._set_status("Still saving the last session - try again in a moment.")
                 return
             if hasattr(self.app, "is_pro") and not self.app.is_pro():
                 if hasattr(self.app, "_pro_upsell"):
-                    self.app._pro_upsell("Live Prompter")
+                    self.app._pro_upsell("Live Assistance")
                 return
+            if state == getattr(mw, "STATE_DONE", "done") and hasattr(mw, "_reset"):
+                # The last session's Done page: its title, attendees and any
+                # resume state belong to THAT meeting, not this one.
+                mw._reset()
             if hasattr(mw, "input_title") and not mw.input_title.text().strip():
                 mw.input_title.setText("Live session " + time.strftime("%H:%M"))
-            # Transcription language for this session (default English) - the
-            # recorder reads cfg["language"]; the previous value is restored
-            # when the session ends so dictation keeps its own setting.
+            # Transcription language for this session (default English), passed
+            # to the meeting - the saved dictation language is never touched.
             lang = (self.app.cfg.get("live_assist_language") or "en").strip()
-            if lang and lang != "auto":
-                self._prev_language = self.app.cfg.get("language", "auto")
-                self.app.cfg["language"] = lang
-            mw._start_meeting()
+            # Answers can only be as live as the transcript: short speech pieces
+            # for this session (the meeting's final transcript is redone in
+            # full afterwards, so accuracy of the notes is unaffected).
+            self._set_fast_chunks(True)
+            # Wake the answer engine now, so the first question isn't a cold start.
+            threading.Thread(target=self._warm_up_engine, daemon=True).start()
+            mw._start_meeting(language=lang if lang and lang != "auto" else None)
             if getattr(mw, "state", None) != mw.STATE_RECORDING:
-                self._restore_language()
+                self._set_fast_chunks(False)
                 self._set_status("Couldn't start listening - see Record Meeting.")
+            else:
+                self.app.track("live_prompter_started", {
+                    "language": lang or "auto",
+                    "screen_auto": self.btn_screen.isChecked(),
+                    "auto_suggest": self._auto,
+                })
         except Exception as e:
-            logger.warning("Live Prompter start failed: %s", e, exc_info=True)
-            self._restore_language()
+            logger.warning("Live Assistance start failed: %s", e, exc_info=True)
+            self._set_fast_chunks(False)
             self._set_status(f"Couldn't start: {str(e)[:80]}")
+
+    def _set_fast_chunks(self, on):
+        rec = getattr(self.app, "recorder", None) if self.app else None
+        if rec is not None:
+            rec.fast_live_chunks = bool(on)
+
+    def _warm_up_engine(self):
+        # Worker thread. A scale-to-zero GPU endpoint (a dedicated Modal model) can take
+        # a while to boot; this request starts it while the call gets going.
+        try:
+            engine, cfg = self._resolve_engine()
+            if engine is not None:
+                actions.warm_up(engine, cfg)
+        except Exception:
+            logger.debug("engine warm-up failed", exc_info=True)
 
     def _stop_listening(self):
         mw = getattr(self.app, "meetings_win", None) if self.app else None
@@ -1021,14 +1080,8 @@ class LiveAssistOverlay(QWidget):
             mw._stop_meeting()
             self._set_status("Stopped - the notes are generated in Record Meeting.")
         except Exception as e:
-            logger.warning("Live Prompter stop failed: %s", e, exc_info=True)
+            logger.warning("Live Assistance stop failed: %s", e, exc_info=True)
             self._set_status(f"Couldn't stop: {str(e)[:80]}")
-
-    def _restore_language(self):
-        prev = getattr(self, "_prev_language", None)
-        if prev is not None and self.app:
-            self.app.cfg["language"] = prev
-            self._prev_language = None
 
     # ── data feed (GUI thread) ──
     def set_meeting_active(self, active, title="", attendees=""):
@@ -1037,34 +1090,60 @@ class LiveAssistOverlay(QWidget):
             self._live_since = time.time()
             self._live_text = ""
             self._summary = ""
+            self._qa_history = []
+            self._audio_folder, self._audio_ready, self._audio_size = None, False, -1
+            self._audio_polls = 0
+            self.btn_audio.hide()
             self._title, self._attendees = title or "", attendees or ""
-            self.txt_now.setText("Listening…")
-            self.lbl_now_head.show()
-            self.txt_now.show()
             self.txt_summary.clear()
+            self.txt_summary.setPlaceholderText("Listening…")
             self.lbl_status.setText("")
         else:
-            self._restore_language()
-            self.lbl_status.setText("Stopped - suggestions use the final transcript.")
+            self._set_fast_chunks(False)
+            # The recording lands in the meeting folder moments after Stop;
+            # _on_tick shows Download audio once THIS session's part is fully
+            # written - a resumed meeting already has earlier parts, so count
+            # them now (the save worker hasn't started yet).
+            mw = getattr(self.app, "meetings_win", None) if self.app else None
+            self._audio_folder = getattr(mw, "_meeting_dir", None)
+            self._audio_base = len(self._audio_parts()) if self._audio_folder else 0
+            self._audio_polls, self._audio_size = 0, -1
+            self.lbl_status.setText("Stopped - saving the recording and the notes…")
         self._refresh_live_controls()
 
-    def feed_transcript(self, piece):
+    def discard_session_audio(self):
+        """The session was discarded: nothing to offer for download."""
+        self._audio_folder, self._audio_ready = None, False
+        self.btn_audio.hide()
+        self._set_status("Session discarded.")
+
+    def feed_transcript(self, piece, answer=True):
+        """A newly transcribed piece of the call. ``answer=False`` for bulk
+        catch-up text (a resumed meeting, opening mid-call) - old questions in
+        it must not trigger answers."""
         piece = (piece or "").strip()
         if not piece:
             return
         self._live_text = (self._live_text + " " + piece).strip()
         self._text_since_suggest += len(piece)
-        sentences = [s for s in re.split(r"(?<=[.!?])\s+", self._live_text) if s]
-        self.txt_now.setText(" ".join(sentences[-2:])[-260:])
-        if not self.txt_now.isVisible() and self._expanded:
-            self.lbl_now_head.show()
-            self.txt_now.show()
+        tail = self._live_text[-700:]
+        if len(self._live_text) > 700 and " " in tail:
+            tail = tail.split(" ", 1)[1]
+        self.txt_summary.setPlainText(tail)
+        sb = self.txt_summary.verticalScrollBar()
+        sb.setValue(sb.maximum())
+        # The companion part: someone just asked something - answer right away.
+        # Only while the overlay is on screen: a hidden overlay must never
+        # grab screenshots or send the call to an AI behind the user's back
+        # (it stays connected to every meeting once it has been opened).
+        if (answer and self._auto and self._meeting_active and self.isVisible()
+                and looks_like_question(piece)):
+            self.suggest("", auto=True)
 
     def set_summary(self, text):
+        # The meeting window's rolling recap isn't shown here: the overlay is
+        # for answers, and the live transcript beats a recap mid-call.
         self._summary = text or ""
-        lines = [ln for ln in self._summary.splitlines() if ln.strip()]
-        keep = [ln for ln in lines if not ln.lstrip().startswith("#")][:6]
-        self.txt_summary.setPlainText("\n".join(keep))
 
     # ── suggestions ──
     def _set_status(self, text):
@@ -1074,146 +1153,296 @@ class LiveAssistOverlay(QWidget):
         q = self.input_ask.text().strip()
         if q:
             self.suggest(q)
+            self._suggest_from_input = True   # clear the field once it's answered
 
-    def suggest(self, question=""):
-        if self._suggesting:
-            return
+    def _ask_or_answer(self):
+        # The Ask button: the typed question if there is one, else answer the
+        # latest question of the call.
+        if self.input_ask.text().strip():
+            self._ask()
+        else:
+            self.suggest("")
+
+    def suggest(self, question="", auto=False, force_screen=False):
+        """Answer now. A newer request supersedes one still streaming - the
+        freshest question is the one that matters in a live call."""
         if not self.app:
             self._on_suggestion("", "No app context.")
             return
-        auto_screen = self.btn_screen.isChecked()
+        if auto and ((self._suggesting and not getattr(self, "_suggest_auto", False))
+                     or time.time() < getattr(self, "_hold_until", 0.0)):
+            # The user asked for the answer on screen (typed, Solve screen,
+            # Follow-ups...): a question heard meanwhile waits its turn
+            # (_on_tick) instead of cutting that answer off or replacing it.
+            self._pending_auto = True
+            return
+        screen_on = self.btn_screen.isChecked()
         if not self._live_text.strip() and not question:
-            if auto_screen:
-                # Nothing said, nothing asked, Suggest pressed: the screen is
-                # the only context there is.
-                question = "Describe what is on my screen and what I should do next."
+            if screen_on:
+                # Nothing said yet: the screen is the only context there is.
+                question, force_screen = SOLVE_SCREEN, True
             else:
                 self.txt_suggestion.setPlainText(
-                    "Nothing has been said yet - press Start first, or ask a question.")
+                    "Nothing has been said yet - press Start, or type a question.")
                 return
         image_b64 = ""
-        if should_attach_screen(question, self._live_text, auto_screen):
-            image_b64 = capture_screen_png_b64(self.screen() or QApplication.primaryScreen())
+        # Privacy Mode is on-device only: answers come from a local, text-only
+        # model, so a screenshot could only ever leave via cloud OCR - none.
+        if should_attach_screen(screen_on, force_screen) and not self.app.cfg.get("privacy_mode"):
+            image_b64 = capture_screen_b64(screen_to_capture(self.screen()))
+        if force_screen and not image_b64:
+            # Asking a model to "solve the screen" without one only gets a
+            # confident, made-up answer.
+            self.txt_suggestion.setPlainText(
+                "Solve screen is off in Privacy Mode - the screen never leaves this "
+                "computer." if self.app.cfg.get("privacy_mode")
+                else "Couldn't capture the screen - try again.")
+            return
+        self._gen += 1
+        gen = self._gen
+        self._pending_auto = False
+        self._screen_note = ""                # this answer's screen status, if any
+        self._suggest_auto = auto
+        self._suggest_asked = bool(question)
+        self._suggest_from_input = False
+        self._suggest_question = question or last_question(self._live_text)
         self._last_attached_screen = bool(image_b64)
         self._suggesting = True
         self._suggest_started = time.time()
         self._first_token_at = 0.0
         self._text_since_suggest = 0
-        self.btn_suggest.setEnabled(False)
         self.txt_suggestion.setPlainText("Thinking…")
         context = rolling_context(
             self._live_text, question, self._title, self._attendees,
             screen=bool(image_b64),
-            output_lang=(self.app.cfg.get("live_assist_output_language") or "en"))
-        threading.Thread(target=self._suggest_worker, args=(context, image_b64),
+            output_lang=(self.app.cfg.get("live_assist_output_language") or "en"),
+            history=self._qa_history)
+        threading.Thread(target=self._suggest_worker, args=(context, image_b64, gen),
                          daemon=True).start()
 
     def _resolve_engine(self):
-        """Engine for suggestions: the configured notes engine with Pro routing;
-        if that engine can't run (managed without Pro, cloud without its key),
-        prefer a downloaded local model. Returns (None, cfg) when no REAL
-        engine can run - there is deliberately no rule-based fallback."""
+        """Engine for answers (see actions.live_engine): the Pro cloud for a Pro
+        user even if a small offline model is set for Smart Actions, a cloud
+        engine with its own key, else a downloaded local model. (None, cfg)
+        when no REAL engine can run - there is deliberately no rule-based
+        fallback."""
         engine, cfg = self.app._resolve_action_engine()
-        info = actions.ACTION_MODELS.get(engine, {})
-        kind = info.get("kind")
-        has_key = actions.engine_has_key(engine, self.app.cfg)
-        has_token = bool((cfg or {}).get("_managed_token"))
-        if engine == actions.RULE_BASED_ID or (kind == "cloud" and not has_key) \
-                or (kind == "managed" and not has_token):
-            try:
-                import local_llm
-                for mid in local_llm.MODEL_CATALOG:
-                    if local_llm.model_downloaded(mid):
-                        return mid, cfg
-            except Exception:
-                pass
-            return None, cfg
-        return engine, cfg
+        return actions.live_engine(engine, cfg), cfg
 
-    def _suggest_worker(self, context, image_b64):
+    def _suggest_worker(self, context, image_b64, gen):
         try:
             engine, cfg = self._resolve_engine()
             if engine is None:
-                self.sig_suggestion.emit("", actions.NO_ENGINE_MESSAGE)
+                self.sig_suggestion.emit("", actions.NO_ENGINE_MESSAGE, gen)
                 return
             kind = actions.ACTION_MODELS.get(engine, {}).get("kind")
             cfg = dict(cfg or {})
+            image_status = {}
             if image_b64 and kind in ("cloud", "managed"):
                 cfg["_image_png_b64"] = image_b64
+                cfg["_image_status"] = image_status   # set if the model refused it
             elif image_b64:
                 # Text-only engine (local model): read the screen with Mistral
-                # OCR when a Mistral key exists, so screen context still works.
-                mkey = (cfg.get("mistral_api_key") or "").strip()
+                # OCR when a Mistral key exists, so screen context still works -
+                # never in Privacy Mode (belt and braces: suggest() already
+                # doesn't capture then).
+                mkey = ("" if cfg.get("privacy_mode")
+                        else (cfg.get("mistral_api_key") or "").strip())
                 ocr = actions.action_api.mistral_ocr(image_b64, mkey) if mkey else ""
+                # The model gets no image: drop the note that says it does.
+                context = actions.action_api._SCREEN_NOTE.sub("", context)
+                self._last_attached_screen = bool(ocr)
                 if ocr:
-                    context += ("\n\nText visible on the user's screen (OCR):\n"
-                                + ocr[:3000])
-                    self.sig_status.emit("Screen read via OCR")
+                    screen = "Text visible on the user's screen (OCR):\n" + ocr[:3000]
+                    self._note_screen(gen, "Screen read via OCR")
                 else:
-                    self.sig_status.emit("Screen needs a cloud AI engine (Pro or your own "
-                                         "key) - answered from the transcript only.")
+                    screen = actions.action_api._NO_SCREEN_NOTE
+                    self._note_screen(gen, "Screen needs a cloud AI engine (Pro or your own "
+                                           "key) - answered from the transcript only.")
+                head, sep, question = context.rpartition("\n\nUser's question: ")
+                context = (f"{head}\n\n{screen}{sep}{question}" if sep
+                           else f"{context}\n\n{screen}")
             acc = []
             last_emit = [0.0]
 
             def on_token(delta):
-                acc.append(delta)
+                if gen != self._gen:
+                    raise _Superseded()           # a newer question took over
+                if isinstance(delta, actions.action_api.ReplaceText):
+                    acc[:] = [str(delta)]         # what streamed so far was reasoning
+                    last_emit[0] = 0.0
+                    # "First words" counts the answer, not the reasoning before it.
+                    self._first_token_at = time.time() if str(delta).strip() else 0.0
+                else:
+                    acc.append(delta)
+                    if not self._first_token_at and delta.strip():
+                        self._first_token_at = time.time()
                 now = time.time()
-                if now - last_emit[0] >= 0.08:      # ~12 UI updates/s is plenty
+                if now - last_emit[0] >= 0.05:      # ~20 UI updates/s
                     last_emit[0] = now
-                    self.sig_partial.emit("".join(acc))
+                    self.sig_partial.emit("".join(acc), gen)
 
             text = actions.process_stream(context, actions.ACTION_LIVE_ASSIST, on_token,
                                           model=engine, config=cfg)
-            self.sig_suggestion.emit((text or "".join(acc)).strip(), "")
-        except Exception as e:
-            self.sig_suggestion.emit("", str(e)[:240])
-
-    def _on_partial(self, text):
-        if not self._suggesting:
+            if image_status.get("dropped"):
+                # The engine can't read images: the answer came from the
+                # conversation alone - don't claim "screen seen".
+                self._last_attached_screen = False
+                self._note_screen(gen, "Screen not read - this AI engine can't see images; "
+                                       "answered from the conversation only.")
+            self.sig_suggestion.emit((text or "".join(acc)).strip(), "", gen)
+        except _Superseded:
             return
-        if not self._first_token_at:
-            self._first_token_at = time.time()
+        except Exception as e:
+            self.sig_suggestion.emit("", str(e)[:240], gen)
+
+    def _note_screen(self, gen, text):
+        """Worker thread: a screen status for answer ``gen`` only - it shows
+        in place of that answer's "Answered..." line and is gone with the next
+        question (an older, superseded worker changes nothing)."""
+        if gen != self._gen:
+            return
+        self._screen_note = text
+        self.sig_status.emit(text)
+
+    def _on_partial(self, text, gen=None):
+        if not self._suggesting or (gen is not None and gen != self._gen):
+            return
+        # (_first_token_at is set by the worker, from answer text only.)
         self.txt_suggestion.setPlainText(text)
         sb = self.txt_suggestion.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def _on_suggestion(self, text, error):
+    def _on_suggestion(self, text, error, gen=None):
+        if gen is not None and gen != self._gen:
+            return      # the answer to an older question - superseded
         self._suggesting = False
         self._last_suggest_at = time.time()
-        self.btn_suggest.setEnabled(True)
         took = time.time() - self._suggest_started if self._suggest_started else 0
+        if self.app:
+            self.app.track("live_prompter_suggestion", {
+                "ok": not error,
+                "auto": bool(getattr(self, "_suggest_auto", False)),
+                "asked": getattr(self, "_suggest_asked", False),
+                "screen": bool(getattr(self, "_last_attached_screen", False)),
+                "first_words_seconds": (round(self._first_token_at - self._suggest_started, 1)
+                                        if self._first_token_at else None),
+                "seconds": round(took, 1),
+            })
         if error:
-            self.txt_suggestion.setPlainText(f"Couldn't get a suggestion: {error}")
+            self.txt_suggestion.setPlainText(f"Couldn't get an answer: {error}")
             return
-        render_markdown(self.txt_suggestion, text.strip() or "(no suggestion)")
-        if not self.lbl_status.text().startswith("Screen"):
+        render_markdown(self.txt_suggestion, text.strip() or "(no answer)")
+        if text.strip():
+            self._qa_history = (self._qa_history
+                                + [(getattr(self, "_suggest_question", ""), text.strip())]
+                                )[-HISTORY_TURNS:]
+            if not getattr(self, "_suggest_auto", False):
+                # Give the user time to read what they asked for before an
+                # automatic answer may replace it.
+                self._hold_until = time.time() + USER_ANSWER_HOLD_S
+        note = getattr(self, "_screen_note", "")
+        if note:
+            self.lbl_status.setText(note)
+        else:
             first = (f"first words {self._first_token_at - self._suggest_started:.1f}s · "
                      if self._first_token_at else "")
-            shot = "screen attached · " if getattr(self, "_last_attached_screen", False) else ""
+            shot = "screen seen · " if getattr(self, "_last_attached_screen", False) else ""
             self.lbl_status.setText(
-                f"Updated {time.strftime('%H:%M:%S')} · {first}done {took:.1f}s · {shot}"
+                f"Answered {time.strftime('%H:%M:%S')} · {first}done {took:.1f}s · {shot}"
                 "AI can be wrong - check facts")
-        self.input_ask.clear()
+        if getattr(self, "_suggest_from_input", False):
+            self.input_ask.clear()
 
     def _on_auto_toggled(self, on):
         self._auto = bool(on)
         if self.app:
-            self.app.cfg["live_assist_auto"] = self._auto
+            self.app.cfg["live_assist_auto_answer"] = self._auto
             self.app.save_config()
+
+    def _set_screen_tooltip(self, on):
+        self.btn_screen.setToolTip(
+            "Screen context: On. Every answer sees the screen you're working on "
+            "(this card left out), so a question, task or error on it gets solved. "
+            "Needs an AI engine that can read images. Click to turn off." if on else
+            "Screen context: Off. Answers never see your screen - except when you "
+            "press Solve screen. Click to turn on.")
 
     def _on_screen_toggled(self, on):
         self.btn_screen.update()
-        self.btn_screen.setToolTip(
-            "Screen context: Auto. A screenshot of your screen (this card left out) is "
-            "attached when you or the other side refer to what's on screen. Needs a "
-            "cloud AI engine. Click to turn off." if on else
-            "Screen context: Off. Suggestions never see your screen. Click for Auto.")
+        self._set_screen_tooltip(on)
         self._richify_tooltips()
         if self.app:
             self.app.cfg["live_assist_screen_auto"] = bool(on)
             self.app.save_config()
 
+    # ── the session's recording ──
+    def _audio_parts(self):
+        try:
+            import meeting_store
+            return meeting_store.audio_parts(self._audio_folder)
+        except Exception:
+            return []
+
+    def _check_audio_ready(self):
+        """Show Download audio once THIS session's recording is on disk and
+        has stopped growing (it's written right after Stop). Gives up after a
+        couple of minutes - a session too short to save writes nothing."""
+        try:
+            parts = self._audio_parts()
+            if len(parts) <= getattr(self, "_audio_base", 0):
+                self._audio_polls = getattr(self, "_audio_polls", 0) + 1
+                if self._audio_polls > 150:
+                    self._audio_folder = None
+                return
+            size = sum(p.stat().st_size for p in parts)
+        except Exception:
+            self._audio_folder = None
+            return
+        if size and size == getattr(self, "_audio_size", -1):
+            self._audio_ready = True
+            self.btn_audio.show()
+        self._audio_size = size
+
+    def _save_audio(self):
+        import meeting_store
+        from ui.meeting_detail import recording_save_path
+        parts = meeting_store.audio_parts(self._audio_folder) if self._audio_folder else []
+        if not parts:
+            self._set_status("No recording found for this session.")
+            return
+        path = recording_save_path(self, "Live session " + time.strftime("%Y-%m-%d %H-%M"))
+        if not path:
+            return
+        self.btn_audio.setEnabled(False)
+        self._set_status("Saving the recording…")
+
+        def _worker():
+            try:
+                import audio_export
+                out = audio_export.export_recording(parts, path)
+                self.sig_export_done.emit(str(out) if out else "", "" if out else "Nothing to export")
+            except Exception as e:
+                self.sig_export_done.emit("", str(e)[:200])
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_export_done(self, path, error):
+        self.btn_audio.setEnabled(True)
+        if error:
+            self._set_status(f"Couldn't save the recording: {error}")
+            return
+        import os
+        self._set_status(f"Recording saved: {os.path.basename(path)}")
+        if self.app:
+            self.app.track("meeting_exported", {"target": "audio", "ok": True})
+
     def _on_tick(self):
+        if (getattr(self, "_pending_auto", False) and not self._suggesting
+                and time.time() >= getattr(self, "_hold_until", 0.0)):
+            self._pending_auto = False
+            if self._auto and self._meeting_active and self.isVisible():
+                self.suggest("", auto=True)
         # Watchdog: Qt can recreate the native window (flag/parent changes)
         # and the exclusion lives on the HWND - re-apply if it went missing.
         if (self._private and self.isVisible() and glass.capture_exclusion_supported()
@@ -1222,12 +1451,14 @@ class LiveAssistOverlay(QWidget):
             self._apply_glass()
         if self._meeting_active:
             self._update_timer()
+        if self._audio_folder and not self._audio_ready:
+            self._check_audio_ready()
         if self._suggesting:
             el = int(time.time() - self._suggest_started)
-            if el >= 3 and not self._first_token_at:
+            if el >= 8 and not self._first_token_at:
+                # A scale-to-zero model endpoint booting after a pause.
+                self.txt_suggestion.setPlainText(
+                    f"Waking up the AI model… {el}s (only the first answer after a "
+                    "pause is slow)")
+            elif el >= 3 and not self._first_token_at:
                 self.txt_suggestion.setPlainText(f"Thinking… {el}s")
-            return
-        if (self._auto and self._meeting_active and self.isVisible()
-                and self._text_since_suggest > 120
-                and time.time() - self._last_suggest_at >= AUTO_SUGGEST_EVERY_SEC):
-            self.suggest("")
