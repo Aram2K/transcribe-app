@@ -303,6 +303,8 @@ class TestConfig(unittest.TestCase):
             c = load_config()
             self.assertEqual(c["whisper_model"], "large-v3")
             self.assertEqual(c["language"], DEFAULT["language"])
+            # Existing configs without the key get the adaptive HUD glass.
+            self.assertEqual(c["overlay_theme"], "auto")
         finally:
             m.CONFIG_PATH = orig
 

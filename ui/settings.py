@@ -193,7 +193,7 @@ class Settings(QDialog):
     _BACKGROUND_KEYS = frozenset((
         "secrets_owner", "user_secrets", "last_known_pro", "known_emails",
         "last_signin_email", "pending_update_version", "account_gate_seen",
-        "onboarding_done",
+        "onboarding_done", "overlay_pos",     # the HUD saves it when dragged
     ))
 
     def _staged_settings(self):
@@ -3721,7 +3721,7 @@ class Settings(QDialog):
         self._acct_perks = QLabel(
             "<div style='font-size:11px; line-height:150%;'>"
             "<b>Transcribe Pro</b> includes:<br>"
-            "<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; <b>Unlimited Smart Actions</b> - rewrite, translate, summarize and draft emails by voice<br>"
+            "<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; <b>Unlimited Smart Actions</b> (fair use) - rewrite, translate, summarize and draft emails by voice<br>"
             "<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; <b>Smart meeting recording</b> with AI-generated notes and summaries<br>"
             "<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; <b>Fast cloud transcription</b> - no setup, no API key, no timeouts<br>"
             "<span style='color:#a855f7;font-weight:800'>&#10003;</span>&nbsp; <b>Priority access</b> to new models, plus direct support"

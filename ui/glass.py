@@ -17,6 +17,7 @@ market it otherwise.
 import ctypes
 import logging
 import sys
+import threading
 
 logger = logging.getLogger("transcribe")
 
@@ -275,3 +276,229 @@ def set_click_through(widget, enabled=True):
 
 def capture_exclusion_supported():
     return IS_WINDOWS and windows_build() >= 19041
+
+
+# Private user32/gdi32 handles for the helpers below, so their argtypes/restype
+# never leak into other callers of the shared ctypes.windll.* - and set up
+# under a lock, because the dictation HUD samples the screen from a worker.
+_u32 = None
+_gdi = None
+_dll_lock = threading.Lock()
+SPI_GETCLIENTAREAANIMATION = 0x1042
+MONITOR_DEFAULTTONEAREST = 2
+SM_SWAPBUTTON = 23
+WS_EX_NOACTIVATE = 0x08000000
+
+
+class _MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", ctypes.c_long * 4),
+                ("rcWork", ctypes.c_long * 4), ("dwFlags", ctypes.c_ulong),
+                ("szDevice", ctypes.c_wchar * 32)]
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
+                ("biHeight", ctypes.c_int32), ("biPlanes", ctypes.c_uint16),
+                ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+                ("biSizeImage", ctypes.c_uint32), ("biXPelsPerMeter", ctypes.c_int32),
+                ("biYPelsPerMeter", ctypes.c_int32), ("biClrUsed", ctypes.c_uint32),
+                ("biClrImportant", ctypes.c_uint32)]
+
+
+class _BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", _BITMAPINFOHEADER), ("bmiColors", ctypes.c_uint32 * 3)]
+
+
+def _private_user32():
+    global _u32
+    with _dll_lock:
+        if _u32 is None:
+            u = ctypes.WinDLL("user32")
+            vp = ctypes.c_void_p
+            u.GetForegroundWindow.restype = vp
+            u.MonitorFromWindow.argtypes = [vp, ctypes.c_uint]
+            u.MonitorFromWindow.restype = vp
+            u.GetMonitorInfoW.argtypes = [vp, vp]
+            u.GetMonitorInfoW.restype = ctypes.c_int
+            u.SystemParametersInfoW.argtypes = [ctypes.c_uint, ctypes.c_uint, vp, ctypes.c_uint]
+            u.SystemParametersInfoW.restype = ctypes.c_int
+            u.GetDC.argtypes = [vp]
+            u.GetDC.restype = vp
+            u.ReleaseDC.argtypes = [vp, vp]
+            u.ReleaseDC.restype = ctypes.c_int
+            u.GetWindowRect.argtypes = [vp, ctypes.POINTER(ctypes.c_long * 4)]
+            u.GetWindowRect.restype = ctypes.c_int
+            u.GetAsyncKeyState.argtypes = [ctypes.c_int]
+            u.GetAsyncKeyState.restype = ctypes.c_short
+            u.GetSystemMetrics.argtypes = [ctypes.c_int]
+            u.GetSystemMetrics.restype = ctypes.c_int
+            _u32 = u
+    return _u32
+
+
+def _private_gdi32():
+    global _gdi
+    with _dll_lock:
+        if _gdi is None:
+            g = ctypes.WinDLL("gdi32")
+            vp = ctypes.c_void_p
+            g.CreateCompatibleDC.argtypes = [vp]
+            g.CreateCompatibleDC.restype = vp
+            g.CreateDIBSection.argtypes = [vp, vp, ctypes.c_uint, ctypes.POINTER(vp), vp,
+                                           ctypes.c_uint32]
+            g.CreateDIBSection.restype = vp
+            g.SelectObject.argtypes = [vp, vp]
+            g.SelectObject.restype = vp
+            g.BitBlt.argtypes = [vp, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                 vp, ctypes.c_int, ctypes.c_int, ctypes.c_uint32]
+            g.BitBlt.restype = ctypes.c_int
+            g.DeleteObject.argtypes = [vp]
+            g.DeleteObject.restype = ctypes.c_int
+            g.DeleteDC.argtypes = [vp]
+            g.DeleteDC.restype = ctypes.c_int
+            g.GdiFlush.restype = ctypes.c_int
+            _gdi = g
+    return _gdi
+
+
+def window_rect(widget_or_hwnd):
+    """(left, top, right, bottom) of a window in physical screen pixels, or
+    None. Any thread."""
+    if not IS_WINDOWS:
+        return None
+    hwnd = widget_or_hwnd if isinstance(widget_or_hwnd, int) else _hwnd(widget_or_hwnd)
+    if not hwnd:
+        return None
+    try:
+        r = (ctypes.c_long * 4)()
+        if _private_user32().GetWindowRect(hwnd, ctypes.byref(r)):
+            return tuple(r)
+    except Exception:
+        pass
+    return None
+
+
+def grab_screen(x, y, w, h):
+    """Top-down BGRX bytes of a physical-pixel screen rect (GDI BitBlt), or
+    None. Safe on a worker thread - a grab waits for the next DWM frame, so it
+    must not run on the GUI thread in a loop. Like every capture API it leaves
+    out windows excluded with WDA_EXCLUDEFROMCAPTURE."""
+    if not IS_WINDOWS or w <= 0 or h <= 0:
+        return None
+    try:
+        u, g = _private_user32(), _private_gdi32()
+    except Exception:
+        return None
+    sdc = u.GetDC(None)
+    if not sdc:
+        return None
+    mdc = bmp = old = None
+    try:
+        mdc = g.CreateCompatibleDC(sdc)
+        info = _BITMAPINFO()
+        info.bmiHeader = _BITMAPINFOHEADER(ctypes.sizeof(_BITMAPINFOHEADER), w, -h, 1, 32,
+                                           0, 0, 0, 0, 0, 0)       # BI_RGB, top-down
+        bits = ctypes.c_void_p()
+        bmp = g.CreateDIBSection(sdc, ctypes.byref(info), 0, ctypes.byref(bits), None, 0)
+        if not mdc or not bmp or not bits.value:
+            return None
+        old = g.SelectObject(mdc, bmp)
+        if not g.BitBlt(mdc, 0, 0, w, h, sdc, x, y, 0x00CC0020):   # SRCCOPY
+            return None
+        g.GdiFlush()
+        return ctypes.string_at(bits.value, w * h * 4)
+    except Exception as e:
+        logger.debug("grab_screen: %s", e)
+        return None
+    finally:
+        if old:
+            g.SelectObject(mdc, old)
+        if bmp:
+            g.DeleteObject(bmp)
+        if mdc:
+            g.DeleteDC(mdc)
+        u.ReleaseDC(None, sdc)
+
+
+def primary_button_down():
+    """Whether the primary mouse button is held right now - the physical
+    state, so it also catches a release that happened outside our window.
+    Honours swapped buttons. False off Windows."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        u = _private_user32()
+        vk = 0x02 if u.GetSystemMetrics(SM_SWAPBUTTON) else 0x01    # VK_RBUTTON / VK_LBUTTON
+        return bool(u.GetAsyncKeyState(vk) & 0x8000)
+    except Exception:
+        return False
+
+
+def set_no_activate(widget, enabled=True):
+    """WS_EX_NOACTIVATE: clicking or dragging the window never activates it,
+    so the app the user is typing in keeps focus. Returns True on success."""
+    if not IS_WINDOWS:
+        return False
+    hwnd = _hwnd(widget)
+    if not hwnd:
+        return False
+    try:
+        ex = _get_exstyle(hwnd)
+        ex = (ex | WS_EX_NOACTIVATE) if enabled else (ex & ~WS_EX_NOACTIVATE)
+        _set_exstyle(hwnd, ex)
+        return bool(_get_exstyle(hwnd) & WS_EX_NOACTIVATE) == enabled
+    except Exception as e:
+        logger.warning("set_no_activate: %s", e)
+        return False
+
+
+def animations_enabled():
+    """False when the user switched off Windows "Animation effects"
+    (Settings > Accessibility > Visual effects): decorative motion should stop.
+    True off Windows or when the setting can't be read."""
+    if not IS_WINDOWS:
+        return True
+    try:
+        val = ctypes.c_int(1)
+        if _private_user32().SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0,
+                                                   ctypes.byref(val), 0):
+            return bool(val.value)
+    except Exception:
+        pass
+    return True
+
+
+def transparency_enabled():
+    """False when the user switched off Windows "Transparency effects"
+    (Settings > Personalization > Colors): see-through surfaces should turn
+    solid. True off Windows or when the setting can't be read."""
+    if not IS_WINDOWS:
+        return True
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            return bool(winreg.QueryValueEx(k, "EnableTransparency")[0])
+    except Exception:
+        return True
+
+
+def foreground_monitor_name():
+    """Device name (e.g. \\\\.\\DISPLAY2) of the monitor showing the foreground
+    window - where the user is typing - or "" when unknown. Equals
+    QScreen.name() for that monitor on Windows."""
+    if not IS_WINDOWS:
+        return ""
+    try:
+        u = _private_user32()
+        hwnd = u.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        mon = u.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        info = _MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(info)
+        if mon and u.GetMonitorInfoW(mon, ctypes.byref(info)):
+            return info.szDevice
+    except Exception:
+        pass
+    return ""

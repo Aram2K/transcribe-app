@@ -48,12 +48,16 @@ APP_VERSION = "1.9.1"
 MANAGED_PROXY_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/transcribe-proxy"
 FEEDBACK_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/submit-feedback"
 DELETE_ACCOUNT_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/delete-account"
+BILLING_PORTAL_URL = "https://hftcelxzfoubheqeoool.supabase.co/functions/v1/billing-portal"
+SUPPORT_EMAIL = "aibuben.xyz@gmail.com"
 
 # ── Monetization links (Stripe) ───────────────────────────────────────────────
 PRO_MONTHLY_URL = "https://buy.stripe.com/3cI5kC30N1oeari7rh0Ba00"
 PRO_ANNUAL_URL  = "https://buy.stripe.com/fZuaEW0SF4Aq1UMh1R0Ba01"
-# Set this to your Stripe Customer Portal link (Billing → Customer portal) so Pro
-# users can self-manage their subscription. Left blank until configured.
+# "Manage subscription" opens the Stripe Customer Portal already signed in via
+# the billing-portal function. This is Stripe's no-code login link (Settings →
+# Billing → Customer portal → Login link) - the fallback for an account the
+# function can't match to a Stripe customer. Blank while that link is off.
 STRIPE_PORTAL_URL = ""
 PROJECT_GITHUB_URL = "https://github.com/Aram2K/transcribe-app"
 RELEASES_URL = "https://github.com/Aram2K/transcribe-app/releases/latest"
@@ -147,6 +151,13 @@ DEFAULT = {
     "live_assist_language": "en",         # transcription language for prompter sessions
     "live_assist_output_language": "en",  # language of the suggestions
     "live_assist_screen_auto": True,      # attach a screenshot when the talk refers to the screen
+    # Dictation HUD glass (ui/overlay.py): "auto" adapts to what is behind it
+    # (light over bright content, dark over dark), or pin "dark" / "light".
+    "overlay_theme": "auto",
+    # Keep the HUD out of screen shares and recordings. Its live glass needs
+    # this (it samples what is behind it); off, it paints a smoked plate.
+    "overlay_private": True,
+    "overlay_pos": None,                  # where the user dragged the HUD
     # Bumped when the config shape changes in a way that needs migration.
     "config_schema_version": 1,
 }
@@ -442,6 +453,38 @@ def cloud_error_message(provider, status, body_text):
     if status == 400:
         return f"{provider} rejected the request: {msg[:90]}" if msg else f"{provider}: bad request."
     return (f"{provider} error (HTTP {status}). {msg[:90]}").strip()
+
+
+def billing_portal_session(token, post=None):
+    """(url, problem) for the signed-in user's Stripe Customer Portal, from the
+    billing-portal function. ``problem`` is "" on success, else "signed_out",
+    "no_customer" (no Stripe customer for this account) or "unavailable"."""
+    if not token:
+        return None, "signed_out"
+    if post is None:
+        import requests
+        post = requests.post
+    try:
+        resp = post(BILLING_PORTAL_URL, json={},
+                    headers={"Authorization": f"Bearer {token}"}, timeout=20)
+    except Exception as e:
+        logger.warning("Billing portal unreachable: %s", e)
+        return None, "unavailable"
+    if resp.status_code == 200:
+        try:
+            url = (resp.json() or {}).get("url") or ""
+        except ValueError:
+            url = ""
+        # Only ever open Stripe's own portal from this response.
+        if url.startswith("https://billing.stripe.com/"):
+            return url, ""
+        return None, "unavailable"
+    if resp.status_code == 401:
+        return None, "signed_out"
+    if resp.status_code == 404:
+        return None, "no_customer"
+    logger.warning("Billing portal HTTP %s: %s", resp.status_code, (resp.text or "")[:200])
+    return None, "unavailable"
 
 
 def model_ok(name):
@@ -2394,14 +2437,41 @@ class AppController(QObject):
         threading.Thread(target=self.auth.sign_out, daemon=True).start()
 
     def open_billing(self):
-        if STRIPE_PORTAL_URL:
-            webbrowser.open(STRIPE_PORTAL_URL)
+        """Settings → Account → Manage subscription (and the tray): the Stripe
+        Customer Portal, already signed in - cancel (a trial is then never
+        charged), change the card, download invoices."""
+        if not self.auth.is_authenticated:
+            self.show_auth_gate()
+            return
+        if getattr(self, "_billing_busy", False):
+            return                              # a click is already on its way
+        self._billing_busy = True
+        threading.Thread(target=self._open_billing_worker, daemon=True).start()
+
+    def _open_billing_worker(self):
+        try:
+            url, problem = billing_portal_session(self.auth.get_access_token())
+            if not url and problem != "signed_out" and STRIPE_PORTAL_URL:
+                url = STRIPE_PORTAL_URL         # Stripe's email-code login instead
+            if url:
+                webbrowser.open(url)
+            else:
+                self.overlay.call_soon(self._billing_problem, problem)
+        finally:
+            self._billing_busy = False
+
+    def _billing_problem(self, problem):
+        if problem == "signed_out":
+            text = "Your session expired. Sign in again, then open Manage subscription."
+        elif problem == "no_customer":
+            who = self.auth.user_email or "this account"
+            text = (f"There's no Stripe subscription linked to {who}.\n\n"
+                    "If you subscribed with a different email, sign in with that one - "
+                    f"or write to {SUPPORT_EMAIL} and we'll sort it out.")
         else:
-            self.show_tray_hint(
-                "Manage subscription",
-                "Use the 'Manage subscription' link in your Stripe receipt email "
-                "(Customer Portal not configured yet)."
-            )
+            text = ("Couldn't open your subscription page right now. Check your connection "
+                    f"and try again, or write to {SUPPORT_EMAIL}.")
+        QMessageBox.information(None, "Manage subscription", text)
 
     def set_privacy_mode(self, on, notify=True):
         """Apply Privacy Mode globally and immediately. Privacy forces everything

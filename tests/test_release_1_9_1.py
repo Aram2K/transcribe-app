@@ -57,7 +57,8 @@ class TestSettingsWriteBack(unittest.TestCase):
         me = SimpleNamespace(_BACKGROUND_KEYS=Settings._BACKGROUND_KEYS, cfg_working={
             "whisper_model": "large-v3", "secrets_owner": "user:X", "user_secrets": {},
             "last_known_pro": {"X": False}, "pending_update_version": "v1.9.2",
-            "live_assist_auto_answer": False, "known_emails": ["a@b.c"]})
+            "live_assist_auto_answer": False, "known_emails": ["a@b.c"],
+            "overlay_pos": [10, 20]})
         self.assertEqual(Settings._staged_settings(me), {"whisper_model": "large-v3"})
 
     def test_auto_answer_uses_a_new_key(self):

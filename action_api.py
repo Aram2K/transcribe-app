@@ -516,7 +516,8 @@ def _raise_for_managed_status(resp):
     if resp.status_code == 403:
         raise ActionAPIError("Pro is required for managed Smart Actions.")
     if resp.status_code == 429:
-        raise ActionAPIError("Daily Smart Actions limit reached - try again tomorrow.")
+        raise ActionAPIError("Daily fair-use limit reached (1,000 Smart Actions a day). "
+                             "It resets at midnight UTC.")
     if resp.status_code == 503:
         raise ActionAPIError("Managed Smart Actions aren't set up on the server yet.")
 
