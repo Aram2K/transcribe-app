@@ -46,7 +46,7 @@ It was built especially for **Armenian speakers** who need accurate, native-scri
 | 🔒 **Fully offline** | Local Whisper AI and Qwen/Gemma action summaries offline |
 | ☁️ **Google Cloud option** | Best accuracy for Armenian via Speech-to-Text API |
 | ⚡ **Streaming results** | Background chunks transcribed while you speak |
-| 📊 **Waveform overlay** | Premium floating visualizer overlay |
+| 📊 **Dictation pill** | Liquid-glass pill with a live waveform - drag it anywhere, never steals focus |
 | 🕘 **History log** | Searchable list of all past transcriptions |
 | ⚙️ **Settings panel** | Staged transactional settings (Save &amp; Cancel) with dynamic provider model isolation and real-world 2026 token pricing display |
 | 📝 **Custom vocabulary** | Seed recognition with names or domain terms |
