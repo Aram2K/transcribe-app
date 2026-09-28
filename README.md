@@ -42,6 +42,7 @@ It was built especially for **Armenian speakers** who need accurate, native-scri
 | 🎧 **Record meetings** | System audio + mic, speaker labels, AI notes with action items, Notion export, resumable sessions, MP3/WAV recordings |
 | 📄 **Transcribe Files** | Drop any audio/video file → a Word document with speaker labels and timestamps |
 | 📋 **Smart paste** | Auto-pastes at your cursor; falls back to clipboard |
+| 🗣 **Mixed languages** | Switch languages mid-sentence - every word stays in the language and alphabet you spoke it in |
 | 🌐 **Armenian-first** | Optimized offline models with Armenian Flag Tricolor branding and native AIBUBEN Yerevan AI Community integration |
 | 🔒 **Fully offline** | Local Whisper AI and Qwen/Gemma action summaries offline |
 | ☁️ **Google Cloud option** | Best accuracy for Armenian via Speech-to-Text API |
@@ -136,8 +137,10 @@ While a meeting is being recorded (or straight from the tray / **Ctrl+Alt+A**), 
 - **NOW** shows the last thing said; **SO FAR** a running AI summary.
 - **A companion, not a summary**: when someone asks you something, the answer starts streaming on its own; **Answer / Follow-ups / Solve screen** or any typed question work any time. Answers are formatted (bold key phrases, bullets, code blocks).
 - **Screen context**: with **Screen** on, every answer sees the screen under your cursor - the card itself is never in the screenshot.
+- **Session context**: **+ Add context** tells it what the call is about (who you are, who you're talking to, what you want); it's locked in for the session and shapes every answer.
+- **Images**: snip part of your screen (the snipping screen is hidden from screen sharing on Windows) or paste one with Ctrl+V - it goes with your next question.
 - **Engine**: Pro answers come from DeepSeek V4.1 Flash on a Modal endpoint (vision, thinking off for speed), with Gemini Flash and Mistral as automatic fallbacks. Your own Cerebras / OpenAI-compatible / Gemini key works too.
-- **Private**: the card is excluded from screen sharing and recordings on Windows 10 2004+, and the eye badge always reports the real state (it says so when the OS can't guarantee it - e.g. Remote Desktop, macOS).
+- **Private**: the card is excluded from screen sharing and recordings on Windows 10 2004+ and macOS 14 and earlier, and the eye badge always reports the real state (it says so when the OS can't guarantee it - e.g. Remote Desktop, or macOS 15+, where sharing a single window keeps the card out).
 
 It is a privacy feature for your own notes during calls; recording-consent guidance applies, and it is not intended for interviews, exams or assessments where assistance is prohibited.
 
