@@ -623,9 +623,12 @@ class MeetingsWindow(QDialog):
         self._stage_pick("action_model", self.combo_action.currentData())
 
     # ── State Machine Triggers ──
-    def _start_meeting(self, language=None, *, resume=False):
+    def _start_meeting(self, language=None, *, resume=False, audio_mode=None):
         """``language``: this session's transcription language (Live
         Assistance passes its own) - never written to the saved settings.
+        ``audio_mode``: this session's capture mode, when this system can
+        capture it (Live Assistance asks for mic + system sound) - the saved
+        Record Meeting choice stays as it is.
         ``resume``: set only by resume_meeting; every other Start is a NEW
         meeting."""
         if not self.app or not self.app.recorder:
@@ -684,6 +687,9 @@ class MeetingsWindow(QDialog):
         # from the config only when the saved mode can't be captured here.
         meeting_mode = self.combo_device.currentData()
         self._stage_pick("meeting_audio_mode", meeting_mode)
+        if audio_mode and self.combo_device.findData(audio_mode) >= 0:
+            meeting_mode = audio_mode
+        self._session_audio_mode = meeting_mode
 
         # Build local timestamp folder for auto-save recovery (a resumed
         # meeting keeps writing into its original folder).
@@ -858,7 +864,8 @@ class MeetingsWindow(QDialog):
         h, m = divmod(m, 60)
         dur_str = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-        mode = self.app.cfg.get("meeting_audio_mode", "") if self.app else ""
+        mode = getattr(self, "_session_audio_mode", "") or (
+            self.app.cfg.get("meeting_audio_mode", "") if self.app else "")
         mode_label = {
             "smart_meeting": "Mic + System audio",
             "system_only": "System audio only (no mic)",
@@ -1102,7 +1109,8 @@ class MeetingsWindow(QDialog):
                 # In a system-audio mode, a dead-silent loopback means the
                 # sound the user heard was playing on a DIFFERENT output
                 # device than the Windows default - tell them exactly that.
-                mode = self.app.cfg.get("meeting_audio_mode", "")
+                mode = (getattr(self, "_session_audio_mode", "")
+                        or self.app.cfg.get("meeting_audio_mode", ""))
                 loop_peak = float(getattr(self.app.recorder, "_loopback_peak", 0.0) or 0.0)
                 if mode in ("smart_meeting", "system_only") and loop_peak < 0.01:
                     msg = ("No system audio reached the recorder - the sound you "

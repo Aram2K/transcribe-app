@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QFileDialog,
 )
 from PySide6.QtGui import QFont, QColor, QIcon
+import hotkeys
+import speech_langs
 import local_llm
 import history as hist
 import telemetry
@@ -216,7 +218,7 @@ class Settings(QDialog):
     # (privacy_mode, save_history) stay in sync in both dicts, so they never
     # show as dirty here either.
     _DIRTY_KEYS = (
-        "hotkey", "language", "initial_prompt", "meeting_audio_mode",
+        "hotkey", "language", "mix_languages", "initial_prompt", "meeting_audio_mode",
         "output_action", "backend", "managed_provider", "mistral_stt_model",
         "whisper_model", "action_model", "analytics_enabled",
         "action_api_provider", "action_api_base_url", "action_api_model",
@@ -499,6 +501,7 @@ class Settings(QDialog):
             self.combo_lang.blockSignals(True)
             self.combo_lang.setCurrentIndex(idx)
             self.combo_lang.blockSignals(False)
+        self._load_mix_checks()
             
         # 3. Custom Vocab - the structured term list, falling back to a legacy
         # free-text prompt from an older build.
@@ -714,7 +717,7 @@ class Settings(QDialog):
         hk_lay = QVBoxLayout(hotkey_frame)
         hk_lay.addWidget(QLabel("Dictation Hotkey", hotkey_frame))
         
-        self.btn_hotkey = QPushButton(self.cfg_working.get("hotkey", "alt+r").upper() if self.app else "ALT+R", hotkey_frame)
+        self.btn_hotkey = QPushButton(hotkeys.display(self.cfg_working.get("hotkey", "alt+r") if self.app else "alt+r").upper(), hotkey_frame)
         self.btn_hotkey.clicked.connect(self._toggle_capture)
         self.btn_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; border-color: #3b82f6;")
         hk_lay.addWidget(self.btn_hotkey)
@@ -778,8 +781,31 @@ class Settings(QDialog):
             if idx >= 0:
                 self.combo_lang.setCurrentIndex(idx)
         self.combo_lang.currentIndexChanged.connect(self._save_general_configs)
+        self.combo_lang.currentIndexChanged.connect(self._update_mix_row)
         self._configure_dropdown(self.combo_lang, show_all_items=True)
         lang_lay.addWidget(self.combo_lang)
+
+        # Mixed languages: the ones you switch between, even mid-sentence.
+        self.mix_row = QWidget(lang_frame)
+        mix_grid = QGridLayout(self.mix_row)
+        mix_grid.setContentsMargins(0, 6, 0, 0)
+        mix_grid.setHorizontalSpacing(14)
+        mix_grid.addWidget(QLabel("Languages you mix:", self.mix_row), 0, 0, 1, 4)
+        self.mix_checks = {}
+        for i, (code, name) in enumerate(speech_langs.NAMES.items()):
+            cb = QCheckBox(name, self.mix_row)
+            cb.toggled.connect(lambda on, c=code: self._on_mix_toggled(c, on))
+            self.mix_checks[code] = cb
+            mix_grid.addWidget(cb, 1 + i // 4, i % 4)
+        lang_lay.addWidget(self.mix_row)
+        self.mix_hint = QLabel(
+            "Tick two or more and every word stays in the language you spoke it in, in its "
+            "own script. None ticked: any language. Works best with Pro cloud or a Gemini "
+            "key.", lang_frame)
+        self.mix_hint.setObjectName("subtitleLabel")
+        self.mix_hint.setWordWrap(True)
+        lang_lay.addWidget(self.mix_hint)
+        self._load_mix_checks()
         layout.addWidget(lang_frame)
 
         # Custom Vocabulary - names/jargon the recognizer keeps getting wrong.
@@ -2906,6 +2932,30 @@ class Settings(QDialog):
                 out.append({"from": src, "to": dst})
         return out
 
+    def _load_mix_checks(self):
+        if not hasattr(self, "mix_checks"):
+            return
+        picked = speech_langs.saved_mix(self.cfg_working if self.app else {})
+        for code, cb in self.mix_checks.items():
+            cb.blockSignals(True)
+            cb.setChecked(code in picked)
+            cb.blockSignals(False)
+        self._update_mix_row()
+
+    def _update_mix_row(self, *_):
+        if not hasattr(self, "mix_row"):
+            return
+        mixed = self.combo_lang.currentData() == "multi"
+        self.mix_row.setVisible(mixed)
+        self.mix_hint.setVisible(mixed)
+
+    def _on_mix_toggled(self, code, on):
+        # Saved as ticked; it takes effect from two languages (speech_langs).
+        picked = [c for c, cb in self.mix_checks.items() if cb.isChecked()]
+        if self.app:
+            self.cfg_working["mix_languages"] = picked
+            self._refresh_dirty()
+
     def _save_general_configs(self):
         if not self.app:
             return
@@ -4599,7 +4649,7 @@ class Settings(QDialog):
         # Disarm the dictation button if it was waiting.
         if self.capturing:
             self.capturing = False
-            self.btn_hotkey.setText(self.cfg_working.get("hotkey", "alt+r").upper() if self.app else "ALT+R")
+            self.btn_hotkey.setText(self._fmt_hotkey(None, self.cfg_working.get("hotkey", "alt+r") if self.app else "alt+r").upper())
             self.btn_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; border-color: #3b82f6;")
         self._capture_target = "prompter"
         self.capturing = True
@@ -4649,7 +4699,7 @@ class Settings(QDialog):
     def _toggle_capture(self):
         if self.capturing and getattr(self, "_capture_target", "dictation") == "dictation":
             self.capturing = False
-            self.btn_hotkey.setText(self.cfg_working.get("hotkey", "alt+r").upper() if self.app else "ALT+R")
+            self.btn_hotkey.setText(self._fmt_hotkey(None, self.cfg_working.get("hotkey", "alt+r") if self.app else "alt+r").upper())
             self.btn_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; border-color: #3b82f6;")
         else:
             self._reset_lp_capture_button()
@@ -4659,75 +4709,35 @@ class Settings(QDialog):
             self.btn_hotkey.setStyleSheet("font-weight: bold; min-height: 36px; border-color: #ef4444; color: #ef4444;")
             self.setFocus() # Pull focus away so keyPressEvent captures keypresses
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            if not self.capturing:
-                event.ignore()
-                return
+    def event(self, e):
+        # While a hotkey is being captured, key combinations must reach
+        # keyPressEvent instead of firing shortcuts - on a Mac ⌘Q, ⌘W or ⌘H
+        # would otherwise quit, close or hide the app mid-capture.
+        if getattr(self, "capturing", False) and e.type() == QEvent.ShortcutOverride:
+            e.accept()
+            return True
+        return super().event(e)
 
+    def keyPressEvent(self, event):
         if not self.capturing:
+            if event.key() == Qt.Key_Escape:
+                event.ignore()                  # Esc must not close this dialog
+                return
             super().keyPressEvent(event)
             return
-
-        key = event.key()
-        if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
+        if event.key() == Qt.Key_Escape and not event.modifiers():
+            # Esc cancels the capture (whichever button was armed).
+            if getattr(self, "_capture_target", "dictation") == "prompter":
+                self._toggle_lp_capture()
+            else:
+                self._toggle_capture()
             return
-            
-        mods = []
-        qt_mods = event.modifiers()
-        if qt_mods & Qt.ControlModifier:
-            mods.append("ctrl")
-        if qt_mods & Qt.AltModifier:
-            mods.append("alt")
-        if qt_mods & Qt.ShiftModifier:
-            mods.append("shift")
-        if qt_mods & Qt.MetaModifier:
-            mods.append("win")
-
-        KEY_MAP = {
-            Qt.Key_Space: "space",
-            Qt.Key_Tab: "tab",
-            Qt.Key_Enter: "enter",
-            Qt.Key_Return: "enter",
-            Qt.Key_Escape: "esc",
-            Qt.Key_Backspace: "backspace",
-            Qt.Key_Delete: "delete",
-            Qt.Key_Insert: "insert",
-            Qt.Key_Home: "home",
-            Qt.Key_End: "end",
-            Qt.Key_PageUp: "page up",
-            Qt.Key_PageDown: "page down",
-            Qt.Key_Up: "up",
-            Qt.Key_Down: "down",
-            Qt.Key_Left: "left",
-            Qt.Key_Right: "right",
-            Qt.Key_F1: "f1", Qt.Key_F2: "f2", Qt.Key_F3: "f3", Qt.Key_F4: "f4",
-            Qt.Key_F5: "f5", Qt.Key_F6: "f6", Qt.Key_F7: "f7", Qt.Key_F8: "f8",
-            Qt.Key_F9: "f9", Qt.Key_F10: "f10", Qt.Key_F11: "f11", Qt.Key_F12: "f12",
-        }
-        
-        key_str = ""
-        if key in KEY_MAP:
-            key_str = KEY_MAP[key]
-        elif 48 <= key <= 90: # letters and digits
-            key_str = chr(key).lower()
-        else:
+        hotkey_str, problem = hotkeys.from_key_event(event)
+        if problem == "needs_modifier":
+            QMessageBox.warning(self, "Modifier Required", hotkeys.needs_modifier_message())
             return
-
-        # Modifier-less binding is only safe for Function keys (F1-F12); a bare
-        # typing/navigation key would fire during normal use. Require a modifier
-        # otherwise (mouse buttons are handled separately in eventFilter).
-        is_function_key = len(key_str) >= 2 and key_str[0] == "f" and key_str[1:].isdigit()
-        if not mods and not is_function_key:
-            QMessageBox.warning(
-                self, "Modifier Required",
-                "Use at least one modifier (Ctrl, Alt, Shift, or Win), a Function "
-                "key (F1-F12), or a mouse button.\n\nA single typing key can't be a "
-                "hotkey because it would trigger while you type."
-            )
-            return
-
-        hotkey_str = "+".join(mods + [key_str]) if mods else key_str
+        if not hotkey_str:
+            return                              # a lone modifier, or an unsupported key
 
         # The same capture path serves both hotkey buttons; whichever was
         # clicked last is the target.
@@ -4746,11 +4756,5 @@ class Settings(QDialog):
 
     @staticmethod
     def _fmt_hotkey(self_or_none, hk):
-        if hk.startswith("mouse:"):
-            names = {"middle": "Mouse Middle", "left": "Mouse Left",
-                     "right": "Mouse Right", "x1": "Mouse Back", "x2": "Mouse Forward"}
-            return names.get(hk.split(":")[1], hk)
-        caps = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift",
-                "win": "Win", "super": "Super"}
-        return " + ".join(caps.get(p, p.upper() if len(p) == 1 else p.capitalize())
-                          for p in hk.split("+"))
+        """"Alt + R" on Windows, "⌥ R" on a Mac (see hotkeys.display)."""
+        return hotkeys.display(hk)

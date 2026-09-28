@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QApplication, QCompleter
 )
 from PySide6.QtGui import QFont, QColor, QIcon
+import hotkeys
 import local_llm
 
 class Onboarding(QDialog):
@@ -464,7 +465,7 @@ class Onboarding(QDialog):
         card_desc.setWordWrap(True)
         layout_card.addWidget(card_desc)
         
-        self.btn_hotkey = QPushButton(self.hotkey_val.upper(), hotkey_card)
+        self.btn_hotkey = QPushButton(hotkeys.display(self.hotkey_val).upper(), hotkey_card)
         self.btn_hotkey.clicked.connect(self._toggle_capture)
         self.btn_hotkey.setStyleSheet("font-size: 15px; font-weight: bold; min-height: 40px; border-color: #3b82f6;")
         layout_card.addWidget(self.btn_hotkey)
@@ -507,7 +508,7 @@ class Onboarding(QDialog):
         self.combo_lang = QComboBox(lang_card)
         langs = [
             ("auto", "Auto-detect"),
-            ("multi", "Multilingual"),
+            ("multi", "Mixed languages"),
             ("hy", "Armenian"),
             ("en", "English"),
             ("ru", "Russian"),
@@ -656,7 +657,7 @@ class Onboarding(QDialog):
                 hotkey_str = btn_map[btn]
                 self.hotkey_val = hotkey_str
                 self.capturing = False
-                self.btn_hotkey.setText(self.hotkey_val.upper().replace("MOUSE:", "MOUSE "))
+                self.btn_hotkey.setText(hotkeys.display(self.hotkey_val).upper())
                 self.btn_hotkey.setStyleSheet("font-size: 15px; font-weight: bold; min-height: 40px; border-color: #3b82f6;")
                 return True # swallow event
         return super().eventFilter(obj, event)
@@ -664,7 +665,7 @@ class Onboarding(QDialog):
     def _toggle_capture(self):
         if self.capturing:
             self.capturing = False
-            self.btn_hotkey.setText(self.hotkey_val.upper())
+            self.btn_hotkey.setText(hotkeys.display(self.hotkey_val).upper())
             self.btn_hotkey.setStyleSheet("font-size: 15px; font-weight: bold; min-height: 40px; border-color: #3b82f6;")
         else:
             self.capturing = True
@@ -672,77 +673,32 @@ class Onboarding(QDialog):
             self.btn_hotkey.setStyleSheet("font-size: 15px; font-weight: bold; min-height: 40px; border-color: #ef4444; color: #ef4444;")
             self.setFocus() # Pull focus away from button so keyPressEvent captures correctly
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            if not self.capturing:
-                event.ignore()
-                return
+    def event(self, e):
+        # While a hotkey is being captured, key combinations must reach
+        # keyPressEvent instead of firing shortcuts - on a Mac ⌘Q, ⌘W or ⌘H
+        # would otherwise quit, close or hide the app mid-capture.
+        if getattr(self, "capturing", False) and e.type() == QEvent.ShortcutOverride:
+            e.accept()
+            return True
+        return super().event(e)
 
+    def keyPressEvent(self, event):
         if not self.capturing:
+            if event.key() == Qt.Key_Escape:
+                event.ignore()                  # Esc must not close this dialog
+                return
             super().keyPressEvent(event)
             return
-
-        key = event.key()
-        
-        # Disallow simple single keys unless they are modifiers + something
-        if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
+        if event.key() == Qt.Key_Escape and not event.modifiers():
+            self._toggle_capture()              # Esc cancels the capture
             return
-            
-        mods = []
-        qt_mods = event.modifiers()
-        if qt_mods & Qt.ControlModifier:
-            mods.append("ctrl")
-        if qt_mods & Qt.AltModifier:
-            mods.append("alt")
-        if qt_mods & Qt.ShiftModifier:
-            mods.append("shift")
-        if qt_mods & Qt.MetaModifier:
-            mods.append("win")
-
-        # Map special key codes
-        KEY_MAP = {
-            Qt.Key_Space: "space",
-            Qt.Key_Tab: "tab",
-            Qt.Key_Enter: "enter",
-            Qt.Key_Return: "enter",
-            Qt.Key_Escape: "esc",
-            Qt.Key_Backspace: "backspace",
-            Qt.Key_Delete: "delete",
-            Qt.Key_Insert: "insert",
-            Qt.Key_Home: "home",
-            Qt.Key_End: "end",
-            Qt.Key_PageUp: "page up",
-            Qt.Key_PageDown: "page down",
-            Qt.Key_Up: "up",
-            Qt.Key_Down: "down",
-            Qt.Key_Left: "left",
-            Qt.Key_Right: "right",
-            Qt.Key_F1: "f1", Qt.Key_F2: "f2", Qt.Key_F3: "f3", Qt.Key_F4: "f4",
-            Qt.Key_F5: "f5", Qt.Key_F6: "f6", Qt.Key_F7: "f7", Qt.Key_F8: "f8",
-            Qt.Key_F9: "f9", Qt.Key_F10: "f10", Qt.Key_F11: "f11", Qt.Key_F12: "f12",
-        }
-        
-        key_str = ""
-        if key in KEY_MAP:
-            key_str = KEY_MAP[key]
-        elif 48 <= key <= 90: # A-Z and 0-9
-            key_str = chr(key).lower()
-        else:
-            return # ignore weird keys
-
-        # Modifier-less binding is only safe for Function keys (F1-F12); a bare
-        # typing/navigation key would fire during normal use.
-        is_function_key = len(key_str) >= 2 and key_str[0] == "f" and key_str[1:].isdigit()
-        if not mods and not is_function_key:
-            QMessageBox.warning(
-                self, "Modifier Required",
-                "Use at least one modifier (Ctrl, Alt, Shift, or Win), a Function "
-                "key (F1-F12), or a mouse button.\n\nA single typing key can't be a "
-                "hotkey because it would trigger while you type."
-            )
+        combo, problem = hotkeys.from_key_event(event)
+        if problem == "needs_modifier":
+            QMessageBox.warning(self, "Modifier Required", hotkeys.needs_modifier_message())
             return
-
-        self.hotkey_val = "+".join(mods + [key_str]) if mods else key_str
+        if not combo:
+            return                              # a lone modifier, or an unsupported key
+        self.hotkey_val = combo
         self._toggle_capture()
 
     def _set_backend(self, backend):

@@ -40,6 +40,8 @@ import auth
 import entitlements
 import text_cleanup
 import vocabulary
+import hotkeys
+import speech_langs
 
 # ── Version ───────────────────────────────────────────────────────────────────
 APP_VERSION = "1.9.2"
@@ -85,6 +87,10 @@ DEFAULT = {
     "hotkey":        "alt+r",
     "whisper_model": "base",
     "language":      "auto",
+    # With language "multi" (Mixed languages): the languages the user switches
+    # between, even mid-sentence (speech_langs.py). Fewer than two ticked =
+    # any language, as "multi" always worked.
+    "mix_languages": [],
     "sample_rate":   16000,
     "chunk_size":    1024,
     "accent_color":  "#3b82f6",
@@ -151,6 +157,9 @@ DEFAULT = {
     "live_assist_language": "en",         # transcription language for prompter sessions
     "live_assist_output_language": "en",  # language of the suggestions
     "live_assist_screen_auto": True,      # attach a screenshot when the talk refers to the screen
+    # What the user wrote about the call (the overlay's Context line): every
+    # answer is shaped by it until they change or clear it.
+    "live_assist_context": "",
     # Dictation HUD glass (ui/overlay.py): "auto" adapts to what is behind it
     # (light over bright content, dark over dark), or pin "dark" / "light".
     "overlay_theme": "auto",
@@ -398,7 +407,7 @@ MODELS = {
 
 LANG_NAMES = {
     "auto":  "Auto-detect",
-    "multi": "Multilingual",
+    "multi": "Mixed languages",
     "hy":    "Armenian",
     "en":    "English",
     "ru":    "Russian",
@@ -550,6 +559,13 @@ def _repair_whisper_model_cache(name):
     except Exception as e:
         logger.warning("Could not repair Whisper model cache for %s: %s", name, e)
         return False
+
+def _missing_from_cache(e):
+    """The offline load failed only because the model isn't downloaded yet
+    (huggingface_hub's LocalEntryNotFoundError) - not a GPU problem."""
+    return (type(e).__name__ == "LocalEntryNotFoundError"
+            or "local_files_only" in str(e))
+
 
 def model_downloaded(name):
     try:
@@ -807,9 +823,9 @@ class AudioRecorder:
             if self._model is None or self._model_name != name:
                 from faster_whisper import WhisperModel
                 dev, ct = self._whisper_device()
-                # Try GPU first (if available), then CPU; and online first, then
-                # offline cache (HF revalidation can fail on flaky networks even
-                # when the model is fully cached). A GPU load can fail when the
+                # Try GPU first (if available), then CPU; and the offline cache
+                # first, then online - revalidating with Hugging Face costs a
+                # round trip before every load and can stall on a flaky network. A GPU load can fail when the
                 # CUDA libraries are missing or VRAM is short - we fall back to CPU
                 # rather than erroring, so dictation always works.
                 # Use all physical CPU cores (ctranslate2 otherwise caps at a low
@@ -827,8 +843,8 @@ class AudioRecorder:
                     self._add_cuda_dll_dirs()
                 attempts = []
                 if dev == "cuda":
-                    attempts += [("cuda", ct, False), ("cuda", ct, True)]
-                attempts += [("cpu", "int8", False), ("cpu", "int8", True)]
+                    attempts += [("cuda", ct, True), ("cuda", ct, False)]
+                attempts += [("cpu", "int8", True), ("cpu", "int8", False)]
                 last_err = None
                 repaired_cache = False
                 for d, c, local_only in attempts:
@@ -860,7 +876,7 @@ class AudioRecorder:
                         return
                     except Exception as e:
                         last_err = e
-                        if d == "cuda":
+                        if d == "cuda" and not (local_only and _missing_from_cache(e)):
                             self._cuda_usable = False  # remember: skip GPU next time
                         logger.warning("Whisper load failed on %s/%s (offline=%s): %s",
                                        d, c, local_only, e)
@@ -1058,6 +1074,7 @@ class AudioRecorder:
         self._chunk_threads = []
         self._record_error  = ""
         self._abort         = False
+        self._tail_speech_sec = None
         self._cloud_capped  = False
         self._level_peak    = 0.05
         # Full wall-clock recording retained for post-meeting speaker
@@ -1243,6 +1260,18 @@ class AudioRecorder:
 
         while self.recording or post_roll_chunks > 0:
             if self.stop_requested and post_roll_chunks == 0:
+                if (self._abort or silence_sec >= 0.3
+                        or (not meeting_cadence and speech_sec == 0.0
+                            and self._chunk_idx > 0)):
+                    # No syllable in flight - Esc (nothing gets transcribed),
+                    # or the speaker had already stopped talking (a pause, or
+                    # nothing since the last chunk) - so no post-roll: the
+                    # result comes half a second sooner. Before any speech
+                    # was ever detected the post-roll stays, in case the
+                    # detector hasn't calibrated to this voice yet (meetings
+                    # cut chunks on a timer, so a chunk proves nothing there).
+                    self.recording = False
+                    break
                 post_roll_chunks = max_post_roll
 
             if post_roll_chunks > 0:
@@ -1390,6 +1419,9 @@ class AudioRecorder:
                     self.recording = False
                     break
                 time.sleep(0.05)
+        # Speech in the tail (the audio since the last chunk): transcribe()
+        # skips a tail without any.
+        self._tail_speech_sec = speech_sec
 
     def _transcribe_chunk(self, audio, idx):
         try:
@@ -1497,7 +1529,15 @@ class AudioRecorder:
         # A tail at the noise floor would only make Whisper hallucinate (it
         # tends to echo the custom-vocabulary prompt on near-silence), so the
         # final blob must carry actual signal to be worth transcribing.
-        if len(remaining) >= min_samples and float(np.abs(remaining).max()) >= 0.004:
+        # No speech since the last chunk (the speaker paused before stopping):
+        # every word is transcribed already - decoding the silence would only
+        # add a second and invite a made-up "Thank you."
+        # Dictation only: meetings cut chunks on a timer, so there a chunk
+        # doesn't prove the detector ever heard the (maybe quiet) speaker.
+        silent_tail = (getattr(self, "_capture_mode", None) is None and self._chunk_idx > 0
+                       and getattr(self, "_tail_speech_sec", None) == 0.0)
+        if (not silent_tail and len(remaining) >= min_samples
+                and float(np.abs(remaining).max()) >= 0.004):
             if cfg["backend"] == "managed":
                 last_text, detected = self._run_managed(remaining)
             elif cfg["backend"] == "google" and cfg["google_api_key"]:
@@ -1649,6 +1689,13 @@ class AudioRecorder:
 
         lang_setting = self._lang_setting()
         prompt = cfg.get("initial_prompt", "").strip() or None
+        # Mixed languages: a short primer with a line in each mixed language,
+        # in its own script, nudges Whisper to keep switching instead of
+        # transliterating everything into the language it detected.
+        mix = speech_langs.mix_languages(cfg) if lang_setting == "multi" else []
+        base_prompt = speech_langs.whisper_primer(mix) or None
+        if base_prompt:
+            prompt = f"{base_prompt} {prompt}" if prompt else base_prompt
 
         # Serialize ALL inference on this model: faster-whisper/ctranslate2 is
         # not safe for concurrent transcribe() calls, and the chunked pipeline
@@ -1669,6 +1716,11 @@ class AudioRecorder:
                 )
                 list(segs_detect)
                 lang_arg = detect_info.language
+                if mix:
+                    # Only the languages the user mixes can win - Armenian is
+                    # otherwise easily heard as another language.
+                    lang_arg = speech_langs.dominant_among(
+                        getattr(detect_info, "all_language_probs", None), mix, lang_arg)
                 if lang_setting == "auto":
                     self._session_lang = lang_arg
 
@@ -1703,17 +1755,24 @@ class AudioRecorder:
             text = _decode(prompt)
             # Vocabulary evidence check: on short or unclear audio the glossary
             # prompt makes Whisper WRITE the terms in. When a term shows up,
-            # decode again without the prompt; if that shows no trace of the
-            # term, the prompt invented it - use the honest decode (with
-            # near-miss spellings snapped to the terms). Costs a second pass
-            # only for pieces that contain a term.
+            # decode again without the glossary (the mixed-language primer
+            # stays); if that shows no trace of the term, the prompt invented
+            # it - use the honest decode (with near-miss spellings snapped to
+            # the terms). Costs a second pass only for pieces with a term.
             terms = vocabulary.load_terms(cfg)
-            if prompt and terms and vocabulary.evidence_trigger(text, terms):
-                plain = _decode(None)
+            if prompt and prompt != base_prompt and terms and vocabulary.evidence_trigger(text, terms):
+                plain = _decode(base_prompt)
                 invented = vocabulary.unsupported_terms(text, plain, terms)
                 if invented:
                     logger.info("[vocab] glossary insertion dropped (%d term(s))", len(invented))
                     text = vocabulary.correct_spellings(plain, terms)
+            if mix:
+                try:
+                    quiet = float(np.abs(np.asarray(audio)).max()) < 0.02
+                except Exception:
+                    quiet = False
+                if speech_langs.is_primer_echo(text, mix, quiet=quiet):
+                    text = ""                 # only the primer, read back into silence
         return text, lang_arg
 
     def _run_google(self, audio):
@@ -1730,16 +1789,11 @@ class AudioRecorder:
             b64_data = base64.b64encode(wav_bytes).decode("utf-8")
 
             lang_setting = self._lang_setting()
-            lang_names = {"hy": "Armenian", "ru": "Russian", "en": "English",
-                          "fr": "French", "de": "German", "es": "Spanish", "ar": "Arabic"}
-            lang_hint = ""
-            if lang_setting in lang_names:
-                nm = lang_names[lang_setting]
-                # A strong, explicit instruction makes Gemini stay in the target
-                # language and native script (e.g. Armenian) instead of drifting
-                # to English or transliteration.
-                lang_hint = (f" The speaker is speaking {nm}. Transcribe in {nm} using its"
-                             f" native script and return only {nm} text.")
+            # Native script for the spoken language(s) - and words from another
+            # language kept as spoken, not translated: an Armenian sentence
+            # with English words in it stays exactly that. With Mixed
+            # languages it's told which ones it will hear, switching anywhere.
+            lang_hint = speech_langs.cloud_hint(lang_setting, speech_langs.mix_languages(cfg))
 
             # The user's custom vocabulary used to be dropped on every cloud
             # backend - configure it, upgrade to cloud, and it silently stopped
@@ -1803,11 +1857,18 @@ class AudioRecorder:
             # Custom vocabulary for the proxy to fold into its prompt. Older
             # proxy deployments ignore unknown fields, so this is a no-op until
             # the server side ships - never an error.
+            lang_setting = self._lang_setting()
             body = {
                 "audio": b64_data,
                 "sample_rate": cfg["sample_rate"],
-                "language": self._lang_setting(),
+                "language": lang_setting,
                 "provider": provider,
+                # The languages to expect: the mix for Mixed languages, else the
+                # one set (empty for auto). Its presence also tells the proxy to
+                # keep foreign words as spoken; older proxies ignore it.
+                "languages": (speech_langs.mix_languages(cfg) if lang_setting == "multi"
+                              else [lang_setting] if lang_setting in speech_langs.NAMES
+                              else []),
             }
             vocab_terms = vocabulary.cloud_terms(cfg)
             if vocab_terms:
@@ -2048,6 +2109,9 @@ class AppController(QObject):
 
         # Register the configured hotkey (keyboard combo or mouse button).
         self._setup_hotkey(self.cfg["hotkey"])
+        # Load the speech model in the background now, so the first Alt+R
+        # doesn't wait 1-2 s for it.
+        QTimer.singleShot(2500, self._preload_speech_model)
 
         # Setup System Tray
         self._setup_tray()
@@ -2849,6 +2913,19 @@ class AppController(QObject):
         self._unregister_kbd_hotkey()
         self._unregister_mouse_listener()
 
+        if hotkeys.is_bare_typing_key(hotkey):
+            # A lone typing key ("space") would start dictation on every
+            # keystroke - older capture screens could save one. Back to the
+            # default, and say so once the tray is up.
+            bad, hotkey = hotkey, DEFAULT["hotkey"]
+            logger.warning("Hotkey %r is a bare typing key - using %r", bad, hotkey)
+            self.cfg["hotkey"] = hotkey
+            self.save_config()
+            QTimer.singleShot(3000, lambda: self.show_tray_hint(
+                "Hotkey reset",
+                f"{hotkeys.display(bad)} would trigger while you type, so dictation is back "
+                f"on {hotkeys.display(hotkey)}. Pick another in Settings."))
+
         try:
             if hotkey.startswith("mouse:"):
                 from pynput import mouse as pynput_mouse
@@ -2886,6 +2963,7 @@ class AppController(QObject):
                 # macOS / Linux: pynput GlobalHotKeys (handles modifier tracking
                 # internally - more robust than a custom Listener).
                 from pynput import keyboard as pynput_keyboard
+                hotkeys.prepare_pynput_listeners()
                 listener = pynput_keyboard.GlobalHotKeys({
                     self._to_pynput_hotkey(hotkey): lambda: self.sig_hotkey.emit(),
                 })
@@ -2919,7 +2997,7 @@ class AppController(QObject):
         hotkey = "+".join(p.strip().lower() for p in (hotkey or "").split("+") if p.strip())
         dictation = "+".join(p.strip().lower()
                              for p in (self.cfg.get("hotkey") or "").split("+") if p.strip())
-        if not hotkey or hotkey == dictation:
+        if not hotkey or hotkey == dictation or hotkeys.is_bare_typing_key(hotkey):
             return False
         try:
             if sys.platform == "win32":
@@ -2929,6 +3007,7 @@ class AppController(QObject):
                 self._registered_assist_hotkey = hotkey
             else:
                 from pynput import keyboard as pynput_keyboard
+                hotkeys.prepare_pynput_listeners()
                 listener = pynput_keyboard.GlobalHotKeys({
                     self._to_pynput_hotkey(hotkey): lambda: self.sig_assist_hotkey.emit(),
                 })
@@ -2990,20 +3069,7 @@ class AppController(QObject):
     @staticmethod
     def _to_pynput_hotkey(hotkey):
         # "alt+shift+r" -> "<alt>+<shift>+r" for pynput.GlobalHotKeys
-        parts = []
-        for p in hotkey.lower().split("+"):
-            p = p.strip()
-            if p in ("ctrl", "control"):
-                parts.append("<ctrl>")
-            elif p in ("alt", "option"):
-                parts.append("<alt>")
-            elif p == "shift":
-                parts.append("<shift>")
-            elif p in ("win", "super", "cmd", "command"):
-                parts.append("<cmd>")
-            else:
-                parts.append(p)
-        return "+".join(parts)
+        return hotkeys.to_pynput(hotkey)
 
     def apply_tray_bindings(self):
         self._setup_hotkey(self.cfg["hotkey"])
@@ -3046,7 +3112,7 @@ class AppController(QObject):
             if self._is_meeting_busy():
                 self.show_tray_hint(
                     "Meeting Recording Active",
-                    "Alt-R dictation is paused while a meeting is recording so "
+                    f"{hotkeys.display(self.cfg.get('hotkey', 'alt+r'))} dictation is paused while a meeting is recording so "
                     "the two don't mix. Stop the meeting to dictate again.",
                 )
                 return
@@ -3097,6 +3163,9 @@ class AppController(QObject):
         result is discarded and can't paste), tell the recorder to bail, stop
         recording, and clear the busy/recording state right away so the very
         next hotkey starts a fresh recording with no 'still finishing' wait."""
+        # The pill goes first - Esc must feel instant even while the recorder
+        # winds down below.
+        self.overlay.call_soon(self.overlay.hide_overlay)
         # Bumping the job sequence orphans whatever _stop_impl is doing: its
         # result is dropped and it won't re-clear _busy from under a new job.
         self._job_seq = getattr(self, "_job_seq", 0) + 1
@@ -3113,7 +3182,22 @@ class AppController(QObject):
         self._busy = False                  # immediately ready for the next take
         self._account_recording_time()
         self._unregister_transient_keys()
-        self.overlay.call_soon(self.overlay.hide_overlay)
+
+    def _preload_speech_model(self):
+        """Background-load the local Whisper model when dictation uses it
+        (never a download: only a model already on disk)."""
+        cfg_now = self._effective_cfg()
+        if cfg_now.get("backend", "local") != "local":
+            return
+        name = cfg_now.get("whisper_model") or "base"
+
+        def _load():
+            try:
+                if model_downloaded(name):
+                    self.recorder.load_model(name)
+            except Exception as e:
+                logger.debug("Speech model preload failed: %s", e)
+        threading.Thread(target=_load, daemon=True).start()
 
     def _cloud_preflight_warn(self):
         """Immediate, friendly warning if a cloud backend is selected but clearly
@@ -3198,6 +3282,7 @@ class AppController(QObject):
         self._unregister_transient_keys()
         try:
             from pynput import keyboard as pynput_keyboard
+            hotkeys.prepare_pynput_listeners()
 
             def _on_press(key):
                 try:
@@ -3279,6 +3364,24 @@ class AppController(QObject):
         - only if nothing else has changed the clipboard since.
         """
         return bool(restore_enabled and pasted and prev_was_text and still_ours)
+
+    @staticmethod
+    def _wait_keys_released(max_s=0.35):
+        """Paste once the keys that stopped the dictation are up - a held Alt
+        or Ctrl would turn Ctrl+V into another shortcut. By the time the text
+        is ready they almost always are, so this returns at once (it used to
+        always sleep 350 ms)."""
+        if sys.platform != "win32":
+            time.sleep(max_s)
+            return
+        try:
+            state = ctypes.windll.user32.GetAsyncKeyState
+            keys = (0x10, 0x11, 0x12, 0x5B, 0x5C, 0x0D, 0x1B)  # Shift Ctrl Alt Win Win Enter Esc
+            deadline = time.monotonic() + max_s
+            while any(state(k) & 0x8000 for k in keys) and time.monotonic() < deadline:
+                time.sleep(0.015)
+        except Exception:
+            time.sleep(max_s)
 
     def _paste_via_clipboard(self, text, restore=True):
         """Copy `text`, send the paste chord, then restore the prior clipboard.
@@ -3545,7 +3648,7 @@ class AppController(QObject):
             APP_VERSION,
         )
 
-        time.sleep(0.35)
+        self._wait_keys_released(0.35)
         pasted = self._paste_via_clipboard(output_text)
 
         self.overlay.call_soon(self.overlay.show_done, pasted)

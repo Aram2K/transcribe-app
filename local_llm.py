@@ -460,13 +460,15 @@ def _messages_for(mode, text, source_lang, target_lang, vocab_block=""):
         instruction = (
             "You are the user's real-time companion during a live call. The text is "
             "the latest part of the conversation (speech recognition, may be "
-            "imperfect), optionally followed by the user's question.\n"
+            "imperfect), optionally followed by the user's question. It may start "
+            "with \"About this session\": the user's own notes on the call - true "
+            "for the whole call; use its facts and follow its focus.\n"
             "Answer the user's question if there is one; otherwise answer the LAST "
             "question or request in the text. Start with the answer itself - the "
-            "words to say or the solution - then at most 2 short bullets. Put code "
-            "or commands in a fenced code block.\n"
+            "words to say or the solution - then at most 2 short bullets. Simple "
+            "words, under 45 words. Put code or commands in a fenced code block.\n"
             "No summary, no recap, no headings. Do not invent facts, and never make "
-            "claims about the user's own background or experience."
+            "claims about the user's own background or experience beyond those notes."
         )
     else:
         instruction = "Rewrite the user's text clearly while preserving meaning. Output only the result."

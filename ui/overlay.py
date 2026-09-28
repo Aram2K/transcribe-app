@@ -866,13 +866,18 @@ class Overlay(QWidget):
         self._bd, self._bd_luma = None, None
         self._glass_cache.clear()
         self._excluded = False
+        private = bool((self.app.cfg if self.app else {}).get("overlay_private", True))
         if self._hwnd:
             glass.set_no_activate(self)       # Qt may rebuild styles on show
-            private = bool((self.app.cfg if self.app else {}).get("overlay_private", True))
             if private and glass.capture_exclusion_supported() and not glass.is_remote_session():
                 self._excluded = glass.exclude_from_capture(self, True)
             else:
                 glass.exclude_from_capture(self, False)
+        elif glass.IS_MAC and QApplication.platformName() == "cocoa":
+            # macOS: the same privacy through NSWindow.sharingType. (No live
+            # glass there - sampling the screen needs the Screen Recording
+            # permission - so the plate stays.)
+            glass.exclude_from_capture(self, private)
         self._live = self._excluded and not self._solid
         self._theme = self._pick_theme()      # provisional: pinned, or the system theme
         self._shown_at = time.monotonic()

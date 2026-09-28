@@ -6,6 +6,10 @@ import re
 
 TAIL_CHARS = 2600                # ~3-4 minutes of speech fed to the model
 HISTORY_TURNS = 2                # earlier answers kept for follow-up questions
+# The session context the user writes: room for a brief and a job or product
+# description, and still well inside a local model's 8k-token window next to
+# the transcript tail.
+CONTEXT_CHARS = 5000
 
 SOLVE_SCREEN = ("Solve the problem or answer the question shown on my screen. "
                 "Give the solution directly.")
@@ -15,13 +19,22 @@ _LANG_NAMES = {"en": "English", "de": "German", "fr": "French", "es": "Spanish",
                "hy": "Armenian", "tr": "Turkish", "zh": "Chinese", "ja": "Japanese"}
 
 
+def clip_context(text, limit=CONTEXT_CHARS):
+    """The session context as the model gets it: trimmed, at most ``limit``
+    characters."""
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
 def rolling_context(live_text, question="", title="", attendees="",
-                    tail_chars=TAIL_CHARS, screen=False, output_lang="en", history=()):
+                    tail_chars=TAIL_CHARS, screen=False, output_lang="en", history=(),
+                    session_context=""):
     """The text handed to the model: recent conversation + optional question,
     plus the last answers of this session (``history``: (asked, answer) pairs)
     so a follow-up like "and the second part?" has something to refer to.
-    Cuts at a sentence boundary when it can so the model doesn't start
-    mid-word."""
+    ``session_context`` is what the user wrote about the call - it holds for
+    every answer of the session. Cuts at a sentence boundary when it can so
+    the model doesn't start mid-word."""
     tail = (live_text or "").strip()
     if len(tail) > tail_chars:
         tail = tail[-tail_chars:]
@@ -29,6 +42,12 @@ def rolling_context(live_text, question="", title="", attendees="",
         if cut and cut.end() < len(tail) // 2:
             tail = tail[cut.end():]
     parts = []
+    ctx = clip_context(session_context)
+    if ctx:
+        # First, and the same on every call of the session: the rest is read
+        # in its light, and the endpoint can cache it along with the brief.
+        parts.append("About this session (written by the user; it holds for every "
+                     "answer):\n" + ctx)
     if title or attendees:
         meta = []
         if title:
@@ -45,7 +64,13 @@ def rolling_context(live_text, question="", title="", attendees="",
                          f"{a[:280]}{'…' if len(a) > 280 else ''}")
         parts.append("\n".join(lines))
     parts.append("Conversation (latest part):\n" + (tail or "(nothing transcribed yet)"))
-    if screen:
+    if screen == "snip":
+        # A part of the screen the user picked (or an image they pasted) for
+        # this question: here the image IS the subject.
+        parts.append("(A screenshot of the user's screen is attached. It is the part "
+                     "of the screen the user picked for this question - use it as the "
+                     "main context.)")
+    elif screen:
         # Context, not the task: with Screen on a screenshot rides along with
         # every answer, relevant or not (the system prompt says the same).
         parts.append("(A screenshot of the user's screen is attached. Use it as "

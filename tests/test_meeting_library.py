@@ -492,6 +492,23 @@ class TestMeetingStartState(unittest.TestCase):
         self.assertEqual(w.combo_action.currentData(), "api_cerebras")
         self.assertEqual(app.recorder.started["capture_mode"], "smart_meeting")
 
+    def test_live_assist_hears_both_sides_without_changing_the_saved_mode(self):
+        app = _App(meeting_audio_mode="default_mic")
+        um, w = _window(app)
+        w.state = w.STATE_IDLE
+        self._start(w, language="en", audio_mode="smart_meeting")
+        self.assertEqual(app.recorder.started["capture_mode"], "smart_meeting")
+        self.assertEqual(app.cfg["meeting_audio_mode"], "default_mic")    # saved pick kept
+        self.assertEqual(w._session_audio_mode, "smart_meeting")
+
+    def test_a_mode_this_system_cannot_capture_falls_back(self):
+        app = _App(meeting_audio_mode="default_mic")
+        um, w = _window(app)
+        w.combo_device = _Combo(["default_mic"], "default_mic")          # no loopback here
+        w.state = w.STATE_IDLE
+        self._start(w, language="en", audio_mode="smart_meeting")
+        self.assertEqual(app.recorder.started["capture_mode"], "default_mic")
+
     def test_resync_is_read_only_and_a_pick_here_is_saved(self):
         app = _App(action_model="rule_based")        # not offered in the meeting picker
         um, w = _window(app)

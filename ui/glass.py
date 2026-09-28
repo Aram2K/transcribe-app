@@ -16,12 +16,14 @@ market it otherwise.
 """
 import ctypes
 import logging
+import os
 import sys
 import threading
 
 logger = logging.getLogger("transcribe")
 
 IS_WINDOWS = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
 
 # SetWindowDisplayAffinity
 WDA_NONE = 0x00
@@ -125,10 +127,71 @@ def windows_build():
         return 0
 
 
+# ── macOS: NSWindow.sharingType ──
+# NSWindowSharingNone keeps a window's pixels out of other processes: screen
+# sharing and recording apps that use the system capture APIs leave it out.
+# It is the same switch Electron's setContentProtection uses. Talked to via
+# the Objective-C runtime with exact prototypes (arm64 must never call
+# objc_msgSend through a variadic signature). GUI thread only (AppKit).
+_NS_SHARING_NONE, _NS_SHARING_READ_ONLY = 0, 1
+_objc = None
+
+
+def _objc_runtime():
+    global _objc
+    if _objc is None:
+        lib = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+        lib.sel_registerName.restype = ctypes.c_void_p
+        lib.sel_registerName.argtypes = [ctypes.c_char_p]
+        send = lambda restype, *args: ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p,
+                                                       *args)(("objc_msgSend", lib))
+        _objc = {
+            "sel": lib.sel_registerName,
+            "id": send(ctypes.c_void_p),                    # -(id)x
+            "get_uint": send(ctypes.c_ulong),               # -(NSUInteger)x
+            "set_uint": send(None, ctypes.c_ulong),         # -(void)x:(NSUInteger)v
+        }
+    return _objc
+
+
+def _ns_window(widget):
+    """The NSWindow behind a Qt top level (winId() is its NSView on macOS)."""
+    view = int(widget.winId())
+    if not view:
+        return None
+    rt = _objc_runtime()
+    return rt["id"](view, rt["sel"](b"window")) or None
+
+
+def _mac_sharing_type(widget):
+    win = _ns_window(widget)
+    if not win:
+        return None
+    rt = _objc_runtime()
+    return int(rt["get_uint"](win, rt["sel"](b"sharingType")))
+
+
+def _mac_set_excluded(widget, enabled):
+    win = _ns_window(widget)
+    if not win:
+        return False
+    rt = _objc_runtime()
+    want = _NS_SHARING_NONE if enabled else _NS_SHARING_READ_ONLY
+    rt["set_uint"](win, rt["sel"](b"setSharingType:"), want)
+    return _mac_sharing_type(widget) == want
+
+
 def exclude_from_capture(widget, enabled=True):
     """Hide ``widget`` from screen capture (shared screens, recordings) while
     keeping it visible on the monitor. Returns True when the OS confirmed the
-    new affinity via GetWindowDisplayAffinity."""
+    new state: GetWindowDisplayAffinity on Windows, NSWindow.sharingType read
+    back on macOS."""
+    if IS_MAC:
+        try:
+            return _mac_set_excluded(widget, enabled)
+        except Exception as e:
+            logger.warning("exclude_from_capture (macOS): %s", e)
+            return False
     if not IS_WINDOWS:
         return False
     # Never request exclusion below Win10 2004: there the same flag degrades to
@@ -154,6 +217,11 @@ def exclude_from_capture(widget, enabled=True):
 
 
 def is_excluded_from_capture(widget):
+    if IS_MAC:
+        try:
+            return _mac_sharing_type(widget) == _NS_SHARING_NONE
+        except Exception:
+            return False
     if not IS_WINDOWS:
         return False
     hwnd = _hwnd(widget)
@@ -274,8 +342,22 @@ def set_click_through(widget, enabled=True):
         return False
 
 
+def mac_capture_protection_reliable():
+    """True through macOS 14, where NSWindow.sharingType keeps a window out of
+    every capture. From macOS 15 (Darwin 24) ScreenCaptureKit - what Zoom,
+    Teams, browsers and QuickTime use - ignores it, and Apple offers no other
+    public way: the window can't be promised hidden there."""
+    if not IS_MAC:
+        return False
+    try:
+        return int(os.uname().release.split(".")[0]) < 24
+    except Exception:
+        return False
+
+
 def capture_exclusion_supported():
-    return IS_WINDOWS and windows_build() >= 19041
+    """Whether hiding a window from screen capture can be PROMISED here."""
+    return mac_capture_protection_reliable() or (IS_WINDOWS and windows_build() >= 19041)
 
 
 # Private user32/gdi32 handles for the helpers below, so their argtypes/restype

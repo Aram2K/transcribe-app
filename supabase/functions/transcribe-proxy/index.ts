@@ -50,9 +50,52 @@ const LANG_NAMES: Record<string, string> = {
 // Languages Mistral Voxtral handles well (ISO-639-1). Others are auto-detected.
 const MISTRAL_LANGS = new Set(["en", "es", "fr", "de", "it", "nl", "pt", "hi", "ar", "ru"]);
 
-async function transcribeGemini(audioB64: string, language: string) {
+// Non-Latin scripts; the rest are written in Latin letters.
+const SCRIPT: Record<string, string> = { hy: "the Armenian alphabet", ru: "Cyrillic", ar: "Arabic script" };
+
+function joinNames(items: string[]): string {
+  return items.length <= 1 ? items.join("") : items.slice(0, -1).join(", ") + " and " + items[items.length - 1];
+}
+
+// The language instruction for clients that send `languages` (v1.9.3+) - the
+// same wording as speech_langs.cloud_hint in the app. Foreign words are kept
+// as spoken, and "multi" (Mixed languages) lists the languages to expect
+// (any language when fewer than two are picked), switching anywhere, even
+// mid-sentence.
+function languageHint(language: string, languages: string[]): string {
   const nm = LANG_NAMES[language];
-  const hint = nm
+  if (nm) {
+    const how = SCRIPT[language] ? ` in ${SCRIPT[language]}, never transliterated into Latin letters` : "";
+    return ` The speaker speaks mainly ${nm}. Write ${nm}${how}. If they use words or phrases ` +
+      `from another language, keep those exactly as spoken, in that language's own script - ` +
+      `don't translate them.`;
+  }
+  if (language === "multi") {
+    const mix = languages.filter((c) => LANG_NAMES[c]);
+    if (mix.length < 2) {
+      return " The speaker may switch languages, even in the middle of a sentence. " +
+        "Write every word in the language it was spoken in, in that language's " +
+        "own script. Never translate, and never turn the whole text into one " +
+        "language.";
+    }
+    const latin = mix.filter((c) => !SCRIPT[c]).map((c) => LANG_NAMES[c]);
+    const bits = mix.filter((c) => SCRIPT[c]).map((c) => `${LANG_NAMES[c]} in ${SCRIPT[c]}`);
+    if (latin.length) bits.push(`${joinNames(latin)} in Latin letters`);
+    return ` The speaker switches between ${joinNames(mix.map((c) => LANG_NAMES[c]))}, often in ` +
+      `the middle of a sentence. Write every word in the language it was spoken in, in that ` +
+      `language's own script (${bits.join(", ")}). Never translate, and never turn the whole ` +
+      `text into one language.`;
+  }
+  return " If the speaker switches languages, keep every word in the language it was spoken " +
+    "in, in its own script - don't translate.";
+}
+
+async function transcribeGemini(audioB64: string, language: string, languages: string[] | null) {
+  const nm = LANG_NAMES[language];
+  // Older clients (no `languages`) keep the exact old prompt.
+  const hint = languages !== null
+    ? languageHint(language, languages)
+    : nm
     ? ` The speaker is speaking ${nm}. Transcribe in ${nm} using its native script and return only ${nm} text.`
     : "";
   const payload = {
@@ -117,6 +160,9 @@ Deno.serve(async (req) => {
   try { body = await req.json(); } catch { return json({ error: "bad_request" }, 400); }
   const audio = body?.audio;
   const language = body?.language ?? "auto";
+  const languages: string[] | null = Array.isArray(body?.languages)
+    ? body.languages.filter((c: unknown) => typeof c === "string").slice(0, 8)
+    : null;
   const provider = (body?.provider ?? "gemini").toString();
   if (!audio || typeof audio !== "string") return json({ error: "no_audio" }, 400);
 
@@ -136,7 +182,7 @@ Deno.serve(async (req) => {
   for (const p of available) {
     result = p === "mistral"
       ? await transcribeMistral(audio, language)
-      : await transcribeGemini(audio, language);
+      : await transcribeGemini(audio, language, languages);
     if (result.ok) break;
   }
   if (!result.ok) return json({ error: "stt_failed", detail: result.detail }, 502);

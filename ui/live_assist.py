@@ -8,10 +8,15 @@ What it is (product contract):
   pipeline, and - on demand (Say next / Follow-ups / Recap / a typed question)
   or automatically - an AI suggestion. With Screen on, a screenshot rides
   along so the AI can answer about what is on the user's screen.
+* A session context: before (or during) a call the user writes what it is
+  about - who they are, who they're talking to, what they want. It's locked
+  in for the session: every answer is shaped by it.
 * PRIVATE by default: excluded from screen capture (ui/glass.py) so it never
   appears on a shared screen or in a recording while staying visible on the
   user's own monitor. A privacy feature for the user's private notes - never
   marketed as a way to deceive anyone; recording-consent guidance applies.
+* An image can go with a question: snip a part of the screen (the picker is
+  hidden from screen shares too) or paste one with Ctrl+V.
 * Liquid glass: because the window is excluded from capture, the pixels
   BEHIND it can be sampled (QScreen.grabWindow honours the exclusion) and
   rendered back through the shape - real blur, an edge refraction ring, a
@@ -26,23 +31,26 @@ signals; every widget touch happens on the GUI thread.
 import base64
 import logging
 import re
+import sys
 import threading
 import time
 
-from PySide6.QtCore import Qt, QBuffer, QIODevice, QPointF, QRect, QRectF, QSize, QTimer, Signal
+from PySide6.QtCore import (
+    Qt, QBuffer, QIODevice, QPoint, QPointF, QRect, QRectF, QSize, QTimer, Signal,
+)
 from PySide6.QtGui import (
-    QBrush, QColor, QCursor, QFont, QIcon, QImage, QLinearGradient, QPainter, QPainterPath,
-    QPen, QPixmap, QRadialGradient,
+    QBrush, QColor, QCursor, QFont, QIcon, QImage, QKeySequence, QLinearGradient, QPainter,
+    QPainterPath, QPen, QPixmap, QRadialGradient,
 )
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
     QTextEdit, QVBoxLayout, QWidget,
 )
 
 import actions
 from live_context import (  # noqa: F401 - re-exported for callers of this module
-    HISTORY_TURNS, SOLVE_SCREEN, TAIL_CHARS, last_question, looks_like_question,
-    rolling_context, should_attach_screen,
+    CONTEXT_CHARS, HISTORY_TURNS, SOLVE_SCREEN, TAIL_CHARS, clip_context, last_question,
+    looks_like_question, rolling_context, should_attach_screen,
 )
 from ui import glass
 
@@ -83,6 +91,20 @@ _THEMES = {
 # After an answer the user asked for, how long an automatic one waits before
 # it may replace it (they are still reading it, or saying it).
 USER_ANSWER_HOLD_S = 12
+
+ASK_PLACEHOLDER = "Ask anything about the call or your screen…"
+ASK_SENT = "✓ Sent - answering…"
+
+# Sent with an image and no typed question.
+SNIP_QUESTION = "Answer or solve what's in the attached image. Give the answer directly."
+
+CONTEXT_EMPTY = "+ Add context - what's this call about?"
+CONTEXT_PLACEHOLDER = (
+    "What's this call about? Who you are, who you're talking to, what you want "
+    "from it. Every answer this session uses it.\n\n"
+    "e.g. Call with Acme's data team about moving their reports to our platform. "
+    "I'm the solutions engineer; they care most about cost and security. Keep "
+    "answers short, in my voice.")
 
 QUICK_ACTIONS = (
     ("Answer", ""),
@@ -164,21 +186,33 @@ def render_markdown(text_edit, md):
         text_edit.setPlainText(md or "")
 
 
+def jpeg_b64(img, max_w=1600, quality=80):
+    """A QPixmap/QImage as base64 JPEG, downscaled for upload - a third of the
+    PNG size, so it reaches the model faster, yet sharp enough for code and
+    small UI text. "" for an empty image."""
+    if img is None or img.isNull():
+        return ""
+    if isinstance(img, QImage) and img.hasAlphaChannel():
+        # JPEG has no alpha: transparent areas would turn black.
+        flat = QImage(img.size(), QImage.Format_RGB32)
+        flat.fill(QColor("#ffffff"))
+        p = QPainter(flat)
+        p.drawImage(0, 0, img)
+        p.end()
+        img = flat
+    if img.width() > max_w:
+        img = img.scaledToWidth(max_w, Qt.SmoothTransformation)
+    buf = QBuffer()
+    buf.open(QIODevice.WriteOnly)
+    img.save(buf, "JPG", quality)
+    return base64.b64encode(bytes(buf.data())).decode("ascii")
+
+
 def capture_screen_b64(screen, max_w=1600, quality=80):
-    """Screenshot of ``screen`` as base64 JPEG, downscaled for upload - a
-    third of the PNG size, so it reaches the model faster, yet sharp enough
-    for code and small UI text. The overlay itself is absent when capture
-    exclusion (Private) is active."""
+    """Screenshot of ``screen`` as base64 JPEG (see jpeg_b64). The overlay
+    itself is absent when capture exclusion (Private) is active."""
     try:
-        pm = screen.grabWindow(0)
-        if pm.isNull():
-            return ""
-        if pm.width() > max_w:
-            pm = pm.scaledToWidth(max_w, Qt.SmoothTransformation)
-        buf = QBuffer()
-        buf.open(QIODevice.WriteOnly)
-        pm.save(buf, "JPG", quality)
-        return base64.b64encode(bytes(buf.data())).decode("ascii")
+        return jpeg_b64(screen.grabWindow(0), max_w, quality)
     except Exception as e:
         logger.debug("screen capture failed: %s", e)
         return ""
@@ -215,6 +249,32 @@ def _send_icon(size=18, color="#ffffff"):
     p.end()
     pm.setDevicePixelRatio(scale)
     return QIcon(pm)
+
+
+def _lock_pixmap(size=12, color="#2563eb"):
+    """A small padlock - the session context is locked in - painted as a path
+    so it's crisp at any DPI."""
+    scale = 3
+    pm = QPixmap(size * scale, size * scale)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.scale(size * scale / 24.0, size * scale / 24.0)
+    pen = QPen(QColor(color), 2.6)
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    shackle = QPainterPath(QPointF(7.5, 11.5))
+    shackle.lineTo(QPointF(7.5, 8.0))
+    shackle.arcTo(QRectF(7.5, 3.5, 9.0, 9.0), 180, -180)
+    shackle.lineTo(QPointF(16.5, 11.5))
+    p.drawPath(shackle)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(color))
+    p.drawRoundedRect(QRectF(4.5, 10.5, 15.0, 11.0), 2.5, 2.5)
+    p.end()
+    pm.setDevicePixelRatio(scale)
+    return pm
 
 
 class _Superseded(BaseException):
@@ -301,11 +361,279 @@ class _IconButton(QPushButton):
             p.drawRoundedRect(QRectF(cx - 5.5, cy - 4.5, 11, 7.5), 1.6, 1.6)
             p.drawLine(QPointF(cx, cy + 3), QPointF(cx, cy + 5.2))
             p.drawLine(QPointF(cx - 3, cy + 5.2), QPointF(cx + 3, cy + 5.2))
+        elif self._kind == "snip":
+            # Viewfinder corners - "capture a part of the screen".
+            s, k = r.width() * 0.22, r.width() * 0.11
+            for dx, dy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+                x, y = cx + dx * s, cy + dy * s
+                p.drawLine(QPointF(x, y), QPointF(x - dx * k, y))
+                p.drawLine(QPointF(x, y), QPointF(x, y - dy * k))
         elif self._kind == "stop":
             # Red rounded square - the universal "stop recording".
             p.setPen(Qt.NoPen)
             p.setBrush(QColor("#ef4444"))
             p.drawRoundedRect(QRectF(cx - 4.5, cy - 4.5, 9, 9), 2.2, 2.2)
+
+
+class _ElidedLabel(QLabel):
+    """One line that shortens itself with "…" when the bar is tight (fonts
+    run wider on macOS) instead of being cut off mid-letter."""
+
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self._full = text
+
+    def setText(self, text):
+        self._full = text or ""
+        self._elide()
+
+    def text(self):
+        return self._full
+
+    def sizeHint(self):
+        return QSize(self.fontMetrics().horizontalAdvance(self._full) + 4,
+                     super().sizeHint().height())
+
+    def minimumSizeHint(self):
+        return QSize(28, super().minimumSizeHint().height())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        self._elide()                     # a style/font change re-measures
+
+    def _elide(self):
+        shown = self.fontMetrics().elidedText(self._full, Qt.ElideRight, max(0, self.width()))
+        if shown != QLabel.text(self):
+            QLabel.setText(self, shown)
+
+
+class _AskEdit(QLineEdit):
+    """The ask box. Ctrl+V (⌘V) with an image on the clipboard attaches the
+    image instead of pasting text."""
+    image_pasted = Signal(QImage)
+
+    _IMAGE_FILES = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
+
+    def keyPressEvent(self, e):
+        if e.matches(QKeySequence.Paste):
+            img = self._clipboard_image()
+            if img is not None and not img.isNull():
+                self.image_pasted.emit(img)
+                return
+        super().keyPressEvent(e)
+
+    def _clipboard_image(self):
+        """An image on the clipboard - a screenshot, or an image file copied in
+        Explorer / Finder - else None."""
+        cb = QApplication.clipboard()
+        mime = cb.mimeData()
+        if mime is None:
+            return None
+        if mime.hasUrls():
+            for url in mime.urls():
+                path = url.toLocalFile() if url.isLocalFile() else ""
+                if path.lower().endswith(self._IMAGE_FILES):
+                    return QImage(path)
+        if mime.hasImage() and not mime.hasText():
+            # (Excel and others put a picture next to copied text - text wins.)
+            return cb.image()
+        return None
+
+
+class _ImageChip(QPushButton):
+    """The attached image: a rounded thumbnail with a small x - click to
+    remove it."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._thumb = QPixmap()
+        self.setFixedSize(34, 34)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFlat(True)
+        self.setStyleSheet("background: transparent; border: none;")
+        self.setToolTip("Image attached - it goes with your next question. Click to remove.")
+
+    def set_image(self, img):
+        dpr = self.devicePixelRatioF() or 1.0
+        side = int(34 * dpr)
+        pm = QPixmap.fromImage(img).scaled(side, side, Qt.KeepAspectRatioByExpanding,
+                                           Qt.SmoothTransformation)
+        x, y = max(0, (pm.width() - side) // 2), max(0, (pm.height() - side) // 2)
+        self._thumb = pm.copy(x, y, side, side)
+        self._thumb.setDevicePixelRatio(dpr)
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        clip = QPainterPath()
+        clip.addRoundedRect(r, 8, 8)
+        p.setClipPath(clip)
+        if not self._thumb.isNull():
+            p.drawPixmap(r.toRect(), self._thumb)
+        p.setClipping(False)
+        p.setPen(QPen(QColor(15, 23, 42, 60), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(r, 8, 8)
+        # The remove badge, top right.
+        badge = QRectF(r.right() - 13, r.top() + 1, 12, 12)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(15, 23, 42, 200))
+        p.drawEllipse(badge)
+        pen = QPen(QColor("#ffffff"), 1.4)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        c = badge.center()
+        p.drawLine(QPointF(c.x() - 2.5, c.y() - 2.5), QPointF(c.x() + 2.5, c.y() + 2.5))
+        p.drawLine(QPointF(c.x() + 2.5, c.y() - 2.5), QPointF(c.x() - 2.5, c.y() + 2.5))
+
+
+class _SnipOverlay(QWidget):
+    """Picks a part of one screen: the screen as it was when the snip began
+    (frozen), dimmed, with the dragged rectangle showing through. Kept out
+    of screen capture like the card, so a shared screen never shows it. Esc,
+    a right click or a click without a drag cancels."""
+    picked = Signal(QImage)
+    cancelled = Signal()
+
+    def __init__(self, geometry, shot):
+        super().__init__(None)
+        self._shot = shot                  # the whole screen, device pixels
+        self._origin = None
+        self._sel = QRect()
+        self._done = False
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setCursor(Qt.CrossCursor)
+        self.setGeometry(geometry)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.drawPixmap(self.rect(), self._shot)
+        dim = QColor(8, 12, 20, 120)
+        sel = self._sel
+        if sel.width() > 1 and sel.height() > 1:
+            outside = QPainterPath()
+            outside.addRect(QRectF(self.rect()))
+            outside.addRect(QRectF(sel))                  # odd-even fill: a hole
+            p.fillPath(outside, dim)
+            p.setPen(QPen(QColor("#60a5fa"), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(sel.adjusted(0, 0, -1, -1))
+        else:
+            p.fillRect(self.rect(), dim)
+        hint = "Drag over the part of the screen to send  ·  Esc cancels"
+        f = QFont(self.font())
+        f.setPointSizeF(max(10.0, f.pointSizeF() + 1))
+        f.setBold(True)
+        p.setFont(f)
+        box = QRect(0, 0, p.fontMetrics().horizontalAdvance(hint) + 28, 34)
+        box.moveCenter(QPoint(self.width() // 2, 44))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(15, 23, 42, 215))
+        p.drawRoundedRect(QRectF(box), 17, 17)
+        p.setPen(QColor("#f8fafc"))
+        p.drawText(box, Qt.AlignCenter, hint)
+
+    @staticmethod
+    def _span(a, b):
+        """The rectangle between two corners, edges exclusive (QRect(p1, p2)
+        would count both edges - one pixel too many each way)."""
+        return QRect(min(a.x(), b.x()), min(a.y(), b.y()),
+                     abs(b.x() - a.x()), abs(b.y() - a.y()))
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._origin = e.position().toPoint()
+            self._sel = QRect()
+            self.update()
+        elif e.button() == Qt.RightButton:
+            self._cancel()
+
+    def mouseMoveEvent(self, e):
+        if self._origin is not None:
+            self._sel = self._span(self._origin, e.position().toPoint())
+            self.update()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() != Qt.LeftButton or self._origin is None:
+            return
+        sel = self._span(self._origin, e.position().toPoint())
+        self._origin = None
+        if sel.width() < 8 or sel.height() < 8:
+            self._cancel()
+            return
+        dpr = self._shot.devicePixelRatio() or 1.0
+        crop = self._shot.copy(QRect(round(sel.x() * dpr), round(sel.y() * dpr),
+                                     round(sel.width() * dpr), round(sel.height() * dpr)))
+        self._done = True
+        self.picked.emit(crop.toImage())
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            self._cancel()
+
+    def closeEvent(self, e):
+        self._cancel()                     # Alt+F4 and the like end the snip too
+        super().closeEvent(e)
+
+    def _cancel(self):
+        if not self._done:
+            self._done = True
+            self.cancelled.emit()
+
+
+class _ContextChip(QFrame):
+    """The line under the header: the session context the answers use, or an
+    invitation to add one. A click opens the editor."""
+    clicked = Signal()
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setObjectName("laCtxChip")
+        self.setAttribute(Qt.WA_Hover, True)          # :hover in the stylesheet
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(26)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(9, 0, 9, 0)
+        lay.setSpacing(6)
+        self.lock = QLabel(self)
+        self.lock.hide()
+        lay.addWidget(self.lock)
+        self.tag = QLabel("CONTEXT", self)
+        self.tag.setObjectName("laCtxTag")
+        lay.addWidget(self.tag)
+        self.text = _ElidedLabel("", self)
+        self.text.setObjectName("laCtxText")
+        lay.addWidget(self.text, 1)
+        self.edit_hint = QLabel("Edit", self)
+        self.edit_hint.setObjectName("laCtxEditHint")
+        lay.addWidget(self.edit_hint)
+
+    def mousePressEvent(self, e):
+        e.accept()                                    # so the release comes here
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+
+
+class _ContextEdit(QPlainTextEdit):
+    """The session-context editor. Ctrl+Enter (⌘↩ on a Mac) or Esc finishes;
+    a plain Enter is a new line."""
+    finished = Signal()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape or (e.key() in (Qt.Key_Return, Qt.Key_Enter)
+                                        and e.modifiers() & Qt.ControlModifier):
+            self.finished.emit()
+            return
+        super().keyPressEvent(e)
 
 
 class _DragBar(QFrame):
@@ -380,6 +708,11 @@ class LiveAssistOverlay(QWidget):
         self._text_since_suggest = 0
         self._title = ""
         self._attendees = ""
+        self._image_b64 = ""               # an image attached to the next question
+        self._image = None
+        self._snips = []                   # the open screen pickers, one per screen
+        # What the user wrote about the call: every answer is shaped by it.
+        self._context = clip_context(str(cfg.get("live_assist_context") or ""))
         self._exclusion_ok = False
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -430,7 +763,7 @@ class LiveAssistOverlay(QWidget):
         bl = QHBoxLayout(self.bar)
         bl.setContentsMargins(4, 2, 0, 2)
         bl.setSpacing(8)
-        self.lbl_title = QLabel("Live Assistance", self.bar)
+        self.lbl_title = _ElidedLabel("Live Assistance", self.bar)
         bl.addWidget(self.lbl_title)
         # Idle: a solid Start button. Live: a green timer + a red stop button.
         self.btn_start = QPushButton("Start", self.bar)
@@ -481,6 +814,50 @@ class LiveAssistOverlay(QWidget):
         body = QVBoxLayout(self.body)
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(8)
+
+        # Session context: one line showing what the answers are told about
+        # this call; a click swaps it (and the transcript card) for an editor.
+        self.ctx_chip = _ContextChip(self.body)
+        self.ctx_chip.clicked.connect(self._open_context_editor)
+        body.addWidget(self.ctx_chip)
+        self.ctx_panel = QWidget(self.body)
+        cp = QVBoxLayout(self.ctx_panel)
+        cp.setContentsMargins(0, 0, 0, 0)
+        cp.setSpacing(8)
+        ctx_head = QHBoxLayout()
+        ctx_head.setSpacing(6)
+        self.lbl_ctx_head = QLabel("SESSION CONTEXT", self.ctx_panel)
+        ctx_head.addWidget(self.lbl_ctx_head)
+        ctx_head.addStretch()
+        self.lbl_ctx_count = QLabel("", self.ctx_panel)
+        self.lbl_ctx_count.setObjectName("laFoot")
+        ctx_head.addWidget(self.lbl_ctx_count)
+        self.btn_ctx_clear = QPushButton("Clear", self.ctx_panel)
+        self.btn_ctx_clear.setFixedHeight(22)
+        self.btn_ctx_clear.setCursor(Qt.PointingHandCursor)
+        self.btn_ctx_clear.clicked.connect(self._clear_context_text)
+        ctx_head.addWidget(self.btn_ctx_clear)
+        self.btn_ctx_done = QPushButton("Done", self.ctx_panel)
+        self.btn_ctx_done.setObjectName("laCtxDone")
+        self.btn_ctx_done.setFixedHeight(22)
+        self.btn_ctx_done.setCursor(Qt.PointingHandCursor)
+        self.btn_ctx_done.setToolTip("Lock it in for this session (Ctrl+Enter)"
+                                     if sys.platform != "darwin"
+                                     else "Lock it in for this session (⌘↩)")
+        self.btn_ctx_done.clicked.connect(self._finish_context_edit)
+        ctx_head.addWidget(self.btn_ctx_done)
+        cp.addLayout(ctx_head)
+        self.ctx_edit = _ContextEdit(self.ctx_panel)
+        self.ctx_edit.setObjectName("laCtxEdit")
+        self.ctx_edit.setPlaceholderText(CONTEXT_PLACEHOLDER)
+        self.ctx_edit.setTabChangesFocus(True)
+        # Exactly the chip + transcript slot it replaces: nothing below moves.
+        self.ctx_edit.setFixedHeight(136)
+        self.ctx_edit.textChanged.connect(self._on_context_typed)
+        self.ctx_edit.finished.connect(self._finish_context_edit)
+        cp.addWidget(self.ctx_edit)
+        self.ctx_panel.hide()
+        body.addWidget(self.ctx_panel)
 
         self.lbl_now_head = QLabel("NOW", self.body)
         body.addWidget(self.lbl_now_head)
@@ -537,10 +914,26 @@ class LiveAssistOverlay(QWidget):
 
         ask_row = QHBoxLayout()
         ask_row.setSpacing(8)
-        self.input_ask = QLineEdit(self.body)
-        self.input_ask.setPlaceholderText("Ask anything about the call or your screen…")
+        self.img_chip = _ImageChip(self.body)
+        self.img_chip.clicked.connect(self._clear_image)
+        self.img_chip.hide()
+        ask_row.addWidget(self.img_chip)
+        self.input_ask = _AskEdit(self.body)
+        self.input_ask.setPlaceholderText(ASK_PLACEHOLDER)
         self.input_ask.returnPressed.connect(self._ask)
+        self.input_ask.image_pasted.connect(self._attach_image)
         ask_row.addWidget(self.input_ask, 1)
+        # Snip a part of the screen to send with the question.
+        hidden = glass.capture_exclusion_supported() and not glass.is_remote_session()
+        self.btn_snip = _IconButton("snip", self.body,
+                                    "Snip a part of the screen to send with your question"
+                                    + (" (the snipping screen is hidden from screen shares)"
+                                       if hidden else "")
+                                    + ". Or paste an image with "
+                                    + ("⌘V." if sys.platform == "darwin" else "Ctrl+V."))
+        self.btn_snip.setFixedSize(34, 34)
+        self.btn_snip.clicked.connect(self._start_snip)
+        ask_row.addWidget(self.btn_snip)
         # A round send button with a paper-plane icon, like a chat app.
         self.btn_suggest = QPushButton("", self.body)
         self.btn_suggest.setObjectName("laSuggest")
@@ -635,13 +1028,33 @@ class LiveAssistOverlay(QWidget):
                 border-radius: 11px; padding: 2px 10px; font-size: 12px; font-weight: 700;
             }}
             QLabel#laFoot {{ color: {t['faint']}; font-size: 11px; }}
+            QFrame#laCtxChip {{
+                background: {t['card']}; border: 1px solid {t['card_border']};
+                border-radius: 9px;
+            }}
+            QFrame#laCtxChip:hover {{ border-color: {accent}; }}
+            QFrame#laCtxChip[empty="true"] {{ border-style: dashed; }}
+            QLabel#laCtxTag {{
+                color: {accent}; font-size: 10px; font-weight: 700; letter-spacing: 1px;
+            }}
+            QLabel#laCtxText {{ color: {t['text']}; font-size: 12px; }}
+            QLabel#laCtxText[empty="true"] {{ color: {t['muted']}; }}
+            QLabel#laCtxEditHint {{ color: {accent}; font-size: 11.5px; }}
+            QPlainTextEdit#laCtxEdit {{
+                background: {t['card']}; border: 1px solid {accent};
+                border-radius: 10px; color: {t['text']}; font-size: 12.5px; padding: 4px;
+            }}
+            QPushButton#laCtxDone {{
+                background: {accent}; color: white; border-color: {accent}; font-weight: 600;
+            }}
         """)
-        for lbl in (self.lbl_now_head, self.lbl_sum_head, self.lbl_sug_head):
+        for lbl in (self.lbl_now_head, self.lbl_sum_head, self.lbl_sug_head,
+                    self.lbl_ctx_head):
             lbl.setStyleSheet(f"color: {t['faint']}; font-size: 10px; font-weight: 700; "
                               "letter-spacing: 1px; background: transparent;")
         self.lbl_title.setStyleSheet(f"color: {t['text']}; font-weight: 700; font-size: 13px;")
         for b in (self.btn_theme, self.btn_collapse, self.btn_close, self.btn_screen,
-                  self.btn_stop):
+                  self.btn_stop, self.btn_snip):
             b.set_theme(t)
         self._shadow_key = None          # shadow tint depends on theme
         self._refresh_private_chip()
@@ -693,6 +1106,10 @@ class LiveAssistOverlay(QWidget):
         excluded = False
         if self._private and supported and not remote:
             excluded = glass.exclude_from_capture(self, True)
+        elif self._private and glass.IS_MAC:
+            # macOS 15+: older capture paths still honour it - worth setting,
+            # but the chip can't claim hidden (capture_exclusion_supported).
+            glass.exclude_from_capture(self, True)
         else:
             glass.exclude_from_capture(self, False)
         self._exclusion_ok = excluded
@@ -722,8 +1139,9 @@ class LiveAssistOverlay(QWidget):
             excluded = glass.is_excluded_from_capture(self) if self.isVisible() \
                 else self._exclusion_ok
         key, _ = private_state(self._private, supported, remote, excluded)
+        mac = sys.platform == "darwin"
         text = {"on": "Private", "off": "Visible", "failed": "Not private",
-                "unavailable": "Private n/a"}[key]
+                "unavailable": "Not hidden" if mac else "Private n/a"}[key]
         bg, fg, border = self._CHIP_COLORS[key]
         try:
             from ui.icons import eye_icon
@@ -739,13 +1157,22 @@ class LiveAssistOverlay(QWidget):
             f"{border}; border-radius: 11px; padding: 2px 10px 2px 8px; font-size: 12px; "
             "font-weight: 600; }")
         tips = {
-            "on": "Hidden from Zoom/Teams/Meet shares, recordings and screenshots on "
-                  "this PC (not from phone cameras). Click to make it visible - e.g. "
-                  "to include it in your own recording.",
+            "on": ("Hidden from screen sharing and recordings through macOS's "
+                   "screen-capture protection (not from phone cameras). Most sharing "
+                   "apps respect it - do a quick test share to be sure. Click to make "
+                   "it visible." if mac else
+                   "Hidden from Zoom/Teams/Meet shares, recordings and screenshots on "
+                   "this PC (not from phone cameras). Click to make it visible - e.g. "
+                   "to include it in your own recording."),
             "off": "This card WILL show on a shared screen. Click to hide it from shares.",
-            "failed": "Windows refused to hide this window - assume it is visible in a share.",
-            "unavailable": "Screen-share privacy needs Windows 10 2004+ and a local "
-                           "(non-remote) session.",
+            "failed": ("macOS" if mac else "Windows") + " refused to hide this window - "
+                      "assume it is visible in a share.",
+            "unavailable": ("macOS 15 and later don't let apps hide a window from "
+                            "screen sharing, so this card shows if you share your whole "
+                            "screen. Share just one window - your browser or the "
+                            "document - and it won't appear." if mac else
+                            "Screen-share privacy needs Windows 10 2004+ and a local "
+                            "(non-remote) session."),
         }
         self.btn_private.setToolTip(tips[key])
 
@@ -756,6 +1183,7 @@ class LiveAssistOverlay(QWidget):
         self.btn_stop.setVisible(live)
         if live:
             self._update_timer()
+        self._refresh_context_chip()
 
     def _update_timer(self):
         since = getattr(self, "_live_since", None)
@@ -1009,8 +1437,102 @@ class LiveAssistOverlay(QWidget):
         self._shadow_key = None
         QTimer.singleShot(0, self._apply_glass)
 
+    # ── session context ──
+    def _refresh_context_chip(self):
+        chip, ctx = self.ctx_chip, self._context
+        locked = bool(ctx) and self._meeting_active
+        chip.lock.setVisible(locked)
+        if locked:
+            chip.lock.setPixmap(_lock_pixmap(12, _THEMES[self._theme_name]["accent"]))
+        chip.tag.setVisible(bool(ctx))
+        chip.tag.setText("LOCKED IN" if locked else "CONTEXT")
+        chip.text.setText(" ".join(ctx.split())[:300] if ctx else CONTEXT_EMPTY)
+        chip.edit_hint.setVisible(bool(ctx))
+        empty = "false" if ctx else "true"
+        for w in (chip, chip.text):
+            if w.property("empty") != empty:
+                w.setProperty("empty", empty)          # restyle: dashed / muted
+                w.style().unpolish(w)
+                w.style().polish(w)
+        if not ctx:
+            tip = ("Tell the assistant what this call is about - who you are, who "
+                   "you're talking to, what you want from it. Every answer this "
+                   "session uses it.")
+            chip.setToolTip(f"<p style='white-space:normal'>{tip}</p>")
+            return
+        import html as html_mod
+        head = ("<b>Locked in for this session</b> - every answer uses it. Click to change it."
+                if locked else
+                "<b>Session context</b> - every answer uses it until you change it. "
+                "Click to edit.")
+        shown = ctx if len(ctx) <= 700 else ctx[:700] + "…"
+        chip.setToolTip(f"<p style='white-space:normal'>{head}</p>"
+                        f"<p style='white-space:pre-wrap'>{html_mod.escape(shown)}</p>")
+
+    def _open_context_editor(self):
+        if not self.ctx_panel.isHidden():
+            return
+        self.ctx_edit.blockSignals(True)
+        self.ctx_edit.setPlainText(self._context)
+        self.ctx_edit.blockSignals(False)
+        self._on_context_typed()
+        self.ctx_chip.hide()
+        self.lbl_sum_head.hide()
+        self.txt_summary.hide()
+        self.ctx_panel.show()
+        self.activateWindow()                  # typing needs the keyboard focus
+        self.ctx_edit.setFocus()
+        self.ctx_edit.moveCursor(self.ctx_edit.textCursor().MoveOperation.End)
+
+    def _on_context_typed(self):
+        text = self.ctx_edit.toPlainText()
+        if len(text) > CONTEXT_CHARS:
+            # A pasted document: keep what the model will get.
+            pos = min(self.ctx_edit.textCursor().position(), CONTEXT_CHARS)
+            self.ctx_edit.blockSignals(True)
+            self.ctx_edit.setPlainText(text[:CONTEXT_CHARS])
+            self.ctx_edit.blockSignals(False)
+            cur = self.ctx_edit.textCursor()
+            cur.setPosition(pos)
+            self.ctx_edit.setTextCursor(cur)
+            text = text[:CONTEXT_CHARS]
+        n = len(text)
+        self.lbl_ctx_count.setText(f"{n:,} / {CONTEXT_CHARS:,}"
+                                   if n >= CONTEXT_CHARS * 0.8 else "")
+
+    def _clear_context_text(self):
+        self.ctx_edit.clear()
+        self.ctx_edit.setFocus()
+
+    def _finish_context_edit(self):
+        if self.ctx_panel.isHidden():
+            return
+        self.ctx_panel.hide()
+        self.ctx_chip.show()
+        self.lbl_sum_head.show()
+        self.txt_summary.show()
+        self._set_context(self.ctx_edit.toPlainText())
+
+    def _set_context(self, text):
+        text = clip_context(text)
+        if text == self._context:
+            return
+        self._context = text
+        if self.app:
+            self.app.cfg["live_assist_context"] = text
+            self.app.save_config()
+        self._refresh_context_chip()
+        if not text:
+            self._set_status("Context cleared.")
+        elif self._meeting_active:
+            self._set_status("✓ Context locked in - every answer from now on uses it.")
+        else:
+            self._set_status("✓ Context saved - every answer uses it.")
+
     # ── start / stop (drives the meeting recorder) ──
     def _start_listening(self):
+        # An open context editor: what's typed is this session's context.
+        self._finish_context_edit()
         mw = getattr(self.app, "meetings_win", None) if self.app else None
         if mw is None:
             self._set_status("Meeting recorder isn't available.")
@@ -1042,7 +1564,11 @@ class LiveAssistOverlay(QWidget):
             self._set_fast_chunks(True)
             # Wake the answer engine now, so the first question isn't a cold start.
             threading.Thread(target=self._warm_up_engine, daemon=True).start()
-            mw._start_meeting(language=lang if lang and lang != "auto" else None)
+            # Both sides of the call, as the Start button promises: mic +
+            # system sound, whatever Record Meeting is set to (when this
+            # system can capture both).
+            mw._start_meeting(language=lang if lang and lang != "auto" else None,
+                              audio_mode="smart_meeting")
             if getattr(mw, "state", None) != mw.STATE_RECORDING:
                 self._set_fast_chunks(False)
                 self._set_status("Couldn't start listening - see Record Meeting.")
@@ -1051,6 +1577,7 @@ class LiveAssistOverlay(QWidget):
                     "language": lang or "auto",
                     "screen_auto": self.btn_screen.isChecked(),
                     "auto_suggest": self._auto,
+                    "context": bool(self._context),
                 })
         except Exception as e:
             logger.warning("Live Assistance start failed: %s", e, exc_info=True)
@@ -1087,6 +1614,9 @@ class LiveAssistOverlay(QWidget):
     def set_meeting_active(self, active, title="", attendees=""):
         self._meeting_active = bool(active)
         if active:
+            # Started from Record Meeting with the editor open: what's typed
+            # is this session's context.
+            self._finish_context_edit()
             self._live_since = time.time()
             self._live_text = ""
             self._summary = ""
@@ -1097,7 +1627,8 @@ class LiveAssistOverlay(QWidget):
             self._title, self._attendees = title or "", attendees or ""
             self.txt_summary.clear()
             self.txt_summary.setPlaceholderText("Listening…")
-            self.lbl_status.setText("")
+            self.lbl_status.setText("Context locked in for this session." if self._context
+                                    else "")
         else:
             self._set_fast_chunks(False)
             # The recording lands in the meeting folder moments after Stop;
@@ -1151,23 +1682,116 @@ class LiveAssistOverlay(QWidget):
 
     def _ask(self):
         q = self.input_ask.text().strip()
-        if q:
-            self.suggest(q)
-            self._suggest_from_input = True   # clear the field once it's answered
+        image, image_b64 = self._image, self._image_b64
+        if not q and not image_b64:
+            return
+        gen = self._gen
+        self.suggest(q or SNIP_QUESTION, image_b64=image_b64)
+        if self._gen == gen:
+            return                            # nothing went out
+        # Sent: empty the box at once and say so - the answer streams below.
+        # (If it fails, the question and image come back.)
+        self._sent_question = q
+        self._sent_image = image if image_b64 else None
+        self._clear_image()
+        self.input_ask.clear()
+        self.input_ask.setPlaceholderText(ASK_SENT)
+        what = q or "the image"
+        extra = " + image" if (q and image_b64) else ""
+        self._set_status("✓ Sent: " + (what if len(what) <= 62 else what[:59] + "…") + extra)
+        self.txt_suggestion.setPlainText(f"You asked: {q or 'about the image'}{extra}\n\nThinking…")
 
     def _ask_or_answer(self):
-        # The Ask button: the typed question if there is one, else answer the
-        # latest question of the call.
-        if self.input_ask.text().strip():
+        # The Ask button: the typed question and/or the attached image if there
+        # is one, else answer the latest question of the call.
+        if self.input_ask.text().strip() or self._image_b64:
             self._ask()
         else:
             self.suggest("")
 
-    def suggest(self, question="", auto=False, force_screen=False):
+    # ── images: snip a part of the screen, or paste one ──
+    def _images_blocked(self):
+        if self.app and self.app.cfg.get("privacy_mode"):
+            self._set_status("Images can't be sent in Privacy Mode - answers stay on this "
+                             "computer.")
+            return True
+        return False
+
+    def _attach_image(self, img):
+        if img is None or img.isNull() or self._images_blocked():
+            return
+        b64 = jpeg_b64(img, 1600, 90)
+        if not b64:
+            return
+        self._image, self._image_b64 = QImage(img), b64
+        self.img_chip.set_image(img)
+        self.img_chip.show()
+        self._set_status("✓ Image attached - ask about it, or just press send.")
+        self.input_ask.setFocus()
+
+    def _clear_image(self):
+        self._image, self._image_b64 = None, ""
+        self.img_chip.hide()
+
+    def _start_snip(self):
+        if self._snips or self._images_blocked():
+            return
+        # Every screen is grabbed BEFORE any picker shows, so no picker is in
+        # another screen's shot. The card is absent too while it's Private.
+        shots = []
+        for scr in QApplication.screens():
+            try:
+                pm = scr.grabWindow(0)
+            except Exception:
+                pm = QPixmap()
+            if not pm.isNull():
+                shots.append((scr, pm))
+        if not shots:
+            self._set_status("Couldn't capture the screen - try again.")
+            return
+        under = screen_to_capture(self.screen())
+        hide = glass.capture_exclusion_supported() and not glass.is_remote_session()
+        for scr, pm in shots:
+            o = _SnipOverlay(scr.geometry(), pm)
+            o.setScreen(scr)                   # that screen's scaling
+            o.setGeometry(scr.geometry())
+            o.picked.connect(self._on_snip_picked)
+            o.cancelled.connect(self._end_snip)
+            if hide:
+                o.winId()                          # a native window to protect...
+                glass.exclude_from_capture(o, True)    # ...before it ever shows
+            o.show()
+            if hide:
+                glass.exclude_from_capture(o, True)    # and again once it's mapped
+            self._snips.append(o)
+            if scr is under:
+                o.raise_()
+                o.activateWindow()             # Esc goes to it
+                o.setFocus()
+
+    def _end_snip(self):
+        snips, self._snips = self._snips, []
+        for o in snips:
+            try:
+                o.close()
+            except RuntimeError:
+                pass                       # already gone
+
+    def _on_snip_picked(self, img):
+        self._end_snip()
+        self._attach_image(img)
+        self.activateWindow()                  # type the question right away
+
+    def suggest(self, question="", auto=False, force_screen=False, image_b64=""):
         """Answer now. A newer request supersedes one still streaming - the
-        freshest question is the one that matters in a live call."""
+        freshest question is the one that matters in a live call.
+        ``image_b64``: an image the user attached (a snip or a pasted one) -
+        sent instead of the automatic screenshot."""
         if not self.app:
             self._on_suggestion("", "No app context.")
+            return
+        if image_b64 and self.app.cfg.get("privacy_mode"):
+            self._images_blocked()
             return
         if auto and ((self._suggesting and not getattr(self, "_suggest_auto", False))
                      or time.time() < getattr(self, "_hold_until", 0.0)):
@@ -1185,10 +1809,11 @@ class LiveAssistOverlay(QWidget):
                 self.txt_suggestion.setPlainText(
                     "Nothing has been said yet - press Start, or type a question.")
                 return
-        image_b64 = ""
+        attached = bool(image_b64)
         # Privacy Mode is on-device only: answers come from a local, text-only
         # model, so a screenshot could only ever leave via cloud OCR - none.
-        if should_attach_screen(screen_on, force_screen) and not self.app.cfg.get("privacy_mode"):
+        if (not attached and should_attach_screen(screen_on, force_screen)
+                and not self.app.cfg.get("privacy_mode")):
             image_b64 = capture_screen_b64(screen_to_capture(self.screen()))
         if force_screen and not image_b64:
             # Asking a model to "solve the screen" without one only gets a
@@ -1204,7 +1829,8 @@ class LiveAssistOverlay(QWidget):
         self._screen_note = ""                # this answer's screen status, if any
         self._suggest_auto = auto
         self._suggest_asked = bool(question)
-        self._suggest_from_input = False
+        self._sent_question = ""              # _ask() sets it for a typed question
+        self._sent_image = None
         self._suggest_question = question or last_question(self._live_text)
         self._last_attached_screen = bool(image_b64)
         self._suggesting = True
@@ -1214,9 +1840,9 @@ class LiveAssistOverlay(QWidget):
         self.txt_suggestion.setPlainText("Thinking…")
         context = rolling_context(
             self._live_text, question, self._title, self._attendees,
-            screen=bool(image_b64),
+            screen="snip" if attached else bool(image_b64),
             output_lang=(self.app.cfg.get("live_assist_output_language") or "en"),
-            history=self._qa_history)
+            history=self._qa_history, session_context=self._context)
         threading.Thread(target=self._suggest_worker, args=(context, image_b64, gen),
                          daemon=True).start()
 
@@ -1317,6 +1943,8 @@ class LiveAssistOverlay(QWidget):
         if gen is not None and gen != self._gen:
             return      # the answer to an older question - superseded
         self._suggesting = False
+        self.input_ask.setPlaceholderText(ASK_PLACEHOLDER)
+        sent, self._sent_question = getattr(self, "_sent_question", ""), ""
         self._last_suggest_at = time.time()
         took = time.time() - self._suggest_started if self._suggest_started else 0
         if self.app:
@@ -1331,6 +1959,12 @@ class LiveAssistOverlay(QWidget):
             })
         if error:
             self.txt_suggestion.setPlainText(f"Couldn't get an answer: {error}")
+            if sent and not self.input_ask.text():
+                self.input_ask.setText(sent)  # nothing lost: Enter sends it again
+            sent_image = getattr(self, "_sent_image", None)
+            self._sent_image = None
+            if sent_image is not None and not self._image_b64:
+                self._attach_image(sent_image)
             return
         render_markdown(self.txt_suggestion, text.strip() or "(no answer)")
         if text.strip():
@@ -1351,8 +1985,6 @@ class LiveAssistOverlay(QWidget):
             self.lbl_status.setText(
                 f"Answered {time.strftime('%H:%M:%S')} · {first}done {took:.1f}s · {shot}"
                 "AI can be wrong - check facts")
-        if getattr(self, "_suggest_from_input", False):
-            self.input_ask.clear()
 
     def _on_auto_toggled(self, on):
         self._auto = bool(on)
