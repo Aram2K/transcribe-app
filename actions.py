@@ -312,6 +312,10 @@ def process(text, mode, source_lang="auto", target_lang="en", model=RULE_BASED_I
             return local_llm.run_action(text, mode, source_lang=source_lang,
                                         target_lang=target_lang, model_id=model,
                                         vocab_block=vocab_block)
+        except local_llm.LocalModelLoadError as e:
+            # A chosen model that won't load: say so (meetings show it with
+            # Retry), never quietly swap in the built-in formatter.
+            raise ActionError(str(e)) from e
         except local_llm.LocalLLMError as e:
             if mode == ACTION_TRANSLATE:
                 raise ActionError(str(e)) from e
@@ -434,11 +438,19 @@ def warm_up(model, config):
     """Wake the engine a live session will use, so the first answer isn't a
     cold start. Blocking (worker thread only); never raises. Nothing leaves
     the device in Privacy Mode."""
-    if (config or {}).get("privacy_mode"):
-        return
     try:
         model = normalize_action_model(model)
         kind = ACTION_MODELS.get(model, {}).get("kind")
+        if kind == "local_llm":
+            # A local session (Privacy Mode, or no cloud engine): load it now
+            # - the idle sweep may have freed it - not at the first question.
+            # Nothing leaves the device.
+            import local_llm
+            if local_llm.model_downloaded(model):
+                local_llm._load_model(model)
+            return
+        if (config or {}).get("privacy_mode"):
+            return
         if kind == "managed":
             action_api.warm_up_managed((config or {}).get("_managed_token"))
         elif kind == "cloud" and config:

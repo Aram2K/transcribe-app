@@ -1143,6 +1143,7 @@ class TestInferenceSerialization(unittest.TestCase):
         rec._infer_lock = threading.Lock()
         rec._session_lang = "en"
         rec.load_model = lambda *a, **k: None
+        rec._load_locked = lambda *a, **k: None   # the model below is "resident"
         rec._lang_setting = lambda: "en"  # skip language-detection branch
 
         state = {"cur": 0, "max": 0}

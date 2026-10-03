@@ -755,6 +755,13 @@ class MeetingsWindow(QDialog):
         try:
             self.app.recorder.start_recording(capture_mode=meeting_mode,
                                               language=meeting_lang)
+            # Load the speech model while the first seconds are recorded (the
+            # idle sweep may have freed it), not when the first piece is due.
+            if hasattr(self.app, "prewarm_speech_model"):
+                try:
+                    self.app.prewarm_speech_model()
+                except Exception:
+                    pass                       # never a recording failure
         except Exception as e:
             self._restore_recorder_callbacks()
             self.state = self.STATE_IDLE
@@ -1292,6 +1299,10 @@ class MeetingsWindow(QDialog):
             self.proc_signals.finished.emit("", str(e))
 
     def _on_processing_finished(self, notes, error_msg):
+        # The session's AI work is over (notes or not): free the local model
+        # now rather than idling with it for minutes.
+        if self.app and hasattr(self.app, "release_models_after_session"):
+            self.app.release_models_after_session()
         transcript = getattr(self, "_final_transcript", "") or ""
 
         if error_msg:
@@ -1632,6 +1643,11 @@ class MeetingsWindow(QDialog):
         self._show_retry_summary(False)
         self.state = self.STATE_PROCESSING
         self.container.setCurrentIndex(2)
+        try:
+            import local_llm
+            local_llm.forget_load_failures()           # Retry = really try the model again
+        except Exception:
+            pass
         threading.Thread(target=self._summarize_and_finish, daemon=True).start()
 
     def _reset(self):

@@ -129,6 +129,10 @@ class TestOverlayHelpers(unittest.TestCase):
         self.assertIn("visible", ps(True, True, False, False)[1].lower())
         self.assertEqual(ps(True, False, False, False)[0], "unavailable")   # old Windows / macOS
         self.assertEqual(ps(True, True, True, False)[0], "unavailable")    # remote session
+        # macOS 15+ with the flag set: best effort, never "on".
+        self.assertEqual(ps(True, False, False, True, partial=True)[0], "partial")
+        self.assertEqual(ps(True, False, True, True, partial=True)[0], "unavailable")  # + remote
+        self.assertEqual(ps(False, False, False, True, partial=True)[0], "off")
         self.assertEqual(ps(False, True, False, False)[0], "off")
         for args in ((True, False, False, True), (True, True, True, True)):
             self.assertNotIn("not in share", ps(*args)[1])

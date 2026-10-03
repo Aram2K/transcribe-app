@@ -170,7 +170,7 @@ class TestLocalWhisperMixed(unittest.TestCase):
                                         "mix_languages": list(mix), "vocabulary": []}):
             # A plain list: the path only slices the audio, and other test
             # files stub numpy out.
-            text, lang = main.AudioRecorder._run_local_once(rec, [0.0] * (16000 * 2))
+            text, lang = main.AudioRecorder._run_local_with(rec, model, [0.0] * (16000 * 2))
         return text, lang, model
 
     def test_detects_among_the_mix_and_primes_the_decoder(self):

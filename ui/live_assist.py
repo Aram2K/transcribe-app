@@ -15,8 +15,8 @@ What it is (product contract):
   appears on a shared screen or in a recording while staying visible on the
   user's own monitor. A privacy feature for the user's private notes - never
   marketed as a way to deceive anyone; recording-consent guidance applies.
-* An image can go with a question: snip a part of the screen (the picker is
-  hidden from screen shares too) or paste one with Ctrl+V.
+* An image can go with a question: a screenshot cropped inside the card
+  itself (nothing new appears on the screen) or one pasted with Ctrl+V.
 * Liquid glass: because the window is excluded from capture, the pixels
   BEHIND it can be sampled (QScreen.grabWindow honours the exclusion) and
   rendered back through the shape - real blur, an edge refraction ring, a
@@ -36,15 +36,15 @@ import threading
 import time
 
 from PySide6.QtCore import (
-    Qt, QBuffer, QIODevice, QPoint, QPointF, QRect, QRectF, QSize, QTimer, Signal,
+    Qt, QBuffer, QEvent, QIODevice, QObject, QPointF, QRect, QRectF, QSize, QTimer, Signal,
 )
 from PySide6.QtGui import (
-    QBrush, QColor, QCursor, QFont, QIcon, QImage, QKeySequence, QLinearGradient, QPainter,
+    QBrush, QColor, QCursor, QIcon, QImage, QKeySequence, QLinearGradient, QPainter,
     QPainterPath, QPen, QPixmap, QRadialGradient,
 )
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
-    QTextEdit, QVBoxLayout, QWidget,
+    QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
 import actions
@@ -128,10 +128,26 @@ def clamp_to_rects(x, y, w, h, rects, margin=8):
             max(t + margin, min(y, b - h - margin)))
 
 
-def private_state(wanted, supported, remote, excluded):
+def mac_partial_tip(macos26=False):
+    """The macOS badge tooltip: the sharingType flag (what Electron's
+    setContentProtection sets) is honoured by some capture paths, not all -
+    see glass.capture_exclusion_supported. Never claims more."""
+    caveat = "Not yet verified on macOS 26." if macos26 else "Apple doesn't guarantee it."
+    return ("Uses macOS's private-window setting. Screenshots skip it, and so do some "
+            "screen shares (reportedly Zoom's \u201c\u2026with window filtering\u201d capture "
+            "modes), but QuickTime and \u2318\u21e75 recordings show it, and so can other "
+            "apps and settings. " + caveat + " Test from a second device before relying on "
+            "it, or share a single window. Click to make it visible.")
+
+
+def private_state(wanted, supported, remote, excluded, partial=False):
     """(key, chip text) - always TRUTHFUL about what the OS actually did. The
     badge is the whole privacy promise; it must never say hidden when the
-    window is in fact capturable (macOS, old Windows, RDP, API refusal)."""
+    window is in fact capturable (macOS, old Windows, RDP, API refusal).
+
+    ``partial``: macOS, where the window's sharingType is set to none and
+    reads back so - some capture paths honour it, some don't (QuickTime,
+    Zoom's default capture mode), and Apple promises nothing. Never "Private"."""
     # Short on purpose: the chip shares the header with Listen/Stop and three
     # icon buttons; the full explanation lives in its tooltip.
     if not wanted:
@@ -139,6 +155,8 @@ def private_state(wanted, supported, remote, excluded):
     if remote:
         return "unavailable", "PRIVATE n/a · remote"
     if not supported:
+        if partial:
+            return "partial", "MAY be hidden"
         return "unavailable", "PRIVATE n/a here"
     if excluded:
         return "on", "PRIVATE · not in share"
@@ -493,99 +511,210 @@ class _ImageChip(QPushButton):
         p.drawLine(QPointF(c.x() + 2.5, c.y() - 2.5), QPointF(c.x() - 2.5, c.y() + 2.5))
 
 
-class _SnipOverlay(QWidget):
-    """Picks a part of one screen: the screen as it was when the snip began
-    (frozen), dimmed, with the dragged rectangle showing through. Kept out
-    of screen capture like the card, so a shared screen never shows it. Esc,
-    a right click or a click without a drag cancels."""
-    picked = Signal(QImage)
+class _PopupPrivacy(QObject):
+    """Tooltips, right-click menus and other popups are windows of their own,
+    so the card's capture exclusion doesn't cover them - a tooltip over the
+    card would show in a share. Each one opened from the card gets the card's
+    privacy as it shows (before it's on screen), and gives it back if Qt
+    reuses it for another window.
+
+    A menu's parent is the widget it belongs to; Qt 6's tooltip window has no
+    parent, so a tooltip is the card's when the last tooltip REQUEST (the
+    QEvent.ToolTip sent to the widget under the mouse) came from the card."""
+
+    def __init__(self, card):
+        super().__init__(card)
+        self._card = card
+
+    def eventFilter(self, obj, event):
+        t = event.type()
+        if t == QEvent.ToolTip and isinstance(obj, QWidget):
+            mine = obj.window() is self._card
+            self._card._tip_from_card = mine
+            if mine:
+                # The tooltip window may already be up (Qt reuses it while a
+                # tooltip shows): guard it too, once Qt has placed the text.
+                QTimer.singleShot(0, self._card._guard_visible_tips)
+        elif t == QEvent.Show and obj is not self._card \
+                and isinstance(obj, QWidget) and obj.isWindow() \
+                and obj.windowType() in (Qt.ToolTip, Qt.Popup):
+            self._card._guard_popup(obj)
+        return False
+
+
+class _CropView(QWidget):
+    """The screenshot, inside the card: drag over the part to send. Nothing
+    opens on the screen itself, so a shared screen shows nothing new (no
+    full-screen picker, no crosshair sweeping across it) - the card is the
+    only thing that changes, and it's private. Enter or a double-click
+    attaches, Esc cancels."""
+    changed = Signal()
+    accepted = Signal()
     cancelled = Signal()
 
-    def __init__(self, geometry, shot):
-        super().__init__(None)
-        self._shot = shot                  # the whole screen, device pixels
-        self._origin = None
-        self._sel = QRect()
-        self._done = False
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_DeleteOnClose, True)
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._shot = QPixmap()
+        self._origin = None                # drag start, 0..1 image coordinates
+        self._sel = None                   # QRectF in 0..1 image coordinates
+        self._sel_before_press = None      # a double-click's first click clears
+        self._dbl = False                  # the press was a double-click's second
+        self._dbl_restore = None
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setCursor(Qt.CrossCursor)
-        self.setGeometry(geometry)
+        self.setMinimumHeight(120)
+        # As tall as the screenshot's shape needs (no empty bands above and
+        # below it), capped so a portrait monitor still fits the card.
+        pol = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        pol.setHeightForWidth(True)
+        self.setSizePolicy(pol)
 
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.drawPixmap(self.rect(), self._shot)
-        dim = QColor(8, 12, 20, 120)
-        sel = self._sel
-        if sel.width() > 1 and sel.height() > 1:
-            outside = QPainterPath()
-            outside.addRect(QRectF(self.rect()))
-            outside.addRect(QRectF(sel))                  # odd-even fill: a hole
-            p.fillPath(outside, dim)
-            p.setPen(QPen(QColor("#60a5fa"), 2))
-            p.setBrush(Qt.NoBrush)
-            p.drawRect(sel.adjusted(0, 0, -1, -1))
-        else:
-            p.fillRect(self.rect(), dim)
-        hint = "Drag over the part of the screen to send  ·  Esc cancels"
-        f = QFont(self.font())
-        f.setPointSizeF(max(10.0, f.pointSizeF() + 1))
-        f.setBold(True)
-        p.setFont(f)
-        box = QRect(0, 0, p.fontMetrics().horizontalAdvance(hint) + 28, 34)
-        box.moveCenter(QPoint(self.width() // 2, 44))
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(15, 23, 42, 215))
-        p.drawRoundedRect(QRectF(box), 17, 17)
-        p.setPen(QColor("#f8fafc"))
-        p.drawText(box, Qt.AlignCenter, hint)
+    MAX_H = 380
+    CLICK_SLOP = 5                     # px on screen: less is a click, not a drag
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        if self._shot.isNull() or self._shot.width() <= 0:
+            return 240
+        return max(120, min(self.MAX_H, round(w * self._shot.height() / self._shot.width())))
+
+    def sizeHint(self):
+        return QSize(452, self.heightForWidth(452))
+
+    def set_shot(self, pm):
+        self._shot = pm
+        self._sel = self._origin = None
+        self.updateGeometry()                 # a new shape (another monitor)
+        self.changed.emit()
+        self.update()
+
+    def has_selection(self):
+        return self._sel is not None
+
+    def _target(self):
+        """Where the screenshot is drawn: fitted and centred."""
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        if self._shot.isNull() or r.width() <= 0 or r.height() <= 0:
+            return r
+        iw, ih = self._shot.width(), self._shot.height()
+        scale = min(r.width() / iw, r.height() / ih)
+        w, h = iw * scale, ih * scale
+        return QRectF(r.x() + (r.width() - w) / 2, r.y() + (r.height() - h) / 2, w, h)
+
+    def _norm(self, pos):
+        t = self._target()
+        if t.width() <= 0 or t.height() <= 0:
+            return QPointF(0, 0)
+        return QPointF(min(1.0, max(0.0, (pos.x() - t.x()) / t.width())),
+                       min(1.0, max(0.0, (pos.y() - t.y()) / t.height())))
 
     @staticmethod
     def _span(a, b):
-        """The rectangle between two corners, edges exclusive (QRect(p1, p2)
-        would count both edges - one pixel too many each way)."""
-        return QRect(min(a.x(), b.x()), min(a.y(), b.y()),
-                     abs(b.x() - a.x()), abs(b.y() - a.y()))
+        return QRectF(QPointF(min(a.x(), b.x()), min(a.y(), b.y())),
+                      QPointF(max(a.x(), b.x()), max(a.y(), b.y())))
+
+    def crop_rect(self):
+        """The selection in the screenshot's device pixels (the whole shot
+        when nothing is selected)."""
+        iw, ih = self._shot.width(), self._shot.height()
+        if self._sel is None:
+            return QRect(0, 0, iw, ih)
+        s = self._sel
+        x, y = round(s.x() * iw), round(s.y() * ih)
+        return QRect(x, y, max(1, min(iw - x, round(s.width() * iw))),
+                     max(1, min(ih - y, round(s.height() * ih))))
+
+    def crop_image(self):
+        if self._shot.isNull():
+            return QImage()
+        return self._shot.copy(self.crop_rect()).toImage()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        t = self._target()
+        clip = QPainterPath()
+        clip.addRoundedRect(t, 8, 8)
+        p.setClipPath(clip)
+        if not self._shot.isNull():
+            p.drawPixmap(t, self._shot, QRectF(self._shot.rect()))
+        if self._sel is not None:
+            sel = QRectF(t.x() + self._sel.x() * t.width(), t.y() + self._sel.y() * t.height(),
+                         self._sel.width() * t.width(), self._sel.height() * t.height())
+            outside = QPainterPath()
+            outside.addRect(t)
+            outside.addRect(sel)                          # odd-even fill: a hole
+            p.fillPath(outside, QColor(8, 12, 20, 130))
+            p.setClipping(False)
+            p.setPen(QPen(QColor("#60a5fa"), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(sel)
+        p.setClipping(False)
+        p.setPen(QPen(QColor(15, 23, 42, 70), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(t, 8, 8)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
-            self._origin = e.position().toPoint()
-            self._sel = QRect()
+            self._dbl = False
+            self._sel_before_press = self._sel
+            self._origin = self._norm(e.position())
+            self._sel = None
+            self.changed.emit()
             self.update()
         elif e.button() == Qt.RightButton:
-            self._cancel()
+            self.cancelled.emit()
 
     def mouseMoveEvent(self, e):
         if self._origin is not None:
-            self._sel = self._span(self._origin, e.position().toPoint())
+            self._sel = self._span(self._origin, self._norm(e.position()))
             self.update()
 
     def mouseReleaseEvent(self, e):
         if e.button() != Qt.LeftButton or self._origin is None:
             return
-        sel = self._span(self._origin, e.position().toPoint())
+        sel = self._span(self._origin, self._norm(e.position()))
         self._origin = None
-        if sel.width() < 8 or sel.height() < 8:
-            self._cancel()
-            return
-        dpr = self._shot.devicePixelRatio() or 1.0
-        crop = self._shot.copy(QRect(round(sel.x() * dpr), round(sel.y() * dpr),
-                                     round(sel.width() * dpr), round(sel.height() * dpr)))
-        self._done = True
-        self.picked.emit(crop.toImage())
+        t = self._target()
+        # A click (no real drag) clears the selection: the whole screen again.
+        # Measured on screen, not in screenshot pixels: a 4K shot is drawn ~8x
+        # smaller here, so a 1 px wobble would otherwise count as a crop. One
+        # long side is enough: a thin drag over one line of text is a crop.
+        dragged = max(sel.width() * t.width(), sel.height() * t.height()) >= self.CLICK_SLOP
+        if self._dbl:
+            self._dbl = False
+            if not dragged:
+                # A real double-click: attach what was picked before it.
+                self._sel = self._dbl_restore
+                self.changed.emit()
+                self.update()
+                self.accepted.emit()
+                return
+        self._sel = sel if dragged else None
+        self.changed.emit()
+        self.update()
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            # Qt delivers a quick second press as this, with no press event.
+            # Decided on release: released in place it's a double-click
+            # (attach); moved, it's a drag begun right after a click.
+            self._dbl = True
+            self._dbl_restore = self._sel_before_press
+            self._origin = self._norm(e.position())
+            self._sel = None
+            self.update()
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape:
-            self._cancel()
-
-    def closeEvent(self, e):
-        self._cancel()                     # Alt+F4 and the like end the snip too
-        super().closeEvent(e)
-
-    def _cancel(self):
-        if not self._done:
-            self._done = True
             self.cancelled.emit()
+        elif e.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.accepted.emit()
+        else:
+            super().keyPressEvent(e)
 
 
 class _ContextChip(QFrame):
@@ -710,10 +839,13 @@ class LiveAssistOverlay(QWidget):
         self._attendees = ""
         self._image_b64 = ""               # an image attached to the next question
         self._image = None
-        self._snips = []                   # the open screen pickers, one per screen
+        self._crop_shots = []              # [(screen, pixmap)] while the crop view is open
+        self._crop_idx = 0
+        self._crop_safe = None             # index of the card's own monitor in the shots
         # What the user wrote about the call: every answer is shaped by it.
         self._context = clip_context(str(cfg.get("live_assist_context") or ""))
         self._exclusion_ok = False
+        self._mac_partial = False          # macOS: sharingType none is set (best effort)
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -730,6 +862,10 @@ class LiveAssistOverlay(QWidget):
         self.sig_export_done.connect(self._on_export_done)
         self._first_token_at = 0.0
         self._build()
+        self._tip_from_card = False
+        self._popup_privacy = _PopupPrivacy(self)
+        if QApplication.instance():
+            QApplication.instance().installEventFilter(self._popup_privacy)
         self._richify_tooltips()
         self._apply_theme()
 
@@ -924,12 +1060,10 @@ class LiveAssistOverlay(QWidget):
         self.input_ask.image_pasted.connect(self._attach_image)
         ask_row.addWidget(self.input_ask, 1)
         # Snip a part of the screen to send with the question.
-        hidden = glass.capture_exclusion_supported() and not glass.is_remote_session()
         self.btn_snip = _IconButton("snip", self.body,
-                                    "Snip a part of the screen to send with your question"
-                                    + (" (the snipping screen is hidden from screen shares)"
-                                       if hidden else "")
-                                    + ". Or paste an image with "
+                                    "Screenshot: crop it right here in the card and send it "
+                                    "with your question. Nothing new appears on your screen. "
+                                    "Or paste an image with "
                                     + ("⌘V." if sys.platform == "darwin" else "Ctrl+V."))
         self.btn_snip.setFixedSize(34, 34)
         self.btn_snip.clicked.connect(self._start_snip)
@@ -967,6 +1101,50 @@ class LiveAssistOverlay(QWidget):
         body.addLayout(foot_row)
 
         root.addWidget(self.body, 1)
+
+        # Screenshot crop view: replaces the body while it's open (see
+        # _start_snip) - the whole flow stays inside this private card.
+        self.crop_panel = QWidget(self)
+        crl = QVBoxLayout(self.crop_panel)
+        crl.setContentsMargins(0, 0, 0, 0)
+        crl.setSpacing(8)
+        crop_head = QHBoxLayout()
+        crop_head.setSpacing(6)
+        self.lbl_crop_head = QLabel("SCREENSHOT", self.crop_panel)
+        crop_head.addWidget(self.lbl_crop_head)
+        crop_head.addStretch()
+        self.btn_crop_screen = QPushButton("", self.crop_panel)
+        self.btn_crop_screen.setFixedHeight(22)
+        self.btn_crop_screen.setCursor(Qt.PointingHandCursor)
+        self.btn_crop_screen.setToolTip("Show the next monitor")
+        self.btn_crop_screen.clicked.connect(self._crop_next_screen)
+        crop_head.addWidget(self.btn_crop_screen)
+        self.btn_crop_cancel = QPushButton("Cancel", self.crop_panel)
+        self.btn_crop_cancel.setFixedHeight(22)
+        self.btn_crop_cancel.setCursor(Qt.PointingHandCursor)
+        self.btn_crop_cancel.clicked.connect(self._end_snip)
+        crop_head.addWidget(self.btn_crop_cancel)
+        self.btn_crop_attach = QPushButton("", self.crop_panel)
+        self.btn_crop_attach.setObjectName("laCtxDone")
+        self.btn_crop_attach.setFixedHeight(22)
+        self.btn_crop_attach.setCursor(Qt.PointingHandCursor)
+        self.btn_crop_attach.setToolTip("Attach it to your next question (Enter)")
+        self.btn_crop_attach.clicked.connect(self._crop_attach)
+        crop_head.addWidget(self.btn_crop_attach)
+        crl.addLayout(crop_head)
+        self.crop_view = _CropView(self.crop_panel)
+        self.crop_view.changed.connect(self._refresh_crop_controls)
+        self.crop_view.accepted.connect(self._crop_attach)
+        self.crop_view.cancelled.connect(self._end_snip)
+        crl.addWidget(self.crop_view)
+        self.lbl_crop_hint = QLabel("", self.crop_panel)
+        self.lbl_crop_hint.setObjectName("laFoot")
+        self.lbl_crop_hint.setWordWrap(True)
+        crl.addWidget(self.lbl_crop_hint)
+        crl.addStretch(1)
+        self.crop_panel.hide()
+        root.addWidget(self.crop_panel, 1)
+
         cfg = self.app.cfg if self.app else {}
         try:
             self.setWindowOpacity(min(1.0, max(0.55, float(cfg.get("live_assist_opacity", 0.96)))))
@@ -1049,7 +1227,7 @@ class LiveAssistOverlay(QWidget):
             }}
         """)
         for lbl in (self.lbl_now_head, self.lbl_sum_head, self.lbl_sug_head,
-                    self.lbl_ctx_head):
+                    self.lbl_ctx_head, self.lbl_crop_head):
             lbl.setStyleSheet(f"color: {t['faint']}; font-size: 10px; font-weight: 700; "
                               "letter-spacing: 1px; background: transparent;")
         self.lbl_title.setStyleSheet(f"color: {t['text']}; font-weight: 700; font-size: 13px;")
@@ -1104,16 +1282,45 @@ class LiveAssistOverlay(QWidget):
         remote = glass.is_remote_session()
         supported = glass.capture_exclusion_supported()
         excluded = False
+        self._mac_partial = False
+        if (getattr(self, "_crop_shots", None) and self._crop_idx != self._crop_safe
+                and not (self._private and supported and not remote)):
+            self._crop_to_safe()               # before the exclusion is lifted
         if self._private and supported and not remote:
             excluded = glass.exclude_from_capture(self, True)
         elif self._private and glass.IS_MAC:
-            # macOS 15+: older capture paths still honour it - worth setting,
-            # but the chip can't claim hidden (capture_exclusion_supported).
-            glass.exclude_from_capture(self, True)
+            # macOS: some capture paths honour it (the same flag Electron's
+            # setContentProtection sets) - not all, so the chip says "May be
+            # hidden", never "Private".
+            self._mac_partial = bool(glass.exclude_from_capture(self, True)) and not remote
         else:
             glass.exclude_from_capture(self, False)
         self._exclusion_ok = excluded
         self._refresh_private_chip(remote, supported, excluded)
+        if getattr(self, "_crop_shots", None):
+            self._refresh_crop_controls()      # privacy changed mid-crop
+
+    def _guard_popup(self, w):
+        """A tooltip/menu about to show: hidden like the card when it belongs
+        to the card and the card is hidden; restored if it was ours before."""
+        parent = w.parentWidget()
+        if parent is not None:
+            mine = parent.window() is self
+        else:
+            mine = w.windowType() == Qt.ToolTip and self._tip_from_card
+        hide = mine and self._private and (self._exclusion_ok or self._mac_partial)
+        if hide or w.property("la_private"):
+            try:
+                w.winId()                      # the native window, before it maps
+                glass.exclude_from_capture(w, hide)
+                w.setProperty("la_private", hide)
+            except RuntimeError:
+                pass                           # already being deleted
+
+    def _guard_visible_tips(self):
+        for w in QApplication.topLevelWidgets():
+            if w.windowType() == Qt.ToolTip and w.isVisible():
+                self._guard_popup(w)
 
     def set_private(self, on):
         self._private = bool(on)
@@ -1128,6 +1335,7 @@ class LiveAssistOverlay(QWidget):
         "off": ("rgba(239,68,68,0.14)", "#b91c1c", "rgba(239,68,68,0.45)"),
         "failed": ("rgba(239,68,68,0.14)", "#b91c1c", "rgba(239,68,68,0.45)"),
         "unavailable": ("rgba(245,158,11,0.16)", "#b45309", "rgba(245,158,11,0.5)"),
+        "partial": ("rgba(245,158,11,0.16)", "#b45309", "rgba(245,158,11,0.5)"),
     }
 
     def _refresh_private_chip(self, remote=None, supported=None, excluded=None):
@@ -1138,16 +1346,20 @@ class LiveAssistOverlay(QWidget):
         if excluded is None:
             excluded = glass.is_excluded_from_capture(self) if self.isVisible() \
                 else self._exclusion_ok
-        key, _ = private_state(self._private, supported, remote, excluded)
         mac = sys.platform == "darwin"
+        # macOS: hiding can't be promised, but the flag may well be set.
+        partial = mac and not supported and bool(excluded or self._mac_partial)
+        key, _ = private_state(self._private, supported, remote, excluded, partial=partial)
         text = {"on": "Private", "off": "Visible", "failed": "Not private",
+                "partial": "May be hidden",
                 "unavailable": "Not hidden" if mac else "Private n/a"}[key]
         bg, fg, border = self._CHIP_COLORS[key]
         try:
             from ui.icons import eye_icon
             from PySide6.QtCore import QSize
             # Eye-off while hidden from the share, open eye when it shows.
-            self.btn_private.setIcon(eye_icon(open_=(key != "on"), size=16, color=QColor(fg)))
+            self.btn_private.setIcon(eye_icon(open_=(key not in ("on", "partial")), size=16,
+                                              color=QColor(fg)))
             self.btn_private.setIconSize(QSize(16, 16))
         except Exception:
             pass
@@ -1157,24 +1369,24 @@ class LiveAssistOverlay(QWidget):
             f"{border}; border-radius: 11px; padding: 2px 10px 2px 8px; font-size: 12px; "
             "font-weight: 600; }")
         tips = {
-            "on": ("Hidden from screen sharing and recordings through macOS's "
-                   "screen-capture protection (not from phone cameras). Most sharing "
-                   "apps respect it - do a quick test share to be sure. Click to make "
-                   "it visible." if mac else
-                   "Hidden from Zoom/Teams/Meet shares, recordings and screenshots on "
+            "on": ("Hidden from Zoom/Teams/Meet shares, recordings and screenshots on "
                    "this PC (not from phone cameras). Click to make it visible - e.g. "
                    "to include it in your own recording."),
             "off": "This card WILL show on a shared screen. Click to hide it from shares.",
             "failed": ("macOS" if mac else "Windows") + " refused to hide this window - "
                       "assume it is visible in a share.",
-            "unavailable": ("macOS 15 and later don't let apps hide a window from "
-                            "screen sharing, so this card shows if you share your whole "
-                            "screen. Share just one window - your browser or the "
-                            "document - and it won't appear." if mac else
+            "partial": mac_partial_tip(glass.macos_26_or_later()),
+            "unavailable": ("macOS didn't take the private-window setting for this "
+                            "card, so assume it shows in screen shares and recordings. "
+                            "Share a single window - your browser or the document - to "
+                            "keep it out." if mac else
                             "Screen-share privacy needs Windows 10 2004+ and a local "
                             "(non-remote) session."),
         }
-        self.btn_private.setToolTip(tips[key])
+        # Rich text so Qt wraps it (a plain tooltip is one ~1000 px line).
+        import html as html_mod
+        self.btn_private.setToolTip("<p style='white-space:normal'>"
+                                    + html_mod.escape(tips[key], quote=False) + "</p>")
 
     def _refresh_live_controls(self):
         live = self._meeting_active
@@ -1412,6 +1624,7 @@ class LiveAssistOverlay(QWidget):
         QTimer.singleShot(0, self._apply_glass)
 
     def hide_overlay(self):
+        self._end_snip()
         self._sample_timer.stop()
         self._spec_timer.stop()
         self.hide()
@@ -1424,12 +1637,18 @@ class LiveAssistOverlay(QWidget):
             if self.app:
                 self.app.track("live_prompter_opened")
 
+    def hideEvent(self, event):
+        self._end_snip()                       # no stale screenshot next time
+        super().hideEvent(event)
+
     def showEvent(self, event):
         super().showEvent(event)
         QTimer.singleShot(0, self._apply_glass)
 
     def set_expanded(self, expanded):
         self._expanded = bool(expanded)
+        if not self._expanded:
+            self._end_snip()
         self.body.setVisible(self._expanded)
         self.setFixedSize(EXPANDED_W if self._expanded else COMPACT_W,
                           EXPANDED_H if self._expanded else COMPACT_H)
@@ -1727,17 +1946,20 @@ class LiveAssistOverlay(QWidget):
         self.img_chip.set_image(img)
         self.img_chip.show()
         self._set_status("✓ Image attached - ask about it, or just press send.")
-        self.input_ask.setFocus()
+        if self.crop_panel.isHidden():
+            # Not while cropping: an image handed back by a failed answer
+            # would move Enter/Esc from the crop view to the hidden ask box.
+            self.input_ask.setFocus()
 
     def _clear_image(self):
         self._image, self._image_b64 = None, ""
         self.img_chip.hide()
 
     def _start_snip(self):
-        if self._snips or self._images_blocked():
+        """Screenshot, cropped inside the card. The grab is silent (like
+        Solve screen) and the card itself is left out of it while Private."""
+        if self._crop_shots or self._images_blocked():
             return
-        # Every screen is grabbed BEFORE any picker shows, so no picker is in
-        # another screen's shot. The card is absent too while it's Private.
         shots = []
         for scr in QApplication.screens():
             try:
@@ -1749,33 +1971,95 @@ class LiveAssistOverlay(QWidget):
         if not shots:
             self._set_status("Couldn't capture the screen - try again.")
             return
-        under = screen_to_capture(self.screen())
-        hide = glass.capture_exclusion_supported() and not glass.is_remote_session()
-        for scr, pm in shots:
-            o = _SnipOverlay(scr.geometry(), pm)
-            o.setScreen(scr)                   # that screen's scaling
-            o.setGeometry(scr.geometry())
-            o.picked.connect(self._on_snip_picked)
-            o.cancelled.connect(self._end_snip)
-            if hide:
-                o.winId()                          # a native window to protect...
-                glass.exclude_from_capture(o, True)    # ...before it ever shows
-            o.show()
-            if hide:
-                glass.exclude_from_capture(o, True)    # and again once it's mapped
-            self._snips.append(o)
-            if scr is under:
-                o.raise_()
-                o.activateWindow()             # Esc goes to it
-                o.setFocus()
+        # Only the card's own monitor may show in the card while a share can
+        # see the card (a share of that monitor shows it anyway); another one
+        # - e.g. the one under the cursor - only while the card is hidden.
+        own = self.screen()
+        safe = next((i for i, (scr, _pm) in enumerate(shots) if scr is own), None)
+        if safe is None and not self._exclusion_ok:
+            self._set_status("Couldn't capture this screen - try again.")
+            return
+        under = screen_to_capture(own)
+        start = safe
+        if self._exclusion_ok:
+            start = next((i for i, (scr, _pm) in enumerate(shots) if scr is under),
+                         0 if safe is None else safe)
+        self._crop_shots = shots
+        self._crop_safe = safe
+        self._crop_idx = start
+        if not self._expanded:
+            self.set_expanded(True)
+        self.body.hide()
+        self.crop_panel.show()
+        self._show_crop_shot()
+        self.activateWindow()                  # Enter / Esc go to the crop view
+        self.crop_view.setFocus()
+
+    def _show_crop_shot(self):
+        self.crop_view.set_shot(self._crop_shots[self._crop_idx][1])
+        n = len(self._crop_shots)
+        self.btn_crop_screen.setVisible(n > 1)
+        self.btn_crop_screen.setText(f"Screen {self._crop_idx + 1} of {n}")
+        self._refresh_crop_controls()
+
+    def _crop_next_screen(self):
+        if self._crop_shots:
+            self._crop_idx = (self._crop_idx + 1) % len(self._crop_shots)
+            self._show_crop_shot()
+            self.crop_view.setFocus()
+
+    def _crop_to_safe(self):
+        """Back to the card's own monitor (or out of the crop if that one
+        couldn't be captured), painted NOW - before the card can be seen."""
+        if self._crop_safe is None:
+            self._end_snip()
+            self._set_status("Screenshot closed - this card is visible in screen sharing now.")
+            return
+        self._crop_idx = self._crop_safe
+        self._show_crop_shot()
+        self.crop_view.repaint()
+
+    def _refresh_crop_controls(self):
+        if self._crop_shots and not self._exclusion_ok and self._crop_idx != self._crop_safe:
+            # The card is visible to a share while it shows another monitor.
+            self._crop_to_safe()               # comes back here, or ends the crop
+            return
+        # Showing ANOTHER monitor's screenshot in a card that a share can see
+        # would put an unshared screen into the share: only while hidden.
+        self.btn_crop_screen.setEnabled(self._exclusion_ok)
+        self.btn_crop_screen.setToolTip(
+            "Show the next monitor" if self._exclusion_ok else
+            "Only while this card is hidden from screen sharing - otherwise that "
+            "monitor would show in your share.")
+        picked = self.crop_view.has_selection()
+        self.btn_crop_attach.setText("Attach selection" if picked else "Attach whole screen")
+        hint = ("Drag again to change it, or click once for the whole screen."
+                if picked else "Drag over the part you want, or attach the whole screen.")
+        if not self._exclusion_ok:
+            hint += ("  Heads-up: this card may show in some screen shares and recordings."
+                     if self._mac_partial else
+                     "  Heads-up: this card isn't hidden from screen sharing right now, "
+                     "so this screenshot shows in your share too.")
+        self.lbl_crop_hint.setText(hint)
+
+    def _crop_attach(self):
+        if not self._crop_shots:
+            return
+        self._on_snip_picked(self.crop_view.crop_image())
 
     def _end_snip(self):
-        snips, self._snips = self._snips, []
-        for o in snips:
-            try:
-                o.close()
-            except RuntimeError:
-                pass                       # already gone
+        if not self._crop_shots and self.crop_panel.isHidden():
+            return
+        self._crop_shots = []
+        self._crop_safe = None
+        self.crop_view.set_shot(QPixmap())     # don't keep the screen in memory
+        self.body.setVisible(self._expanded)
+        self.crop_panel.hide()
+        # Hiding the focused crop view hands focus to the next widget in the
+        # chain - the header's Stop/Start button, where a Space would stop or
+        # start the recording. Put it back in the ask box.
+        if self._expanded and self.isVisible():
+            self.input_ask.setFocus()
 
     def _on_snip_picked(self, img):
         self._end_snip()
@@ -2077,7 +2361,8 @@ class LiveAssistOverlay(QWidget):
                 self.suggest("", auto=True)
         # Watchdog: Qt can recreate the native window (flag/parent changes)
         # and the exclusion lives on the HWND - re-apply if it went missing.
-        if (self._private and self.isVisible() and glass.capture_exclusion_supported()
+        if (self._private and self.isVisible()
+                and (glass.capture_exclusion_supported() or glass.IS_MAC)
                 and not glass.is_remote_session()
                 and not glass.is_excluded_from_capture(self)):
             self._apply_glass()

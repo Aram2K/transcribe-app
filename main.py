@@ -1,6 +1,12 @@
 # Transcribe App - PySide6 Entry Point and Logic Controller
 
 import os
+# numpy's bundled OpenBLAS reserves ~32 MB per thread the moment numpy is
+# imported (24 threads = ~750 MB of commit, almost all untouched); the app's
+# heavy maths runs in CTranslate2 / llama.cpp, not numpy. Before any import
+# of numpy, or it has no effect.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+import gc
 import sys
 import threading
 import time
@@ -17,6 +23,7 @@ import hashlib
 import datetime
 import shutil
 import base64
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -42,6 +49,8 @@ import text_cleanup
 import vocabulary
 import hotkeys
 import speech_langs
+import autostart
+import gpu_accel
 
 # ── Version ───────────────────────────────────────────────────────────────────
 APP_VERSION = "1.9.3"
@@ -86,6 +95,11 @@ ANALYTICS_DECLINED_PATH = storage.path_for("analytics_consent.declined")
 DEFAULT = {
     "hotkey":        "alt+r",
     "whisper_model": "base",
+    # Free the speech / local AI model after this many idle minutes (0 = keep
+    # it loaded). Whisper reloads in ~4-9 s on CPU, so it waits longer; the
+    # reload starts when a recording does, overlapping the speech.
+    "whisper_idle_unload_min": 10,
+    "llm_idle_unload_min": 5,
     "language":      "auto",
     # With language "multi" (Mixed languages): the languages the user switches
     # between, even mid-sentence (speech_langs.py). Fewer than two ticked =
@@ -715,6 +729,24 @@ except ImportError:
     import pyaudio
     HAS_LOOPBACK = False
 
+class _GpuDecodeError(Exception):
+    """A decode failed in the GPU stack (transcribe_segments retries on CPU)."""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.message = message
+
+
+def _model_device(model):
+    """"cuda" / "cpu" for a faster-whisper model (its CTranslate2 model holds
+    the device), or None when unknown."""
+    for obj in (model, getattr(model, "model", None)):
+        dev = getattr(obj, "device", None)
+        if isinstance(dev, str):
+            return dev
+    return None
+
+
 def cfg_float(name, default, minimum=None, maximum=None):
     try:
         value = float(cfg.get(name, default))
@@ -735,6 +767,14 @@ class AudioRecorder:
         self._model           = None
         self._model_name      = None
         self._model_lock      = threading.Lock()
+        # Transcriptions holding the model right now (use_model) and when it
+        # was last used: the idle sweep (maybe_unload_idle) frees it only at 0
+        # users after whisper_idle_unload_min.
+        self._model_users     = 0
+        self._last_model_use  = 0.0
+        # Guards only the two above - never held during a load, so releasing a
+        # lease never waits behind another model's 4-9 s build.
+        self._users_lock      = threading.Lock()
         # Serializes actual transcribe() inference. A single WhisperModel is NOT
         # safe for concurrent calls; the chunked pipeline runs several chunk
         # threads at once, which hangs/crashes on CUDA (CPU only tolerated it by
@@ -781,6 +821,14 @@ class AudioRecorder:
         try:
             import ctranslate2
             if ctranslate2.get_cuda_device_count() > 0:
+                # The packaged Windows app has no cuBLAS until the optional
+                # GPU download (gpu_accel): without it a CUDA model builds, then
+                # fails at its first computation - seconds and video memory
+                # wasted on every start. Same once the GPU was proven unusable.
+                if sys.platform == "win32" and not gpu_accel.libs_dir():
+                    return ("cpu", "int8")
+                if cfg.get(gpu_accel.CFG_FAILED):
+                    return ("cpu", "int8")
                 return ("cuda", "int8_float16")
         except Exception:
             pass
@@ -794,6 +842,11 @@ class AudioRecorder:
         No-op if the packages aren't installed."""
         if sys.platform != "win32":
             return
+        # The optional GPU download (or a CUDA Toolkit already on the PC).
+        try:
+            gpu_accel.register_dll_dirs()
+        except Exception:
+            pass
         try:
             import importlib.util
             for pkg in ("nvidia.cublas", "nvidia.cudnn"):
@@ -820,73 +873,204 @@ class AudioRecorder:
     def load_model(self, name=None):
         name = name or cfg["whisper_model"]
         with self._model_lock:
-            if self._model is None or self._model_name != name:
-                from faster_whisper import WhisperModel
-                dev, ct = self._whisper_device()
-                # Try GPU first (if available), then CPU; and the offline cache
-                # first, then online - revalidating with Hugging Face costs a
-                # round trip before every load and can stall on a flaky network. A GPU load can fail when the
-                # CUDA libraries are missing or VRAM is short - we fall back to CPU
-                # rather than erroring, so dictation always works.
-                # Use all physical CPU cores (ctranslate2 otherwise caps at a low
-                # default), so transcription runs as fast as the machine allows.
-                try:
-                    import psutil
-                    cpu_threads = psutil.cpu_count(logical=False) or 0
-                except Exception:
-                    cpu_threads = os.cpu_count() or 0
-                # Once we learn the CUDA libs are missing, don't keep retrying GPU
-                # on every model switch - go straight to CPU.
-                if getattr(self, "_cuda_usable", None) is False:
-                    dev = "cpu"
-                if dev == "cuda":
-                    self._add_cuda_dll_dirs()
-                attempts = []
-                if dev == "cuda":
-                    attempts += [("cuda", ct, True), ("cuda", ct, False)]
-                attempts += [("cpu", "int8", True), ("cpu", "int8", False)]
+            self._load_locked(name)
+
+    def _users_guard(self):
+        lock = getattr(self, "_users_lock", None)
+        if lock is None:                     # a test double built without __init__
+            lock = self._users_lock = threading.Lock()
+        return lock
+
+    def _load_locked(self, name):
+        """Load ``name`` unless it's the resident model. The caller holds
+        _model_lock (load_model, use_model)."""
+        # About to be used: the idle sweep must not free it right now.
+        self._last_model_use = time.monotonic()
+        if self._model is None or getattr(self, "_model_name", None) != name:
+            # A switch (e.g. the file tab's model): let the old model go
+            # BEFORE building the new one, so both are never resident at
+            # once (~1 GB each). A transcription still running on it keeps
+            # its own reference and finishes normally.
+            self._model = None
+            self._model_name = None
+            # Seen by transcribe(): a model is being BUILT (not just looked
+            # up), so local chunks are about to wait on it.
+            self._building_model = True
+            try:
+                self._build_model_locked(name)
+            finally:
+                self._building_model = False
+
+    def _oom_models(self):
+        """Models the GPU ran out of memory with this session (they run on
+        the processor; smaller ones still use the GPU)."""
+        models = getattr(self, "_cuda_oom_models", None)
+        if models is None:
+            models = self._cuda_oom_models = set()
+        return models
+
+    def _gpu_failed_mid_use(self, failed, name, err):
+        """A model on the GPU failed while transcribing: out of memory = this
+        model goes to the processor; anything else = the GPU is off for this
+        run (and the app remembers it). The failed model is dropped so the
+        retry builds a CPU one."""
+        logger.warning("GPU transcription failed (%s); retrying on CPU.", err)
+        if gpu_accel.is_oom(err):
+            self._oom_models().add(name)
+        else:
+            self._cuda_usable = False
+            self._report_cuda_failure(err)
+        with self._model_lock:
+            if self._model is failed:
+                self._model = None
+                self._model_name = None
+
+    def _report_cuda_failure(self, message):
+        """Tell the app the GPU failed (on_cuda_failed, set by AppController),
+        so a real failure is remembered - not just for this run."""
+        cb = getattr(self, "on_cuda_failed", None)
+        if cb:
+            try:
+                cb(message)
+            except Exception:
+                pass
+
+    def _build_model_locked(self, name):
+        from faster_whisper import WhisperModel
+        dev, ct = self._whisper_device()
+        # Try GPU first (if available), then CPU; and the offline cache
+        # first, then online - revalidating with Hugging Face costs a
+        # round trip before every load and can stall on a flaky network. A GPU load can fail when the
+        # CUDA libraries are missing or VRAM is short - we fall back to CPU
+        # rather than erroring, so dictation always works.
+        # Use all physical CPU cores (ctranslate2 otherwise caps at a low
+        # default), so transcription runs as fast as the machine allows.
+        try:
+            import psutil
+            cpu_threads = psutil.cpu_count(logical=False) or 0
+        except Exception:
+            cpu_threads = os.cpu_count() or 0
+        # Once we learn the CUDA libs are missing, don't keep retrying GPU
+        # on every model switch - go straight to CPU.
+        if getattr(self, "_cuda_usable", None) is False or name in AudioRecorder._oom_models(self):
+            dev = "cpu"                   # GPU unusable, or THIS model doesn't fit on it
+        if dev == "cuda":
+            self._add_cuda_dll_dirs()
+        attempts = []
+        if dev == "cuda":
+            attempts += [("cuda", ct, True), ("cuda", ct, False)]
+        attempts += [("cpu", "int8", True), ("cpu", "int8", False)]
+        last_err = None
+        repaired_cache = False
+        for d, c, local_only in attempts:
+            # GPU already proven unusable earlier in THIS load (its warm-up
+            # raised) - skip the remaining CUDA attempt. Building a second
+            # CUDA model would skip the warm-up below and hand back a broken
+            # GPU model that hangs on real inference - the "stuck on
+            # Finalising" bug on machines where cuBLAS/cuDNN are missing.
+            if d == "cuda" and (getattr(self, "_cuda_usable", None) is False
+                                or name in AudioRecorder._oom_models(self)):
+                continue
+            try:
+                m = WhisperModel(
+                    name, device=d, compute_type=c, local_files_only=local_only,
+                    cpu_threads=cpu_threads, num_workers=1)
+                if d == "cuda":
+                    # A CUDA model constructs even when the CUDA runtime libs
+                    # (cuBLAS/cuDNN, e.g. cublas64_12.dll) are missing - it
+                    # only fails when it actually computes. Force a tiny
+                    # warm-up (unless the GPU is already proven good) so we
+                    # catch that here and fall back to CPU instead of handing
+                    # back a model that hangs on a real dictation.
+                    if getattr(self, "_cuda_usable", None) is not True:
+                        seg, _ = m.transcribe(np.zeros(16000, dtype=np.float32), beam_size=1)
+                        list(seg)
+                    self._cuda_usable = True
+                self._model = m
+                self._model_name = name
+                self._last_model_use = time.monotonic()
+                # A failed CUDA attempt's exception references this
+                # frame (and the broken CUDA model): a cycle that kept
+                # both models alive after an unload until a gc pass.
                 last_err = None
-                repaired_cache = False
-                for d, c, local_only in attempts:
-                    # GPU already proven unusable earlier in THIS load (its warm-up
-                    # raised) - skip the remaining CUDA attempt. Building a second
-                    # CUDA model would skip the warm-up below and hand back a broken
-                    # GPU model that hangs on real inference - the "stuck on
-                    # Finalising" bug on machines where cuBLAS/cuDNN are missing.
-                    if d == "cuda" and getattr(self, "_cuda_usable", None) is False:
+                logger.info("Whisper on %s (%s, cpu_threads=%s)", d, c, cpu_threads)
+                return
+            except Exception as e:
+                last_err = e
+                # Only the GPU stack's own errors say anything about the GPU:
+                # a damaged cache or being offline must not switch it off.
+                if d == "cuda" and gpu_accel.is_cuda_error(e):
+                    self._cuda_error = str(e)[:300]
+                    if gpu_accel.is_oom(e):
+                        AudioRecorder._oom_models(self).add(name)      # smaller models still fit
+                    else:
+                        self._cuda_usable = False  # remember: skip GPU next time
+                        self._report_cuda_failure(self._cuda_error)
+                logger.warning("Whisper load failed on %s/%s (offline=%s): %s",
+                               d, c, local_only, e)
+                if not repaired_cache and _looks_like_whisper_cache_error(e):
+                    if _repair_whisper_model_cache(name):
+                        repaired_cache = True
+                        logger.info("Repaired Whisper cache for %s; retrying load", name)
                         continue
-                    try:
-                        m = WhisperModel(
-                            name, device=d, compute_type=c, local_files_only=local_only,
-                            cpu_threads=cpu_threads, num_workers=1)
-                        if d == "cuda":
-                            # A CUDA model constructs even when the CUDA runtime libs
-                            # (cuBLAS/cuDNN, e.g. cublas64_12.dll) are missing - it
-                            # only fails when it actually computes. Force a tiny
-                            # warm-up (unless the GPU is already proven good) so we
-                            # catch that here and fall back to CPU instead of handing
-                            # back a model that hangs on a real dictation.
-                            if getattr(self, "_cuda_usable", None) is not True:
-                                seg, _ = m.transcribe(np.zeros(16000, dtype=np.float32), beam_size=1)
-                                list(seg)
-                            self._cuda_usable = True
-                        self._model = m
-                        self._model_name = name
-                        logger.info("Whisper on %s (%s, cpu_threads=%s)", d, c, cpu_threads)
-                        return
-                    except Exception as e:
-                        last_err = e
-                        if d == "cuda" and not (local_only and _missing_from_cache(e)):
-                            self._cuda_usable = False  # remember: skip GPU next time
-                        logger.warning("Whisper load failed on %s/%s (offline=%s): %s",
-                                       d, c, local_only, e)
-                        if not repaired_cache and _looks_like_whisper_cache_error(e):
-                            if _repair_whisper_model_cache(name):
-                                repaired_cache = True
-                                logger.info("Repaired Whisper cache for %s; retrying load", name)
-                                continue
-                if last_err:
-                    raise last_err
+        if last_err:
+            try:
+                raise last_err
+            finally:
+                last_err = None        # no frame <-> traceback cycle
+
+    @contextmanager
+    def use_model(self, name=None):
+        """The Whisper model for one transcription: loaded if needed, and
+        counted as in use until the block ends, so the idle sweep never frees
+        it mid-call. Load and hand-out happen in ONE _model_lock hold, so the
+        caller always gets exactly the model it asked for - never None, never
+        a model another thread switched to in between."""
+        name = name or cfg["whisper_model"]
+        with self._model_lock:
+            self._load_locked(name)
+            model = self._model
+            if model is None:
+                raise RuntimeError("The speech model could not be loaded.")
+            with self._users_guard():
+                self._model_users = getattr(self, "_model_users", 0) + 1
+                self._last_model_use = time.monotonic()
+        try:
+            yield model
+        finally:
+            with self._users_guard():
+                self._model_users = max(0, getattr(self, "_model_users", 1) - 1)
+                self._last_model_use = time.monotonic()
+
+    def maybe_unload_idle(self, idle_sec, now=None):
+        """Free the Whisper model after ``idle_sec`` without use (the idle
+        sweep, on a worker thread). Never waits: a load holds the lock for
+        seconds, and then this tick simply skips. Never frees a model that is
+        in use (use_model), during a recording, or while chunk threads run.
+        Dropping the reference frees CTranslate2's memory at once (measured
+        ~0.8 GB for large-v3-turbo on CPU); a reload takes ~4-9 s."""
+        if not idle_sec or idle_sec <= 0:
+            return False
+        if not self._model_lock.acquire(blocking=False):
+            return False
+        try:
+            # Holding _model_lock: no new lease can start (use_model takes it);
+            # a lease ending meanwhile only lowers the count.
+            with self._users_guard():
+                users = getattr(self, "_model_users", 0)
+            if self._model is None or users > 0 or getattr(self, "recording", False):
+                return False
+            if any(t.is_alive() for t in list(getattr(self, "_chunk_threads", []) or [])):
+                return False
+            t = time.monotonic() if now is None else now
+            if t - getattr(self, "_last_model_use", 0.0) < idle_sec:
+                return False
+            name, self._model, self._model_name = self._model_name, None, None
+        finally:
+            self._model_lock.release()
+        gc.collect()
+        logger.info("Freed the idle speech model (%s)", name)
+        return True
 
     def unload_model(self, name=None):
         with self._model_lock:
@@ -1056,7 +1240,17 @@ class AudioRecorder:
         return stream.read(read_n, exception_on_overflow=False)
 
     def start_recording(self, capture_mode=None, language=None):
+        try:
+            self._start_recording_impl(capture_mode, language)
+        except BaseException:
+            # A device that wouldn't open is not a recording - left True, the
+            # idle sweep would never free the speech model again.
+            self.recording = False
+            raise
+
+    def _start_recording_impl(self, capture_mode=None, language=None):
         self.recording = True
+        self._last_model_use = time.monotonic()
         # Per-session language: the meeting window passes its selector value;
         # plain dictation passes nothing, which resets to the global default.
         self.language_override = language or None
@@ -1484,6 +1678,15 @@ class AudioRecorder:
 
     def transcribe(self):
         pending = list(self._chunk_threads)
+        # A cold model load (e.g. after an idle unload) holds _model_lock and
+        # the chunks queue behind it: start their time budget once it's done,
+        # or a slow load would silently drop the first sentences.
+        load_wait = time.time()
+        if getattr(self, "_building_model", False) and AudioRecorder._runs_locally(self):
+            while (getattr(self, "_building_model", False)
+                   and time.time() - load_wait < 90 and not getattr(self, "_abort", False)):
+                time.sleep(0.05)
+        self._last_load_wait = time.time() - load_wait
         budget = max(30, min(180, 5 * len(pending)))
         deadline = time.time() + budget
         for t in pending:
@@ -1599,14 +1802,32 @@ class AudioRecorder:
         if len(audio) < sr // 2:
             return []
         try:
-            self.load_model(model_name)
+            # In use for the whole decode (a file job can take an hour).
+            for attempt in (1, 2):
+                failed = None
+                with self.use_model(model_name) as model:
+                    t0 = time.monotonic()
+                    try:
+                        return self._segments_with(model, audio, sr, language,
+                                                   on_progress, should_cancel,
+                                                   gpu_errors=(attempt == 1))
+                    except _GpuDecodeError as g:
+                        failed, err = model, g.message
+                    finally:
+                        # Decode time only (no download/load): what the GPU would cut.
+                        self._last_segments_seconds = time.monotonic() - t0
+                # The GPU failed mid-file: the processor, once - never a silent
+                # "no speech was detected".
+                model = None
+                self._gpu_failed_mid_use(failed, model_name or cfg["whisper_model"], err)
+                del failed
+            return []
         except Exception as e:
             logger.warning("transcribe_segments: model load failed: %s", e)
             return []
-        with self._model_lock:
-            model = self._model
-        if model is None:
-            return []
+
+    def _segments_with(self, model, audio, sr, language, on_progress, should_cancel,
+                       gpu_errors=False):
         lang_setting = language or self._lang_setting()
         lang_arg = None if lang_setting in ("auto", "multi", "", None) else lang_setting
         # No glossary prompt on long audio: with condition_on_previous_text off
@@ -1645,8 +1866,22 @@ class AudioRecorder:
                             pass
                 return out
         except Exception as e:
+            if gpu_errors and _model_device(model) == "cuda" and gpu_accel.is_cuda_error(e):
+                raise _GpuDecodeError(str(e)) from None
             logger.warning("transcribe_segments failed: %s", e)
             return []
+
+    def _runs_locally(self):
+        """Will this dictation's pieces certainly go through local Whisper?
+        The local backend, or a cloud backend without its key (it records with
+        the local model). A cloud backend that fell back once may well work
+        again - it doesn't wait for a local model it probably won't use."""
+        b = cfg.get("backend") or "local"
+        if b == "local":
+            return True
+        if b == "mistral" and not (cfg.get("mistral_api_key") or "").strip():
+            return True
+        return b == "google" and not (cfg.get("google_api_key") or "").strip()
 
     def _lang_setting(self):
         """The language for THIS recording session: an explicit per-session
@@ -1657,18 +1892,12 @@ class AudioRecorder:
         sr = cfg["sample_rate"]
         if len(audio) < sr // 2:
             return "", "en"
-        try:
-            return self._run_local_once(audio)
-        except Exception as e:
-            # If we were running on the GPU and it failed mid-dictation (OOM,
-            # driver hiccup, a CUDA lib problem), drop to CPU and retry once so the
-            # transcription still succeeds instead of erroring.
-            if getattr(self, "_cuda_usable", None):
-                logger.warning("GPU transcription failed (%s); retrying on CPU.", e)
-                self._cuda_usable = False
-                self.unload_model()
-                return self._run_local_once(audio)
-            raise
+        out = self._run_local_once(audio)
+        if (cfg.get("backend") or "local") != "local":
+            # A cloud backend ran locally (no key, cap, offline) - and it
+            # worked: the next dictation loads the model early too.
+            self._local_fallback_at = time.monotonic()
+        return out
 
     def _fallback_to_local_or_error(self, audio, backend, reason):
         try:
@@ -1682,11 +1911,26 @@ class AudioRecorder:
             return "", f"!{backend}:{reason} Local fallback is unavailable: {friendly}"
 
     def _run_local_once(self, audio):
-        self.load_model()
-        sr = cfg["sample_rate"]
-        with self._model_lock:
-            model = self._model
+        name = cfg["whisper_model"]
+        with self.use_model(name) as model:
+            try:
+                return self._run_local_with(model, audio)
+            except Exception as e:
+                if _model_device(model) != "cuda" or not gpu_accel.is_cuda_error(e):
+                    raise
+                failed, err = model, str(e)   # the text only: no traceback cycle
+        # The GPU failed mid-dictation (out of memory, driver hiccup): THIS
+        # piece again on the processor. Decided by the model that failed, so
+        # every chunk that hit the broken GPU model is retried, not just the
+        # first one to notice.
+        model = None
+        self._gpu_failed_mid_use(failed, name, err)
+        del failed                            # gone before the CPU model is built
+        with self.use_model() as model:
+            return self._run_local_with(model, audio)
 
+    def _run_local_with(self, model, audio):
+        sr = cfg["sample_rate"]
         lang_setting = self._lang_setting()
         prompt = cfg.get("initial_prompt", "").strip() or None
         # Mixed languages: a short primer with a line in each mixed language,
@@ -2020,6 +2264,10 @@ class AppController(QObject):
     sig_auth_changed = Signal()         # auth/entitlement state changed (from worker threads)
     sig_ipc_action = Signal(str)        # a second launch handed us an action (socket thread)
     sig_quit = Signal()                 # quit from a worker thread (after launching the installer)
+    sig_gpu_progress = Signal(int, float, float)  # GPU download: percent, done bytes, total bytes
+    sig_gpu_done = Signal(str, str)     # GPU download: state ("ok"/"gpu_failed"/"failed"/"cancelled"), message
+    sig_gpu_wait = Signal(str, str, float)  # a local transcription made the user wait: context, model, seconds
+    sig_gpu_runtime_failed = Signal(str)  # the GPU failed while transcribing (worker thread)
 
     def __init__(self, qapp):
         super().__init__()
@@ -2110,8 +2358,23 @@ class AppController(QObject):
         # Register the configured hotkey (keyboard combo or mouse button).
         self._setup_hotkey(self.cfg["hotkey"])
         # Load the speech model in the background now, so the first Alt+R
-        # doesn't wait 1-2 s for it.
+        # doesn't wait 1-2 s for it. (The idle sweep frees it again if it
+        # isn't used for whisper_idle_unload_min.)
         QTimer.singleShot(2500, self._preload_speech_model)
+        # Optional NVIDIA GPU acceleration (gpu_accel): the download runs on a
+        # worker; its progress/result and the "you just waited" hints arrive here.
+        self._gpu_thread = None
+        self._gpu_phase = None                         # "download" / "verify" while working
+        self._gpu_cancel = False
+        self._tray_click = None
+        self.sig_gpu_done.connect(self._on_gpu_done, Qt.QueuedConnection)
+        self.sig_gpu_wait.connect(self._on_gpu_wait, Qt.QueuedConnection)
+        self.sig_gpu_runtime_failed.connect(self._on_gpu_runtime_failed, Qt.QueuedConnection)
+        self.recorder.on_cuda_failed = self.sig_gpu_runtime_failed.emit
+        # Every minute: free a speech / local AI model that sits unused.
+        self._idle_timer = QTimer(self)
+        self._idle_timer.timeout.connect(self._idle_sweep)
+        self._idle_timer.start(60_000)
 
         # Setup System Tray
         self._setup_tray()
@@ -2154,6 +2417,8 @@ class AppController(QObject):
 
         # Single click tray icon wakes settings window
         self.tray_icon.activated.connect(self._on_tray_activated)
+        # A click on a notification runs the action it was shown with, if any.
+        self.tray_icon.messageClicked.connect(self._on_tray_message_clicked)
 
     def _build_tray_menu(self):
         """(Re)build the tray context menu. Called again on auth changes so the
@@ -2656,8 +2921,209 @@ class AppController(QObject):
         color = self.cfg.get("accent_color", "#3b82f6")
         self.tray_icon.setIcon(make_qicon(color))
 
-    def show_tray_hint(self, title, message):
-        self.tray_icon.showMessage(title, message, QSystemTrayIcon.Information, 4000)
+    def show_tray_hint(self, title, message, on_click=None):
+        # The click action belongs to THIS notification; a later plain one clears it.
+        self._tray_click = on_click
+        self._last_hint_at = time.monotonic()
+        self.tray_icon.showMessage(title, message, QSystemTrayIcon.Information,
+                                   8000 if on_click else 4000)
+
+    def _on_tray_message_clicked(self):
+        action, self._tray_click = getattr(self, "_tray_click", None), None
+        if action:
+            try:
+                action()
+            except Exception:
+                logger.debug("Notification action failed", exc_info=True)
+
+    # ── GPU acceleration (optional NVIDIA download - see gpu_accel.py) ──────
+    def gpu_download_running(self):
+        t = getattr(self, "_gpu_thread", None)
+        return t is not None and t.is_alive()
+
+    def start_gpu_download(self, source="settings"):
+        """Download NVIDIA's cuBLAS and switch local Whisper to the GPU. GUI
+        thread. Returns False if a download is already running."""
+        if self.gpu_download_running():
+            return False
+        self._gpu_cancel = False
+        self._gpu_phase = "download"
+        self.cfg[gpu_accel.CFG_INTRO] = True
+        self.cfg.pop(gpu_accel.CFG_FAILED, None)       # a fresh try
+        self.save_config()
+        self.track("gpu_download_started", {"source": source})
+
+        def _run():
+            try:
+                gpu_accel.download(
+                    on_progress=lambda p, d, t: self.sig_gpu_progress.emit(int(p), float(d), float(t)),
+                    should_cancel=lambda: self._gpu_cancel)
+            except Exception as e:
+                cancelled = self._gpu_cancel
+                if not isinstance(e, gpu_accel.GpuAccelError):
+                    logger.warning("GPU download failed: %s", e, exc_info=True)
+                self.sig_gpu_done.emit("cancelled" if cancelled else "failed", str(e))
+                return
+            self._gpu_phase = "verify"
+            self.sig_gpu_progress.emit(-1, 0.0, 0.0)  # "checking your graphics card"
+            state, msg = self._verify_gpu()
+            self.sig_gpu_done.emit(state, msg)
+        self._gpu_thread = threading.Thread(target=_run, daemon=True)
+        self._gpu_thread.start()
+        return True
+
+    def retry_gpu(self):
+        """"Try again" after the GPU couldn't run (e.g. the driver was updated
+        since): no new download, just another attempt on the graphics card."""
+        if self.gpu_download_running():
+            return False
+        if not self._can_verify_gpu():
+            # Nothing to test it with right now: keep the recorded failure.
+            self.show_tray_hint("GPU acceleration",
+                                "Choose a downloaded local Whisper model in Settings > "
+                                "Models first - the GPU is tested with it.")
+            return False
+        previous = self.cfg.pop(gpu_accel.CFG_FAILED, None)   # let it try the GPU
+        self._gpu_phase = "verify"
+
+        def _run():
+            self.sig_gpu_progress.emit(-1, 0.0, 0.0)
+            state, msg = self._verify_gpu()
+            if state == "pending" and previous:
+                state, msg = "gpu_failed", previous
+            self.sig_gpu_done.emit(state, msg)
+        self._gpu_thread = threading.Thread(target=_run, daemon=True)
+        self._gpu_thread.start()
+        return True
+
+    def gpu_phase(self):
+        return self._gpu_phase if self.gpu_download_running() else None
+
+    def cancel_gpu_download(self):
+        self._gpu_cancel = True
+
+    def _verify_gpu(self):
+        """Worker thread, right after the download: load the speech model on
+        the GPU now, so the user learns at once whether it runs (an old driver
+        or too little video memory fails here - and the CPU keeps working)."""
+        try:
+            gpu_accel.register_dll_dirs()
+        except Exception:
+            pass
+        rec = self.recorder
+        rec._cuda_usable = None                       # let it try the GPU again
+        rec._cuda_error = ""
+        name = self.cfg.get("whisper_model") or "base"
+        if not self._can_verify_gpu():
+            return "pending", ""                      # tried at the next local transcription
+        try:
+            # A transcription still running keeps its own (CPU) model; the
+            # next one gets the GPU model loaded here.
+            rec.unload_model()
+            rec.load_model(name)
+        except Exception as e:
+            if gpu_accel.is_cuda_error(e):
+                return "gpu_failed", _friendly_transcription_error(e)
+            # The model didn't load at all (a damaged cache...): the GPU is
+            # untested, not failed - it's tried at the next transcription.
+            logger.warning("GPU check couldn't load the speech model: %s", e)
+            return "pending", ""
+        if getattr(rec, "_cuda_usable", None) is True:
+            return "ok", ""
+        err = getattr(rec, "_cuda_error", "") or "the graphics card couldn't run the speech model"
+        if gpu_accel.is_oom(err) or name in AudioRecorder._oom_models(rec):
+            return "gpu_oom", name
+        return "gpu_failed", err
+
+    def _can_verify_gpu(self):
+        # File jobs run locally whatever the dictation backend, so the GPU is
+        # worth testing whenever the local model is on disk.
+        return model_downloaded(self.cfg.get("whisper_model") or "base")
+
+    def _on_gpu_runtime_failed(self, message):
+        """The GPU failed during a real transcription (worker -> here): remember
+        it, so later runs stay on the CPU and Settings says why. Out of memory
+        is about that model's size, not the GPU - not remembered."""
+        if gpu_accel.is_oom(message) or not gpu_accel.libs_dir():
+            return
+        if self.cfg.get(gpu_accel.CFG_FAILED) != message[:300]:
+            self.cfg[gpu_accel.CFG_FAILED] = (message or "unknown error")[:300]
+            self.save_config()
+
+    def _on_gpu_done(self, state, message):
+        self._gpu_phase = None
+        self.track("gpu_download_result", {"state": state})
+        if state == "ok":
+            self.cfg.pop(gpu_accel.CFG_FAILED, None)
+            self.show_tray_hint("GPU acceleration is on",
+                                "Local transcription now runs on your NVIDIA graphics card.")
+        elif state == "pending":
+            self.show_tray_hint("GPU acceleration is installed",
+                                "It's used from your next transcription with a local "
+                                "Whisper model.")
+        elif state == "gpu_oom":
+            self.show_tray_hint(
+                "Model too big for your graphics card",
+                f"Your NVIDIA card ran out of memory with the {message} model, so it runs "
+                "on the processor. A smaller model (e.g. Small) runs on the GPU.",
+                on_click=self.show_gpu_settings)
+        elif state == "gpu_failed":
+            self.cfg[gpu_accel.CFG_FAILED] = (message or "unknown error")[:300]
+            self.show_tray_hint(
+                "GPU acceleration couldn't start",
+                "Your graphics card couldn't run it, so transcription stays on the "
+                "processor. Updating your NVIDIA driver usually fixes this - then "
+                "Settings > Models > GPU acceleration > Try again.",
+                on_click=self.show_gpu_settings)
+        elif state == "failed":
+            self.show_tray_hint("GPU acceleration download failed",
+                                message or "Please try again.", on_click=self.show_gpu_settings)
+        self.save_config()
+
+    def show_gpu_settings(self):
+        self.show_settings()
+        win = getattr(self, "settings_win", None)
+        if win is not None and hasattr(win, "focus_gpu_card"):
+            win.focus_gpu_card()
+
+    def _note_local_wait(self, context, seconds, model=None):
+        """Any thread: the user just waited ``seconds`` on a local transcription
+        - maybe the moment to suggest GPU acceleration (decided on the GUI
+        thread, rarely; see gpu_accel.should_offer_now). File jobs always run
+        locally, whatever the dictation backend."""
+        try:
+            if context != "file" and (self.cfg.get("backend") or "local") != "local":
+                return
+            self.sig_gpu_wait.emit(context, str(model or self.cfg.get("whisper_model") or ""),
+                                   float(seconds))
+        except Exception:
+            pass
+
+    def _on_gpu_wait(self, context, model, seconds):
+        on_gpu = getattr(getattr(self, "recorder", None), "_cuda_usable", None) is True
+        if not gpu_accel.should_offer_now(self.cfg, model, seconds, on_gpu=on_gpu,
+                                          local_job=(context == "file")):
+            return
+        # A few seconds later: the same dictation's own notices (Smart Action
+        # results, cloud limits) would otherwise replace it at once.
+        QTimer.singleShot(6000, lambda: self._show_gpu_offer(context, model, seconds))
+
+    def _show_gpu_offer(self, context, model, seconds):
+        on_gpu = getattr(getattr(self, "recorder", None), "_cuda_usable", None) is True
+        if not gpu_accel.should_offer_now(self.cfg, model, seconds, on_gpu=on_gpu,
+                                          local_job=(context == "file")):
+            return
+        if time.monotonic() - getattr(self, "_last_hint_at", -1e9) < 4:
+            return                              # another notice is up: not now, not counted
+        gpu_accel.note_offered(self.cfg)
+        self.save_config()
+        self.track("gpu_offer_shown", {"context": context, "model": model})
+        self.show_tray_hint(
+            "Speed up transcription with your NVIDIA GPU",
+            f"That took {seconds:.0f} s on the processor. GPU acceleration gives "
+            f"{gpu_accel.speedup_text()} - click to set it up (one-time "
+            f"{gpu_accel.DOWNLOAD_MB} MB download from NVIDIA).",
+            on_click=self.show_gpu_settings)
 
     def _background_check_updates(self):
         import requests
@@ -3183,6 +3649,56 @@ class AppController(QObject):
         self._account_recording_time()
         self._unregister_transient_keys()
 
+    def _idle_sweep(self):
+        """Free models nobody is using: Whisper after whisper_idle_unload_min,
+        a local AI model after llm_idle_unload_min (0 = keep). Skipped while a
+        dictation, meeting or Live Assistance session runs; the work itself
+        runs on a worker thread, so the UI never waits on a model lock. Each
+        model also guards itself - nothing in use is ever freed."""
+        mw = getattr(self, "meetings_win", None)
+        if mw is not None and getattr(mw, "state", None) in (
+                getattr(mw, "STATE_RECORDING", "recording"),
+                getattr(mw, "STATE_PROCESSING", "processing")):
+            return
+        if getattr(self, "is_rec", False) or getattr(self, "_busy", False) \
+                or getattr(self, "_file_job_running", False):
+            return
+        whisper_s = cfg_float("whisper_idle_unload_min", 10, minimum=0) * 60
+        llm_s = cfg_float("llm_idle_unload_min", 5, minimum=0) * 60
+
+        def _sweep():
+            try:
+                if llm_s > 0:
+                    local_llm.unload_idle(llm_s)
+                if whisper_s > 0:
+                    self.recorder.maybe_unload_idle(whisper_s)
+            except Exception:
+                logger.debug("Idle model sweep failed", exc_info=True)
+        threading.Thread(target=_sweep, daemon=True).start()
+
+    def release_models_after_session(self):
+        """A meeting / Live Assistance session's notes are done: free the local
+        AI model now (it held ~2 GB+ until the next sweep otherwise) - unless
+        dictation's Smart mode is about to use it. Reloads in ~1-2 s."""
+        if cfg_float("llm_idle_unload_min", 5, minimum=0) <= 0:
+            return
+        keep = None
+        if actions.normalize_action_mode(self.cfg.get("output_action")) != actions.ACTION_TRANSCRIBE_ONLY:
+            keep = actions.normalize_action_model(self.cfg.get("action_model"))
+
+        def _free():
+            try:
+                local_llm.unload_idle(0, keep=keep)
+            except Exception:
+                logger.debug("Freeing the session's AI model failed", exc_info=True)
+        threading.Thread(target=_free, daemon=True).start()
+
+    def prewarm_speech_model(self):
+        """A recording just started (meeting / Live Assistance): load the local
+        Whisper model now, so the load overlaps the speech instead of holding
+        up the first piece. No-op for cloud backends or a model not on disk."""
+        self._preload_speech_model()
+
     def _preload_speech_model(self):
         """Background-load the local Whisper model when dictation uses it
         (never a download: only a model already on disk)."""
@@ -3242,7 +3758,12 @@ class AppController(QObject):
             self.recorder.start_recording()
             self._register_transient_keys()
 
-            if self.cfg["backend"] == "local":
+            # Load the speech model while the user speaks - also when a cloud
+            # backend will run on it (no key, or it fell back within the hour).
+            fell_back = time.monotonic() - getattr(self.recorder, "_local_fallback_at", -1e9) < 3600
+            local_soon = (fell_back or self._cloud_preflight_warn()) and model_downloaded(
+                self.cfg.get("whisper_model") or "base")
+            if self.cfg["backend"] == "local" or local_soon:
                 threading.Thread(
                     target=self.recorder.load_model,
                     daemon=True,
@@ -3502,6 +4023,11 @@ class AppController(QObject):
                 return
             t.join(timeout=0.1)
             waited += 0.1
+        if (not t.is_alive() and "exc" not in _result
+                and not str(_result.get("lang") or "").startswith("!")):
+            # Minus a cold model load: the GPU wouldn't save that part.
+            self._note_local_wait(
+                "dictation", max(0.0, waited - getattr(self.recorder, "_last_load_wait", 0.0)))
 
         # If managed cloud hit its monthly cap, we transparently used the local
         # model - tell the user once so the switch isn't a mystery.
@@ -3795,6 +4321,13 @@ def main():
             signal_running_instance(action)
         sys.exit(0)
 
+    # A GPU-acceleration removal scheduled last run (its DLLs were loaded):
+    # finish it before anything looks for - or loads - the libraries.
+    try:
+        gpu_accel.finish_pending_remove()
+    except Exception:
+        pass
+
     # 2. Standard Qt Setup
     qapp = QApplication(sys.argv)
     qapp.setQuitOnLastWindowClosed(False) # Tray-resident background app constraint!
@@ -3815,6 +4348,14 @@ def main():
 
     # Create app logic controller
     controller = AppController(qapp)
+
+    # Start-at-login: apply the setting to the OS (first run: default it on),
+    # repairing a missing or stale entry. Packaged builds only.
+    try:
+        if autostart.reconcile(controller.cfg):
+            controller.save_config()
+    except Exception as e:
+        logging.warning("Could not apply the start-at-login setting: %s", e)
 
     # Attach lock socket IPC listener
     # A second launch (or `python main.py <action>`) hands its action to the

@@ -1,6 +1,7 @@
 # Modern Tabbed Settings Panel in PySide6
 
 import os
+import sys
 import threading
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QEvent
 from PySide6.QtWidgets import (
@@ -20,6 +21,8 @@ import action_api
 import actions
 import entitlements
 import vocabulary
+import autostart
+import gpu_accel
 
 
 class _PillItemDelegate(QStyledItemDelegate):
@@ -103,6 +106,7 @@ class Settings(QDialog):
     feedback_finished = Signal(bool, str)
     account_delete_finished = Signal(bool, str)
     specs_ready = Signal(str)  # GPU name detected on a worker thread
+    gpu_state_ready = Signal(str)  # gpu_accel.status(), computed on a worker thread
     update_install_finished = Signal(bool, str)  # installer launched / download error
 
     def __init__(self, parent=None, main_app=None):
@@ -152,6 +156,12 @@ class Settings(QDialog):
         self.account_delete_finished.connect(self._on_account_delete_finished)
         self.specs_ready.connect(self._on_specs_ready)
         self.update_install_finished.connect(self._on_update_install_finished)
+        # Optional NVIDIA GPU acceleration: its state, and the app's download.
+        self._gpu_state = None
+        self.gpu_state_ready.connect(self._refresh_gpu_ui)
+        if self.app is not None and hasattr(self.app, "sig_gpu_progress"):
+            self.app.sig_gpu_progress.connect(self._on_gpu_progress)
+            self.app.sig_gpu_done.connect(self._on_gpu_done)
         
         # Whisper model card controls references
         self.whisper_cards = {}
@@ -196,7 +206,7 @@ class Settings(QDialog):
         "secrets_owner", "user_secrets", "last_known_pro", "known_emails",
         "last_signin_email", "pending_update_version", "account_gate_seen",
         "onboarding_done", "overlay_pos",     # the HUD saves it when dragged
-    ))
+    )) | frozenset(gpu_accel.CFG_KEYS)        # written straight to app.cfg
 
     def _staged_settings(self):
         """What Save commits to app.cfg: this window's own settings only.
@@ -320,6 +330,7 @@ class Settings(QDialog):
     def showEvent(self, event):
         super().showEvent(event)
         self._fit_on_screen()
+        self._gpu_status_async()
         if self.app:
             self.cfg_working = self._snapshot_cfg()
         self._scan_model_statuses()
@@ -520,6 +531,12 @@ class Settings(QDialog):
                 widget.blockSignals(False)
             self._load_replacements_table()
         
+        # Start at login: read from the OS, so a Task Manager switch-off shows.
+        if hasattr(self, "chk_autostart") and autostart.supported():
+            self.chk_autostart.blockSignals(True)
+            self.chk_autostart.setChecked(autostart.is_enabled())
+            self.chk_autostart.blockSignals(False)
+
         # 4. Privacy Mode
         self.chk_privacy.blockSignals(True)
         self.chk_privacy.setChecked(bool(self.cfg_working.get("privacy_mode", False)))
@@ -708,6 +725,33 @@ class Settings(QDialog):
         self._specs_label.setObjectName("subtitleLabel")
         self._specs_label.setWordWrap(True)
         sp_lay.addWidget(self._specs_label)
+        # Recommended once, here, when this PC has an NVIDIA GPU without its
+        # CUDA libraries (filled in by _refresh_gpu_ui).
+        self.gpu_reco = QFrame(specs_frame)
+        self.gpu_reco.setObjectName("gpuReco")
+        self.gpu_reco.setStyleSheet(
+            "QFrame#gpuReco { background: rgba(118,185,0,0.10); "
+            "border: 1px solid rgba(118,185,0,0.45); border-radius: 8px; }")
+        gr_lay = QVBoxLayout(self.gpu_reco)
+        gr_lay.setContentsMargins(10, 8, 10, 8)
+        self.lbl_gpu_reco = QLabel(
+            "<b>Recommended:</b> your NVIDIA graphics card can give you "
+            f"{gpu_accel.speedup_text()}. One-time {gpu_accel.DOWNLOAD_MB} MB "
+            "download from NVIDIA.", self.gpu_reco)
+        self.lbl_gpu_reco.setWordWrap(True)
+        gr_lay.addWidget(self.lbl_gpu_reco)
+        gr_row = QHBoxLayout()
+        self.btn_gpu_reco = QPushButton("Set up GPU acceleration", self.gpu_reco)
+        self.btn_gpu_reco.setObjectName("primaryButton")
+        self.btn_gpu_reco.clicked.connect(lambda: self._gpu_download_clicked("recommendation"))
+        gr_row.addWidget(self.btn_gpu_reco)
+        btn_gpu_later = QPushButton("Not now", self.gpu_reco)
+        btn_gpu_later.clicked.connect(self._gpu_reco_dismiss)
+        gr_row.addWidget(btn_gpu_later)
+        gr_row.addStretch()
+        gr_lay.addLayout(gr_row)
+        self.gpu_reco.hide()
+        sp_lay.addWidget(self.gpu_reco)
         layout.addWidget(specs_frame)
         self._detect_gpu_async()
 
@@ -723,6 +767,28 @@ class Settings(QDialog):
         hk_lay.addWidget(self.btn_hotkey)
         layout.addWidget(hotkey_frame)
 
+        # Start at login. Applied the moment it's ticked (like the History
+        # toggle), and it reads the OS, so a switch-off in Task Manager shows.
+        startup_frame = QFrame(tab)
+        startup_frame.setObjectName("cardFrame")
+        st_lay = QVBoxLayout(startup_frame)
+        login_word = "you log in to your Mac" if sys.platform == "darwin" else "Windows starts"
+        self.chk_autostart = QCheckBox(f"Start Transcribe when {login_word}", startup_frame)
+        st_lay.addWidget(self.chk_autostart)
+        st_desc = QLabel("It waits quietly in the tray, so your hotkey works right away.",
+                         startup_frame)
+        st_desc.setObjectName("subtitleLabel")
+        st_desc.setWordWrap(True)
+        st_lay.addWidget(st_desc)
+        if autostart.supported():
+            self.chk_autostart.setChecked(autostart.is_enabled())
+            self.chk_autostart.toggled.connect(self._on_autostart_toggled)
+        else:
+            self.chk_autostart.setEnabled(False)
+            st_desc.setText("Available once Transcribe is installed - not when it runs from "
+                            "source, or straight from the downloaded zip or disk image.")
+        layout.addWidget(startup_frame)
+
         # Live Assistance - the private call assistant. These controls write
         # straight to app.cfg and apply immediately: the overlay owns the
         # live_assist_* keys, which the Save write-back deliberately skips.
@@ -732,7 +798,9 @@ class Settings(QDialog):
         lp_lay.addWidget(QLabel("Live Assistance  ·  private call assistant", lp_frame))
         lp_desc = QLabel(
             "A floating glass prompter for calls: the last thing said, a running "
-            "summary and instant AI suggestions - kept out of your screen share. "
+            "summary and instant AI suggestions - "
+            + ("kept out of screen shares where macOS allows. " if sys.platform == "darwin"
+               else "kept out of your screen share. ") +
             "Press Listen on it (or start a meeting recording) to begin.", lp_frame)
         lp_desc.setObjectName("subtitleLabel")
         lp_desc.setWordWrap(True)
@@ -755,7 +823,10 @@ class Settings(QDialog):
         lp_row.addWidget(self.btn_lp_hotkey)
         lp_row.addStretch()
         lp_lay.addLayout(lp_row)
-        self.chk_lp_private = QCheckBox("Private by default - never in your screen share", lp_frame)
+        self.chk_lp_private = QCheckBox(
+            "Private by default - hidden from screen shares where macOS allows"
+            if sys.platform == "darwin" else
+            "Private by default - never in your screen share", lp_frame)
         self.chk_lp_private.setChecked(
             bool(self.app.cfg.get("live_assist_private", True)) if self.app else True)
         self.chk_lp_private.toggled.connect(self._apply_lp_private)
@@ -1117,13 +1188,35 @@ class Settings(QDialog):
             # Empty string → no discrete GPU → omit the GPU part entirely.
             self._specs_label.setText(self._quick_specs(gpu or None))
 
+    def _whisper_specs_text(self, info):
+        specs = f"Needs ~{info.get('min_ram')} GB RAM  ·  {self._speed_phrase(info.get('speed_rank', 3))}"
+        if info.get("armenian"):
+            specs += f"  ·  {info.get('armenian')}"
+        return specs
+
+    def _refresh_whisper_speeds(self):
+        """After GPU acceleration is installed or removed: 'on your GPU/CPU'."""
+        self._cuda = None
+        for card in getattr(self, "whisper_cards", {}).values():
+            lbl, info = getattr(card, "lbl_specs", None), getattr(card, "model_info", None)
+            if lbl is not None and info is not None:
+                lbl.setText(self._whisper_specs_text(info))
+
     def _speed_phrase(self, rank):
         """Plain-language speed estimate adjusted for this machine's hardware
         (whether a CUDA GPU is usable), instead of a meaningless fixed '~Ns'."""
         if getattr(self, "_cuda", None) is None:
             try:
-                import ctranslate2
-                self._cuda = ctranslate2.get_cuda_device_count() > 0
+                if sys.platform == "win32":
+                    # Seen is not usable: without cuBLAS (the optional
+                    # download) the packaged app runs on the CPU - and so it
+                    # does for the rest of a run in which the GPU failed.
+                    rec = getattr(self.app, "recorder", None) if self.app else None
+                    self._cuda = (gpu_accel.status(self.app.cfg if self.app else {}) == "ready"
+                                  and getattr(rec, "_cuda_usable", None) is not False)
+                else:
+                    import ctranslate2
+                    self._cuda = ctranslate2.get_cuda_device_count() > 0
             except Exception:
                 self._cuda = False
         try:
@@ -1135,6 +1228,180 @@ class Settings(QDialog):
             return f"{words.get(rank, 'Fast')} on your GPU"
         words = {1: "Very fast", 2: "Fast", 3: "Fast", 4: "Moderate", 5: "Slow", 6: "Slower"}
         return f"{words.get(rank, 'Moderate')} on your CPU"
+
+    # ── GPU acceleration (optional NVIDIA download - gpu_accel.py) ───────────
+    def _gpu_status_async(self):
+        cfg = self.app.cfg if self.app else {}
+        threading.Thread(target=lambda: self.gpu_state_ready.emit(gpu_accel.status(cfg)),
+                         daemon=True).start()
+
+    def _refresh_gpu_ui(self, state=None):
+        if not hasattr(self, "gpu_card"):
+            return
+        if hasattr(self, "btn_gpu_remove"):
+            self.btn_gpu_remove.setEnabled(True)
+        if state is not None and state != self._gpu_state:
+            self._gpu_state = state
+            self._refresh_whisper_speeds()             # installed / removed: GPU or CPU now
+        elif state is not None:
+            self._gpu_state = state
+        state = self._gpu_state
+        cfg = self.app.cfg if self.app else {}
+        phase = self.app.gpu_phase() if self.app and hasattr(self.app, "gpu_phase") else None
+        show = state not in (None, "unsupported")
+        self.gpu_card.setVisible(show)
+        self.gpu_reco.setVisible(bool(show and state == "available" and phase is None
+                                      and gpu_accel.can_offer(cfg)
+                                      and not cfg.get(gpu_accel.CFG_INTRO)))
+        if not show:
+            return
+        ours = gpu_accel.libs_dir() == str(gpu_accel.install_dir())
+        self.chk_gpu_never.blockSignals(True)
+        self.chk_gpu_never.setChecked(bool(cfg.get(gpu_accel.CFG_DECLINED)))
+        self.chk_gpu_never.blockSignals(False)
+        self.chk_gpu_never.setVisible(state == "available" and phase is None)
+        self.gpu_progress.setVisible(phase is not None)
+        self.btn_gpu.setVisible(True)
+        self.btn_gpu.setEnabled(True)
+        self.btn_gpu_remove.setVisible(False)
+        if phase == "download":
+            self.btn_gpu.setText("Cancel")
+            if self.gpu_progress.maximum() == 0:
+                self.gpu_progress.setRange(0, 100)
+            if not self.lbl_gpu_status.text().startswith("Downloading"):
+                self.lbl_gpu_status.setText("Downloading from NVIDIA…")
+        elif phase == "verify":
+            self.btn_gpu.setVisible(False)
+            self.gpu_progress.setRange(0, 0)               # busy
+            self.lbl_gpu_status.setText("Checking your graphics card…")
+        elif gpu_accel.removal_pending():
+            self.btn_gpu.setVisible(False)
+            self.lbl_gpu_status.setText("Removed - the files are deleted when Transcribe "
+                                        "restarts. Transcription uses the processor.")
+        elif state == "available":
+            last_error = getattr(self, "_gpu_last_error", "")
+            self.btn_gpu.setText(("Try again" if last_error else "Download")
+                                 + f" ({gpu_accel.DOWNLOAD_MB} MB)")
+            self.lbl_gpu_status.setText(
+                (f"Last attempt: {last_error}\n" if last_error else "")
+                + f"Your NVIDIA graphics card can give you {gpu_accel.speedup_text()} "
+                "with local Whisper models. One-time download from NVIDIA.")
+        elif state == "ready":
+            rec = getattr(self.app, "recorder", None) if self.app else None
+            if rec is not None and getattr(rec, "_cuda_usable", None) is False:
+                self.btn_gpu.setText("Try again")
+                self.lbl_gpu_status.setText(
+                    "Installed, but the graphics card couldn't run the speech model this "
+                    "session, so transcription uses the processor. Updating your NVIDIA "
+                    "driver usually fixes this.")
+            else:
+                self.btn_gpu.setVisible(False)
+                self.lbl_gpu_status.setText(
+                    "On - local transcription runs on your NVIDIA graphics card."
+                    + ("" if ours else " (Using the CUDA libraries already on this PC.)"))
+            self.btn_gpu_remove.setVisible(ours)
+        else:                                               # failed
+            reason = str(cfg.get(gpu_accel.CFG_FAILED) or "").strip()
+            self.btn_gpu.setText("Try again")
+            self.lbl_gpu_status.setText(
+                ("Downloaded, but your graphics card couldn't run it" if ours else
+                 "Your graphics card couldn't run the speech model with the CUDA "
+                 "libraries already on this PC")
+                + (f" ({reason[:160]})" if reason else "")
+                + ". Transcription stays on the processor. Update your NVIDIA driver, "
+                "then try again.")
+            self.btn_gpu_remove.setVisible(ours)
+
+    def _gpu_download_clicked(self, source):
+        self._gpu_last_error = ""
+        if self.app and hasattr(self.app, "start_gpu_download"):
+            self.app.start_gpu_download(source)
+        self._refresh_gpu_ui()
+
+    def _gpu_main_clicked(self):
+        if not self.app:
+            return
+        phase = self.app.gpu_phase()
+        if phase == "download":
+            self.app.cancel_gpu_download()
+            self.lbl_gpu_status.setText("Cancelling…")
+            return
+        if self._gpu_state == "available":
+            self._gpu_download_clicked("settings")
+        else:
+            self.app.retry_gpu()
+            self._refresh_gpu_ui()
+
+    def _gpu_remove_clicked(self):
+        reply = QMessageBox.question(
+            self, "Remove GPU acceleration",
+            "Remove the GPU libraries (about 736 MB)? Local transcription goes back to "
+            "the processor. You can download them again any time.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        rec = None
+        if self.app:
+            import time as _time
+            self.app.cfg.pop(gpu_accel.CFG_FAILED, None)
+            # Removing it is a "no" for now: no reminder for the next few days.
+            self.app.cfg[gpu_accel.CFG_INTRO] = True
+            self.app.cfg[gpu_accel.CFG_LAST] = _time.time()
+            self.app.save_config()
+            self.app.track("gpu_removed")
+            rec = getattr(self.app, "recorder", None)
+        self.btn_gpu_remove.setEnabled(False)
+        self.lbl_gpu_status.setText("Removing\u2026")
+        cfg = self.app.cfg if self.app else {}
+
+        def _work():
+            # Off the GUI thread: unloading waits for any model load in progress.
+            if rec is not None:
+                # Re-decided at the next load: the processor - or a CUDA
+                # Toolkit's libraries, if the PC has one.
+                rec._cuda_usable = None
+                rec.unload_model()
+            gpu_accel.remove()
+            self.gpu_state_ready.emit(gpu_accel.status(cfg))
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _gpu_never_toggled(self, on):
+        if self.app:
+            self.app.cfg[gpu_accel.CFG_DECLINED] = bool(on)
+            self.app.save_config()
+        self._refresh_gpu_ui()
+
+    def _gpu_reco_dismiss(self):
+        # Not now: the recommendation goes; a gentle reminder may come later,
+        # when a transcription actually waits on the processor.
+        if self.app:
+            self.app.cfg[gpu_accel.CFG_INTRO] = True
+            self.app.save_config()
+        self._refresh_gpu_ui()
+
+    def _on_gpu_progress(self, percent, done, total):
+        if not hasattr(self, "gpu_card"):
+            return
+        if percent < 0 or not self.gpu_progress.isVisible():
+            self._refresh_gpu_ui()                      # phase changed
+        if percent >= 0:
+            self.gpu_progress.setRange(0, 100)
+            self.gpu_progress.setValue(int(percent))
+            self.lbl_gpu_status.setText(
+                f"Downloading from NVIDIA… {done / 2**20:.0f} of {total / 2**20:.0f} MB")
+
+    def _on_gpu_done(self, state, message):
+        self._refresh_whisper_speeds()                  # "on your GPU/CPU"
+        if state == "failed":
+            self._gpu_last_error = message or "the download failed"
+        self._gpu_status_async()
+
+    def focus_gpu_card(self):
+        """From a notification: the Models tab, scrolled to the GPU card."""
+        if not hasattr(self, "gpu_card"):
+            return
+        self.tabs.setCurrentWidget(self.models_tab)
+        QTimer.singleShot(50, lambda: self._models_scroll.ensureWidgetVisible(self.gpu_card, 0, 40))
 
     def _detect_gpu_async(self):
         threading.Thread(target=lambda: self.specs_ready.emit(self._detect_gpu()), daemon=True).start()
@@ -1242,7 +1509,49 @@ class Settings(QDialog):
         whisper_notice.setStyleSheet("margin-bottom: 8px;")
         scroll_lay.addWidget(whisper_notice)
 
+        # GPU acceleration (NVIDIA PCs only - hidden elsewhere).
+        self.gpu_card = QFrame(scroll_content)
+        self.gpu_card.setObjectName("cardFrame")
+        g_lay = QVBoxLayout(self.gpu_card)
+        g_head = QLabel("GPU acceleration (NVIDIA)", self.gpu_card)
+        g_head.setStyleSheet("font-weight: 600;")
+        g_lay.addWidget(g_head)
+        self.lbl_gpu_status = QLabel("", self.gpu_card)
+        self.lbl_gpu_status.setObjectName("subtitleLabel")
+        self.lbl_gpu_status.setWordWrap(True)
+        g_lay.addWidget(self.lbl_gpu_status)
+        self.gpu_progress = QProgressBar(self.gpu_card)
+        self.gpu_progress.setRange(0, 100)
+        self.gpu_progress.setTextVisible(False)
+        self.gpu_progress.setFixedHeight(8)
+        self.gpu_progress.hide()
+        g_lay.addWidget(self.gpu_progress)
+        g_row = QHBoxLayout()
+        self.btn_gpu = QPushButton("", self.gpu_card)
+        self.btn_gpu.setObjectName("primaryButton")
+        self.btn_gpu.clicked.connect(self._gpu_main_clicked)
+        g_row.addWidget(self.btn_gpu)
+        self.btn_gpu_remove = QPushButton("Remove", self.gpu_card)
+        self.btn_gpu_remove.clicked.connect(self._gpu_remove_clicked)
+        g_row.addWidget(self.btn_gpu_remove)
+        g_row.addStretch()
+        self.chk_gpu_never = QCheckBox("Don't suggest this again", self.gpu_card)
+        self.chk_gpu_never.toggled.connect(self._gpu_never_toggled)
+        g_row.addWidget(self.chk_gpu_never)
+        g_lay.addLayout(g_row)
+        g_note = QLabel(
+            f"From NVIDIA's official cuBLAS package (version {gpu_accel.CUBLAS_VERSION}, "
+            "NVIDIA's license applies). Uses about 736 MB of disk. Only speech models "
+            "run on the GPU; your audio never leaves this computer.", self.gpu_card)
+        g_note.setObjectName("subtitleLabel")
+        g_note.setWordWrap(True)
+        g_note.setStyleSheet("font-size: 11px;")
+        g_lay.addWidget(g_note)
+        self.gpu_card.hide()
+        scroll_lay.addWidget(self.gpu_card)
+
         # Build Whisper cards
+        self._models_scroll = scroll
         for name, info in MODELS.items():
             card = self._build_whisper_card(name, info)
             self.whisper_cards[name] = card
@@ -1912,13 +2221,11 @@ class Settings(QDialog):
         card_lay.addLayout(title_row)
 
         # Specs row
-        specs = f"Needs ~{info.get('min_ram')} GB RAM  ·  {self._speed_phrase(info.get('speed_rank', 3))}"
-        if info.get("armenian"):
-            specs += f"  ·  {info.get('armenian')}"
-        lbl_specs = QLabel(specs, card)
+        lbl_specs = QLabel(self._whisper_specs_text(info), card)
         lbl_specs.setObjectName("subtitleLabel")
         lbl_specs.setWordWrap(True)
         card_lay.addWidget(lbl_specs)
+        card.lbl_specs, card.model_info = lbl_specs, info
 
         # Progress bar
         pbar = QProgressBar(card)
@@ -3436,6 +3743,24 @@ class Settings(QDialog):
         self.app.save_config()
         self._populate_history_list()
 
+    def _on_autostart_toggled(self, on):
+        ok = autostart.set_enabled(on)
+        # The setting records whether the app keeps a login entry at all (a
+        # Task Manager switch-off can leave one listed but disabled) - after a
+        # failure, that's what the OS has, not what the checkbox asked for.
+        keep = on if ok else autostart.is_registered()
+        if self.app:
+            self.cfg_working[autostart.CFG_KEY] = keep
+            self.app.cfg[autostart.CFG_KEY] = keep
+            self.app.save_config()
+        if not ok:
+            self.chk_autostart.blockSignals(True)
+            self.chk_autostart.setChecked(autostart.is_enabled())
+            self.chk_autostart.blockSignals(False)
+            QMessageBox.warning(self, "Start at login",
+                                "Couldn't change the startup setting. "
+                                "Please try again.")
+
     def _save_telemetry_config(self):
         if not self.app:
             return
@@ -4491,7 +4816,13 @@ class Settings(QDialog):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         )
         if reply == QMessageBox.Yes:
-            local_llm.remove_model(name)
+            try:
+                local_llm.remove_model(name)
+            except (local_llm.LocalLLMError, OSError) as e:
+                # In use (a meeting summary, say) or a file still open.
+                QMessageBox.warning(self, "Remove Local LLM",
+                                    f"Couldn't remove it right now: {e}")
+                return
             if self.app:
                 self.app.track("model_removed", {"kind": "llm", "model": name})
             self._local_llm_states[name] = "missing"

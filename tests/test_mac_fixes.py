@@ -81,8 +81,7 @@ class TestMacCapturePrivacy(unittest.TestCase):
         return rt, state
 
     def _patched(self, rt, darwin="23.6.0"):
-        # Darwin 23 = macOS 14; 24 = macOS 15, where ScreenCaptureKit ignores
-        # sharingType.
+        # Darwin 23 = macOS 14, 24 = macOS 15, 25 = macOS 26.
         from ui import glass
         return (mock.patch.object(glass, "IS_MAC", True),
                 mock.patch.object(glass, "IS_WINDOWS", False),
@@ -96,7 +95,6 @@ class TestMacCapturePrivacy(unittest.TestCase):
         widget = SimpleNamespace(winId=lambda: 0x123)
         a, b, c, d = self._patched(rt)
         with a, b, c, d:
-            self.assertTrue(glass.capture_exclusion_supported())
             self.assertTrue(glass.exclude_from_capture(widget, True))
             self.assertEqual(state["sharing"], 0)    # NSWindowSharingNone
             self.assertTrue(glass.is_excluded_from_capture(widget))
@@ -115,17 +113,19 @@ class TestMacCapturePrivacy(unittest.TestCase):
         with a, b, c, d:
             self.assertFalse(glass.exclude_from_capture(SimpleNamespace(winId=lambda: 0x123), True))
 
-    def test_macos_15_and_later_cannot_promise_hidden(self):
-        # ScreenCaptureKit (Zoom, Teams, browsers) ignores sharingType there:
-        # the flag is still set, but "Private" must not be claimed.
+    def test_no_macos_version_promises_hidden(self):
+        # sharingType is best effort on every macOS (QuickTime, Zoom's default
+        # capture mode show it): the flag is still set, but "Private" is never
+        # claimed - the badge says "May be hidden".
         from ui import glass
-        for darwin in ("24.6.0", "25.1.0"):
+        for darwin in ("23.6.0", "24.6.0", "25.1.0"):
             rt, state = self._runtime()
             a, b, c, d = self._patched(rt, darwin)
             with a, b, c, d:
                 self.assertFalse(glass.capture_exclusion_supported(), darwin)
                 self.assertTrue(glass.exclude_from_capture(SimpleNamespace(winId=lambda: 0x123), True))
                 self.assertEqual(state["sharing"], 0)
+                self.assertEqual(glass.macos_26_or_later(), darwin.startswith("25"))
 
 
 @unittest.skipUnless(_real_qt(), "real PySide6 not importable (stubbed)")

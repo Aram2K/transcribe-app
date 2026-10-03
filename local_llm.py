@@ -1,5 +1,10 @@
+import gc
+import logging
 import shutil
 import threading
+import time
+import weakref
+from contextlib import contextmanager
 from pathlib import Path
 
 import psutil
@@ -60,8 +65,26 @@ LEGACY_MODEL_IDS = {
     "aibuben_gpu": QWEN_7B_ID,
 }
 
+logger = logging.getLogger("transcribe")
+
 _llms = {}
 _llm_lock = threading.Lock()
+# Generations holding each model right now (_lease) and when it was last used:
+# unload_idle frees a model only at 0 leases - and only ever by dropping the
+# cache's reference, never Llama.close(), which would free the native context
+# under a generation still running on another thread (an uncatchable crash).
+_in_use = {}
+_last_used = {}
+_removing = set()           # being deleted from disk: no new load may start
+# A model that just failed to load: refused for a while instead of rebuilt
+# (GBs each time) by every 20 s live recap. forget_load_failures() = Retry.
+_load_failures = {}
+_LOAD_RETRY_S = 600
+
+
+def forget_load_failures():
+    with _llm_lock:
+        _load_failures.clear()
 # One inference lock per model: llama-cpp's Llama shares a single native
 # context, so two concurrent create_chat_completion calls corrupt state or
 # crash the whole process (an access violation Python cannot catch). Dictation
@@ -73,6 +96,12 @@ _infer_locks = {}
 
 class LocalLLMError(RuntimeError):
     pass
+
+
+class LocalModelLoadError(LocalLLMError):
+    """The model file is there but won't load (memory, a damaged file): the
+    user must hear about it - unlike a missing optional runtime, it never
+    silently degrades to the built-in formatter."""
 
 
 def normalize_model_id(model_id):
@@ -113,7 +142,21 @@ def model_downloaded(model_id=QWEN_TINY_ID):
 
 def remove_model(model_id=QWEN_TINY_ID):
     model_id = normalize_model_id(model_id)
-    unload_model(model_id)
+    # Check, mark and drop in ONE lock hold: no lease can slip in between.
+    with _llm_lock:
+        if _in_use.get(model_id):
+            raise LocalLLMError("The model is busy right now - try again when it finishes.")
+        _removing.add(model_id)
+        _llms.pop(model_id, None)
+        _load_failures.pop(model_id, None)
+    try:
+        return _remove_files(model_id)
+    finally:
+        with _llm_lock:
+            _removing.discard(model_id)
+
+
+def _remove_files(model_id):
     directory = model_dir(model_id)
     removed = False
     if directory.exists():
@@ -132,6 +175,59 @@ def unload_model(model_id=None):
             _llms.clear()
         else:
             _llms.pop(normalize_model_id(model_id), None)
+
+
+def unload_idle(max_idle_s, keep=None, now=None):
+    """Free cached models unused for ``max_idle_s`` seconds (0 = every model
+    not in use), except ``keep``. For the idle sweep, on a worker thread:
+    never waits (a load holds the lock for seconds - then it just skips),
+    never touches a model with a generation running. Returns the freed ids.
+
+    Measured (Qwen2.5-3B, n_ctx 8192): dropping the reference frees ~2.3 GB of
+    working set and ~5.5 GB of commit; a reload takes ~1-2 s."""
+    if max_idle_s is None or max_idle_s < 0:
+        return []
+    if not _llm_lock.acquire(blocking=False):
+        return []
+    try:
+        t = time.monotonic() if now is None else now
+        keep = normalize_model_id(keep) if keep else None
+        names = [m for m in _llms
+                 if m != keep and not _in_use.get(m)
+                 and t - _last_used.get(m, 0.0) >= max_idle_s]
+        freed = [_llms.pop(m) for m in names]
+    finally:
+        _llm_lock.release()
+    if not freed:
+        return []
+    refs = []
+    for entry in freed:
+        try:
+            refs.append(weakref.ref(entry["llm"]))
+        except TypeError:
+            refs.append(None)
+    del freed, entry
+    gc.collect()
+    alive = [n for n, r in zip(names, refs) if r is not None and r() is not None]
+    if alive:
+        logger.warning("Local model(s) %s still referenced after unload", alive)
+    logger.info("Freed idle local AI model(s): %s", ", ".join(names))
+    return names
+
+
+@contextmanager
+def _lease(model_id):
+    """The model for one generation, loaded if needed and counted as in use
+    until the block ends (streamed tokens included), so unload_idle never
+    frees it underneath. Load and count happen in one lock hold."""
+    model_id = normalize_model_id(model_id)
+    llm = _load_model(model_id, lease=True)
+    try:
+        yield llm
+    finally:
+        with _llm_lock:
+            _in_use[model_id] = max(0, _in_use.get(model_id, 0) - 1)
+            _last_used[model_id] = time.monotonic()
 
 
 def download_model(model_id=QWEN_TINY_ID, on_progress=None):
@@ -285,12 +381,12 @@ def run_action(text, mode, source_lang="auto", target_lang="en", model_id=QWEN_T
     text = (text or "").strip()
     if not text:
         return ""
-    llm = _load_model(model_id)
     # Serialize ALL inference on this model (tokenize included) - see
     # _infer_locks. The map-reduce path below can hold a model busy for
     # minutes, which is exactly when a dictation smart action would otherwise
-    # land on the same Llama from another thread.
-    with _infer_lock_for(model_id):
+    # land on the same Llama from another thread. The lease keeps the idle
+    # sweep off it for the whole run.
+    with _lease(model_id) as llm, _infer_lock_for(model_id):
         return _run_action_locked(llm, text, mode, source_lang, target_lang,
                                   vocab_block)
 
@@ -304,8 +400,7 @@ def run_action_stream(text, mode, on_token, source_lang="auto", target_lang="en"
     text = (text or "").strip()
     if not text:
         return ""
-    llm = _load_model(model_id)
-    with _infer_lock_for(model_id):
+    with _lease(model_id) as llm, _infer_lock_for(model_id):
         messages = _messages_for(mode, text, source_lang, target_lang, vocab_block)
         max_out = _MAX_TOKENS_BY_MODE.get(mode, 240)
         if mode == "translate" or _messages_tokens(llm, messages) > _N_CTX - max_out - 128:
@@ -374,15 +469,27 @@ def _has_cuda():
         return False
 
 
-def _load_model(model_id):
+def _load_model(model_id, lease=False):
     model_id = normalize_model_id(model_id)
     path = model_path(model_id)
     if not model_downloaded(model_id):
         raise LocalLLMError(f"{model_info(model_id)['label']} is not downloaded yet.")
     with _llm_lock:
+        if model_id in _removing:
+            raise LocalLLMError(f"{model_info(model_id)['label']} is being removed.")
+        failed = _load_failures.get(model_id)
+        if failed and time.monotonic() - failed[0] < _LOAD_RETRY_S:
+            raise LocalModelLoadError(failed[1])
         cached = _llms.get(model_id)
         if cached and cached.get("path") == str(path):
+            if lease:
+                _in_use[model_id] = _in_use.get(model_id, 0) + 1
+            _last_used[model_id] = time.monotonic()
             return cached["llm"]
+        # One local model resident at a time: an idle one (no generation
+        # running) goes before another is built - each holds GBs.
+        for other in [m for m in _llms if m != model_id and not _in_use.get(m)]:
+            _llms.pop(other, None)
         try:
             from llama_cpp import Llama
         except Exception as e:
@@ -397,17 +504,28 @@ def _load_model(model_id):
                 n_gpu_layers=gpu_layers,
                 verbose=False,
             )
-        except Exception:
+        except Exception as first:
             if gpu_layers == 0:
-                raise
-            llm = Llama(
-                model_path=str(path),
-                n_ctx=_N_CTX,
-                n_threads=max(2, min(8, psutil.cpu_count(logical=True) or 4)),
-                n_gpu_layers=0,
-                verbose=False,
-            )
+                msg = f"Couldn't load {model_info(model_id)['label']}: {first}"
+                _load_failures[model_id] = (time.monotonic(), msg)
+                raise LocalModelLoadError(msg) from first
+            try:
+                llm = Llama(
+                    model_path=str(path),
+                    n_ctx=_N_CTX,
+                    n_threads=max(2, min(8, psutil.cpu_count(logical=True) or 4)),
+                    n_gpu_layers=0,
+                    verbose=False,
+                )
+            except Exception as e:
+                msg = f"Couldn't load {model_info(model_id)['label']}: {e}"
+                _load_failures[model_id] = (time.monotonic(), msg)
+                raise LocalModelLoadError(msg) from e
         _llms[model_id] = {"path": str(path), "llm": llm}
+        _load_failures.pop(model_id, None)
+        if lease:
+            _in_use[model_id] = _in_use.get(model_id, 0) + 1
+        _last_used[model_id] = time.monotonic()
         return llm
 
 

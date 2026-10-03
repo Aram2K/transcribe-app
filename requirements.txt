@@ -1,4 +1,7 @@
 faster-whisper
+# CTranslate2 (faster-whisper's engine) stays on CUDA 12: the optional GPU
+# download (gpu_accel.py) is NVIDIA's cuBLAS 12, verified with ctranslate2 4.7.
+ctranslate2>=4.4,<5
 pyaudio; sys_platform != "win32"
 # pyaudiowpatch is a Windows-only PyAudio fork that adds WASAPI loopback
 # (so the meeting recorder can capture system audio in addition to the mic).

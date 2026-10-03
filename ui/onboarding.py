@@ -562,7 +562,29 @@ class Onboarding(QDialog):
         local_desc.setObjectName("subtitleLabel")
         local_desc.setWordWrap(True)
         layout_l.addWidget(local_desc)
-        
+
+        # An NVIDIA GPU without its CUDA libraries: recommend the optional
+        # download right here (ticked; started when setup finishes).
+        self.chk_gpu = None
+        try:
+            import gpu_accel
+            if gpu_accel.status(self.app.cfg if self.app else {}) == "available":
+                # Short label (a checkbox doesn't wrap), details underneath.
+                self.chk_gpu = QCheckBox("Also set up GPU acceleration (recommended)",
+                                         self.local_card)
+                self.chk_gpu.setChecked(True)
+                layout_l.addWidget(self.chk_gpu)
+                gpu_note = QLabel(
+                    f"Your NVIDIA graphics card gives you {gpu_accel.speedup_text()}. "
+                    f"One-time {gpu_accel.DOWNLOAD_MB} MB download from NVIDIA.",
+                    self.local_card)
+                gpu_note.setObjectName("subtitleLabel")
+                gpu_note.setWordWrap(True)
+                gpu_note.setContentsMargins(24, 0, 0, 0)
+                layout_l.addWidget(gpu_note)
+        except Exception:
+            self.chk_gpu = None
+
         layout_eng.addWidget(self.local_card)
         
         # Cloud Backend Option Card
@@ -821,8 +843,16 @@ class Onboarding(QDialog):
             self.app.cfg["analytics_enabled"] = self.analytics_val
             self.app.cfg["onboarding_done"] = True
             self.app.cfg["account_gate_seen"] = True
+            # The GPU recommendation was made (ticked or not): no second one.
+            want_gpu = bool(getattr(self, "chk_gpu", None) is not None
+                            and self.chk_gpu.isChecked() and self.backend_val == "local")
+            if getattr(self, "chk_gpu", None) is not None:
+                import gpu_accel
+                self.app.cfg[gpu_accel.CFG_INTRO] = True
 
             self.app.save_config()
+            if want_gpu and hasattr(self.app, "start_gpu_download"):
+                self.app.start_gpu_download("onboarding")
             self.app.apply_tray_bindings()
             # After saving, so a user who just opted out of analytics sends nothing.
             if hasattr(self.app, "track"):

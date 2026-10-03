@@ -320,7 +320,7 @@ class FileTranscribeTab(QWidget):
         if self.app is not None:
             # The recorder (and its GPU/model) is shared with live dictation
             # and meetings - never fight them for it.
-            if getattr(self.app, "is_rec", False) or (
+            if getattr(self.app, "is_rec", False) or getattr(self.app, "_busy", False) or (
                     hasattr(self.app, "_is_meeting_busy") and self.app._is_meeting_busy()):
                 QMessageBox.information(
                     self, "Recording in progress",
@@ -508,6 +508,15 @@ class FileTranscribeTab(QWidget):
                           else "too_long" if error.startswith("limit:") else "error")
                 self.app.track("file_transcription_failed", {"reason": reason, "took_minutes": took_min})
             elif result:
+                # A long local job on the processor: maybe suggest the GPU.
+                if hasattr(self.app, "_note_local_wait"):
+                    # Decode time only - not the model download or diarization.
+                    decode = getattr(getattr(self.app, "recorder", None),
+                                     "_last_segments_seconds", None)
+                    self.app._note_local_wait(
+                        "file", decode if decode is not None else
+                        time.time() - getattr(self, "_job_started", time.time()),
+                        result.get("model"))
                 self.app.track("file_transcription_completed", {
                     "model": result.get("model"),
                     "audio_minutes": round(result.get("duration", 0) / 60, 1),

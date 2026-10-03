@@ -342,22 +342,31 @@ def set_click_through(widget, enabled=True):
         return False
 
 
-def mac_capture_protection_reliable():
-    """True through macOS 14, where NSWindow.sharingType keeps a window out of
-    every capture. From macOS 15 (Darwin 24) ScreenCaptureKit - what Zoom,
-    Teams, browsers and QuickTime use - ignores it, and Apple offers no other
-    public way: the window can't be promised hidden there."""
-    if not IS_MAC:
-        return False
+def _darwin_major():
     try:
-        return int(os.uname().release.split(".")[0]) < 24
+        return int(os.uname().release.split(".")[0])
     except Exception:
-        return False
+        return 0
+
+
+def macos_26_or_later():
+    """Darwin 25 is macOS 26 Tahoe (Apple went from 15 to 26)."""
+    return IS_MAC and _darwin_major() >= 25
 
 
 def capture_exclusion_supported():
-    """Whether hiding a window from screen capture can be PROMISED here."""
-    return mac_capture_protection_reliable() or (IS_WINDOWS and windows_build() >= 19041)
+    """Whether hiding a window from screen capture can be PROMISED here: only
+    Windows 10 2004+ (WDA_EXCLUDEFROMCAPTURE).
+
+    macOS has no such promise on any version. Its only public switch,
+    NSWindow.sharingType = none (what Electron's setContentProtection sets),
+    is a "legacy constant" per Apple, whose DTS says screen capture can't be
+    prevented. In published tests (2024-2026): screenshots skip the window;
+    some shares do too (Meet in Chrome; reportedly Zoom's "...with window
+    filtering" capture modes); QuickTime and Cmd+Shift+5 recordings, and
+    Zoom's other modes - its Mac default "Auto" among them on 15.7 - show it.
+    exclude_from_capture still sets it there: best effort, labelled so."""
+    return IS_WINDOWS and windows_build() >= 19041
 
 
 # Private user32/gdi32 handles for the helpers below, so their argtypes/restype
