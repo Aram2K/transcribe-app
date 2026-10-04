@@ -10,8 +10,9 @@ Product shape (the CTO reasoning, so future edits keep the contract):
 * Progress is honest: distinct stages (read -> download model if needed ->
   transcribe -> speakers) drive one determinate bar, with a live time-left
   estimate derived from actual throughput. Cancel works mid-transcription.
-* Free covers files up to 1 hour; Pro raises the cap to 5 hours. The limit is
-  enforced on the DECODED duration, not the file size.
+* A file can be up to 5 hours long for everyone - the whole file is held in
+  memory while it's transcribed. Checked on the DECODED duration, not the
+  file size.
 * Output is a real .docx (docx_export) - speaker labels, timestamps, title -
   because "transcript in Word" is the artifact people actually send around.
 """
@@ -28,8 +29,7 @@ from PySide6.QtWidgets import (
 
 import docx_export
 
-FREE_MAX_SEC = 60 * 60          # 1 hour
-PRO_MAX_SEC = 5 * 60 * 60      # 5 hours
+MAX_SEC = 5 * 60 * 60          # 5 hours - the whole file is decoded into memory
 
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma",
               ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4b", ".amr", ".3gp"}
@@ -80,23 +80,13 @@ def pick_auto_model(recorder=None):
     return fallback
 
 
-def max_seconds(is_pro):
-    return PRO_MAX_SEC if is_pro else FREE_MAX_SEC
-
-
-def duration_error(duration_sec, is_pro):
-    """"" when the file is allowed, else the user-facing refusal."""
-    limit = max_seconds(is_pro)
-    if duration_sec <= limit + 1:
+def duration_error(duration_sec):
+    """"" when the file can be transcribed, else the user-facing refusal."""
+    if duration_sec <= MAX_SEC + 1:
         return ""
     mins = int(duration_sec // 60)
-    if is_pro:
-        return (f"This file is about {mins} minutes long - above the "
-                f"{PRO_MAX_SEC // 3600}-hour limit. Split it and transcribe "
-                "the parts separately.")
-    return (f"This file is about {mins} minutes long. Free covers up to "
-            "1 hour per file - upgrade to Transcribe Pro for files up to "
-            f"{PRO_MAX_SEC // 3600} hours.")
+    return (f"This file is about {mins} minutes long - files can be up to "
+            f"{MAX_SEC // 3600} hours. Split it and transcribe the parts separately.")
 
 
 def _fmt_dur(sec):
@@ -176,11 +166,6 @@ class FileTranscribeTab(QWidget):
         self.chk_timestamps.setChecked(True)
         opts.addWidget(self.chk_timestamps)
         lay.addLayout(opts)
-
-        self.lbl_limits = QLabel("", self)
-        self.lbl_limits.setObjectName("subtitleLabel")
-        lay.addWidget(self.lbl_limits)
-        self._refresh_limits_label()
 
         self.btn_go = QPushButton("Transcribe file", self)
         self.btn_go.setObjectName("heroButton")
@@ -278,8 +263,8 @@ class FileTranscribeTab(QWidget):
         dur = probe_duration(path)
         if dur:
             line = f"{info}  ·  {_fmt_dur(dur)}"
-            if duration_error(dur, self._is_pro()):
-                line += "  ·  ⚠ over your plan limit"
+            if duration_error(dur):
+                line += f"  ·  ⚠ longer than {MAX_SEC // 3600} hours"
         try:
             self.sig_file_info.emit(line)
         except RuntimeError:
@@ -289,20 +274,6 @@ class FileTranscribeTab(QWidget):
         self.lbl_file.setText(line)
 
     # ── helpers ──
-    def _is_pro(self):
-        try:
-            return bool(self.app and self.app.is_pro())
-        except Exception:
-            return False
-
-    def _refresh_limits_label(self):
-        if self._is_pro():
-            self.lbl_limits.setText(
-                f"Your Pro plan covers files up to {PRO_MAX_SEC // 3600} hours.")
-        else:
-            self.lbl_limits.setText(
-                "Free covers files up to 1 hour  ·  Pro extends that to "
-                f"{PRO_MAX_SEC // 3600} hours.")
 
     def _populate_models(self):
         from main import MODELS, model_downloaded
@@ -343,8 +314,7 @@ class FileTranscribeTab(QWidget):
         self.lbl_stage.setText("Starting…")
         self.lbl_eta.setText("")
         args = (self._path, self.combo_model.currentData(),
-                self.chk_speakers.isChecked(), self.chk_timestamps.isChecked(),
-                self._is_pro())
+                self.chk_speakers.isChecked(), self.chk_timestamps.isChecked())
         self._job_started = time.time()
         if self.app is not None:
             self.app.track("file_transcription_started", {
@@ -363,15 +333,15 @@ class FileTranscribeTab(QWidget):
             pass
 
     # ── the worker (background thread; UI only via signals) ──
-    def _run_job(self, path, model_choice, want_speakers, want_ts, is_pro):
+    def _run_job(self, path, model_choice, want_speakers, want_ts):
         try:
-            # Cheap metadata gate BEFORE the expensive decode: a free user with
-            # a 6-hour file shouldn't wait for (or pay the RAM of) a full
-            # decode just to be told no. The decoded duration below stays the
+            # Cheap metadata gate BEFORE the expensive decode: a 6-hour file
+            # shouldn't wait for (or pay the RAM of) a full decode just to be
+            # told no. The decoded duration below stays the
             # authoritative check for files with missing/lying metadata.
             probed = probe_duration(path)
             if probed:
-                err = duration_error(probed, is_pro)
+                err = duration_error(probed)
                 if err:
                     self.sig_finished.emit(None, "limit:" + err)
                     return
@@ -385,7 +355,7 @@ class FileTranscribeTab(QWidget):
             if duration < 0.5:
                 self.sig_finished.emit(None, "No audio could be read from this file.")
                 return
-            err = duration_error(duration, is_pro)
+            err = duration_error(duration)
             if err:
                 self.sig_finished.emit(None, "limit:" + err)
                 return
@@ -529,11 +499,6 @@ class FileTranscribeTab(QWidget):
         if error:
             if error.startswith("limit:"):
                 QMessageBox.information(self, "File too long", error[6:])
-                if self.app and hasattr(self.app, "_pro_upsell") and not self._is_pro():
-                    try:
-                        self.app._pro_upsell("long_files")
-                    except Exception:
-                        pass
             else:
                 QMessageBox.warning(self, "Transcription failed", error)
             return

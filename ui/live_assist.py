@@ -784,6 +784,7 @@ class _DragBar(QFrame):
     def mouseMoveEvent(self, e):
         if self._press is not None:
             self._owner.move(e.globalPosition().toPoint() - self._press)
+            self._owner._guard_crop_screen()
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
@@ -1413,7 +1414,20 @@ class LiveAssistOverlay(QWidget):
             # Acrylic lags behind a moving window on Windows 10; lift it.
             glass.remove_backdrop_blur(self)
 
+    def _guard_crop_screen(self):
+        """A crop is open while a share can see the card, and the card moved
+        to another monitor: the screenshot it shows (of the monitor it left)
+        must not appear in a share of this one."""
+        if not getattr(self, "_crop_shots", None) or self._exclusion_ok:
+            return
+        safe = self._crop_safe
+        shot_screen = self._crop_shots[safe][0] if safe is not None else None
+        if self.screen() is not shot_screen:
+            self._end_snip()
+            self._set_status("Screenshot closed - the card moved to another screen.")
+
     def _drag_ended(self):
+        self._guard_crop_screen()
         if self.app:
             self.app.cfg["live_assist_pos"] = [self.x(), self.y()]
             self.app.save_config()

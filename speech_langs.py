@@ -3,7 +3,7 @@ about the language(s) (one language, or several mixed inside a sentence), and
 the helpers the local Whisper path uses for mixed speech.
 
 "Mixed languages" is the language setting "multi" plus cfg["mix_languages"],
-the languages the user switches between - e.g. Armenian and English in one
+the languages the user switches between - e.g. English and Spanish in one
 sentence. Every word should come out in the language it was spoken in, in that
 language's own script: never translated, never transliterated. With fewer than
 two ticked, any language may be detected (how "multi" always worked).
@@ -11,8 +11,8 @@ two ticked, any language may be detected (how "multi" always worked).
 import re
 
 # The languages the app offers, in picker order.
-NAMES = {"hy": "Armenian", "en": "English", "ru": "Russian", "fr": "French",
-         "de": "German", "es": "Spanish", "ar": "Arabic"}
+NAMES = {"en": "English", "ar": "Arabic", "hy": "Armenian", "fr": "French",
+         "de": "German", "ru": "Russian", "es": "Spanish"}
 
 # Non-Latin scripts; the rest are written in Latin letters.
 _SCRIPT = {"hy": "the Armenian alphabet", "ru": "Cyrillic", "ar": "Arabic script"}

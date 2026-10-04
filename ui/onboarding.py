@@ -269,7 +269,7 @@ class Onboarding(QDialog):
         lay.addWidget(self.btn_guest, alignment=Qt.AlignCenter)
 
         guest_note = QLabel(
-            "Guest mode: 10 minutes of free recording, all models - no account needed.",
+            "Guest mode: start dictating right away - no account needed.",
             self.page_account,
         )
         guest_note.setObjectName("subtitleLabel")
@@ -509,13 +509,13 @@ class Onboarding(QDialog):
         langs = [
             ("auto", "Auto-detect"),
             ("multi", "Mixed languages"),
-            ("hy", "Armenian"),
             ("en", "English"),
-            ("ru", "Russian"),
+            ("ar", "Arabic"),
+            ("hy", "Armenian"),
             ("fr", "French"),
             ("de", "German"),
+            ("ru", "Russian"),
             ("es", "Spanish"),
-            ("ar", "Arabic")
         ]
         for val, label in langs:
             self.combo_lang.addItem(label, val)
@@ -599,8 +599,8 @@ class Onboarding(QDialog):
         layout_c.addWidget(self.btn_sel_cloud)
         
         cloud_desc = QLabel(
-            "Ideal for low-end laptops. Leverages Google Cloud Speech-to-Text "
-            "for superior accuracy (specifically for Armenian). Requires a free API Key.",
+            "Ideal for low-end laptops. Uses Google's cloud for high accuracy. "
+            "Requires a free API key.",
             self.cloud_card
         )
         cloud_desc.setObjectName("subtitleLabel")
@@ -660,7 +660,7 @@ class Onboarding(QDialog):
         layout_eng.addWidget(self.mistral_input_frame)
 
         # Telemetry Consent
-        self.chk_telemetry = QCheckBox("Share anonymous usage metrics to improve Armenian AI models", self.page_engine)
+        self.chk_telemetry = QCheckBox("Share anonymous usage data to help improve the app", self.page_engine)
         self.chk_telemetry.setChecked(self.analytics_val)
         layout_eng.addWidget(self.chk_telemetry)
 

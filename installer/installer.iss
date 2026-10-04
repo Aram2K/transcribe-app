@@ -178,6 +178,9 @@ begin
   // The app may have written the Run value itself (Settings toggle), so
   // remove it whether or not the install task created it - but only when it
   // starts THIS install, not a portable copy or another install.
+  // Known gap: on an all-users install each user's Run value lives in their
+  // own HKCU; only the uninstalling account's is removed here. Others are left
+  // pointing at the removed exe, which Windows simply skips at sign-in.
   if (CurUninstallStep = usUninstall) and
      RegQueryStringValue(HKEY_CURRENT_USER, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyAppName}', RunValue) and
      (Pos(Lowercase(ExpandConstant('{app}\{#MyAppExeName}')), Lowercase(RunValue)) > 0) then

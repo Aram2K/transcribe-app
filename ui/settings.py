@@ -128,10 +128,6 @@ class Settings(QDialog):
         self.resize(720, 780)
         self.setSizeGripEnabled(True)  # visible resize handle (also edge-drag)
         
-        # Apply global stylesheet
-        if self.app and hasattr(self.app, "style_content"):
-            self.setStyleSheet(self.app.style_content)
-
         # Thread-safe downloader signals
         self.downloader_signals = DownloadProgressSignal()
         self.downloader_signals.progress.connect(self._on_download_progress)
@@ -171,6 +167,11 @@ class Settings(QDialog):
         self._scan_model_statuses()
         
         self._build_ui()
+        # The global stylesheet goes on once the pages exist: set first, every
+        # page added to the tabs restyled its whole subtree again (~2 s of
+        # every app start).
+        if self.app and hasattr(self.app, "style_content"):
+            self.setStyleSheet(self.app.style_content)
         self.btn_hotkey.installEventFilter(self)
         self.installEventFilter(self)
         # Match the config stack to the engine actually selected in the dropdown
@@ -1190,8 +1191,6 @@ class Settings(QDialog):
 
     def _whisper_specs_text(self, info):
         specs = f"Needs ~{info.get('min_ram')} GB RAM  ·  {self._speed_phrase(info.get('speed_rank', 3))}"
-        if info.get("armenian"):
-            specs += f"  ·  {info.get('armenian')}"
         return specs
 
     def _refresh_whisper_speeds(self):
@@ -1205,25 +1204,37 @@ class Settings(QDialog):
     def _speed_phrase(self, rank):
         """Plain-language speed estimate adjusted for this machine's hardware
         (whether a CUDA GPU is usable), instead of a meaningless fixed '~Ns'."""
-        if getattr(self, "_cuda", None) is None:
+        cuda = getattr(self, "_cuda", None)
+        if cuda is None:
             try:
                 if sys.platform == "win32":
+                    # The GPU state comes from a worker (_gpu_status_async, on
+                    # show): asking here imported ctranslate2 - and on an NVIDIA
+                    # PC started CUDA - on the GUI thread while the app started.
+                    # Until it's known: CPU wording, not remembered;
+                    # _refresh_gpu_ui re-renders the cards when it arrives.
                     # Seen is not usable: without cuBLAS (the optional
                     # download) the packaged app runs on the CPU - and so it
                     # does for the rest of a run in which the GPU failed.
-                    rec = getattr(self.app, "recorder", None) if self.app else None
-                    self._cuda = (gpu_accel.status(self.app.cfg if self.app else {}) == "ready"
-                                  and getattr(rec, "_cuda_usable", None) is not False)
+                    state = getattr(self, "_gpu_state", None)
+                    if state is None:
+                        cuda = False
+                    else:
+                        rec = getattr(self.app, "recorder", None) if self.app else None
+                        cuda = self._cuda = (state == "ready"
+                                             and getattr(rec, "_cuda_usable", None) is not False)
+                elif sys.platform == "darwin":
+                    cuda = self._cuda = False                 # no CUDA on a Mac
                 else:
                     import ctranslate2
-                    self._cuda = ctranslate2.get_cuda_device_count() > 0
+                    cuda = self._cuda = ctranslate2.get_cuda_device_count() > 0
             except Exception:
-                self._cuda = False
+                cuda = self._cuda = False
         try:
             rank = int(rank)
         except (TypeError, ValueError):
             rank = 3
-        if self._cuda:
+        if cuda:
             words = {1: "Instant", 2: "Instant", 3: "Very fast", 4: "Very fast", 5: "Fast", 6: "Fast"}
             return f"{words.get(rank, 'Fast')} on your GPU"
         words = {1: "Very fast", 2: "Fast", 3: "Fast", 4: "Moderate", 5: "Slow", 6: "Slower"}
@@ -1567,7 +1578,7 @@ class Settings(QDialog):
         mistral_notice = QLabel(
             "Cloud transcription. Pro: no key needed. Free: add your Mistral API key in "
             "the model card.  Best for English and major European languages; for "
-            "Armenian, use local Whisper (Recommended) or Gemini.")
+            "other languages, use local Whisper (Recommended) or Gemini.")
         mistral_notice.setWordWrap(True)
         mistral_notice.setObjectName("subtitleLabel")
         mistral_notice.setStyleSheet("margin-bottom: 8px;")
@@ -3504,7 +3515,7 @@ class Settings(QDialog):
         layout.addWidget(self.chk_history)
 
         # Telemetry Consent checkbox.
-        self.chk_telemetry = QCheckBox("Share anonymous usage metrics to improve Armenian AI models", tab)
+        self.chk_telemetry = QCheckBox("Share anonymous usage data to help improve the app", tab)
         if self.app:
             self.chk_telemetry.setChecked(bool(self.app.cfg.get("analytics_enabled", True)))
         self.chk_telemetry.stateChanged.connect(self._save_telemetry_config)
@@ -3804,8 +3815,8 @@ class Settings(QDialog):
         scroll_lay.addWidget(logo_frame)
 
         desc_label = QLabel(
-            "An always-on private dictation tool optimized for Armenian, English, and Russian speakers.\n"
-            "Runs offline using Whisper AI or integrates with Google Cloud Speech API.",
+            "An always-on private dictation tool: speak in your language and your words appear.\n"
+            "Runs on your computer with Whisper AI, or in the cloud when you choose.",
             scroll_content
         )
         desc_label.setWordWrap(True)
@@ -3850,7 +3861,7 @@ class Settings(QDialog):
         aibuben_lay.addWidget(lbl_aibuben_logo)
 
         lbl_aibuben_desc = QLabel(
-            "This project is proud to be part of the <b>AIBUBEN</b> AI community in Yerevan-"
+            "This project is proud to be part of the <b>AIBUBEN</b> AI community - "
             "empowering AI builders, creators, and students to learn, connect, and build state-of-the-art products.",
             aibuben_frame
         )
@@ -4619,14 +4630,7 @@ class Settings(QDialog):
                 )
         else:
             self._acct_status_label.setText("Not signed in  ·  Guest")
-            try:
-                mins = entitlements.guest_minutes_remaining()
-                self._acct_plan_label.setText(
-                    f"Guest trial: ~{mins} min of free recording left. "
-                    "Create a free account to keep dictating + get 3 days of Pro."
-                )
-            except Exception:
-                self._acct_plan_label.setText("Sign in to manage your subscription and unlock Pro.")
+            self._acct_plan_label.setText("Create a free account to try Pro for 3 days.")
 
         # Top-right CTA: neutral "Sign up" for guests, purple "Upgrade" for free/trial.
         if hasattr(self, "_header_cta"):
@@ -4641,11 +4645,7 @@ class Settings(QDialog):
                 "QPushButton:hover { background-color: #9333ea; }"
             )
             if not authed:
-                try:
-                    mins = entitlements.guest_minutes_remaining()
-                except Exception:
-                    mins = 0
-                self._header_cta.setText(f"Sign up   ·   {mins} min left")
+                self._header_cta.setText("Sign up")
                 self._header_cta.setStyleSheet(neutral)
                 self._header_cta.setVisible(True)
             elif on_trial:

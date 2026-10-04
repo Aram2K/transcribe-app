@@ -17,7 +17,7 @@ class TestSpeechLangs(unittest.TestCase):
         self.assertEqual(speech_langs.mix_languages({}), [])
         self.assertEqual(speech_langs.mix_languages({"mix_languages": ["fr"]}), [])
         self.assertEqual(speech_langs.saved_mix({"mix_languages": ["fr"]}), ["fr"])
-        self.assertEqual(speech_langs.mix_languages({"mix_languages": "hy,en"}), ["hy", "en"])
+        self.assertEqual(speech_langs.mix_languages({"mix_languages": "hy,en"}), ["en", "hy"])
         self.assertEqual(speech_langs.mix_languages({"mix_languages": ["fr", "xx", "hy"]}),
                          ["hy", "fr"])                    # picker order, unknown dropped
 
@@ -104,7 +104,7 @@ class TestEngines(unittest.TestCase):
              mock.patch("requests.post", post):
             text, lang = main.AudioRecorder._run_google(rec, [0.0])
         prompt = sent["json"]["contents"][0]["parts"][0]["text"]
-        self.assertIn("switches between Armenian, English and French", prompt)
+        self.assertIn("switches between English, Armenian and French", prompt)
         self.assertEqual((text, lang), ("Բարև, okay", "multi"))
 
     def test_pro_cloud_request_lists_the_languages(self):
@@ -241,7 +241,7 @@ class TestSettingsMixRow(unittest.TestCase):
     def test_ticking_stages_the_mix(self):
         self.S._load_mix_checks(self.me)
         self.me.mix_checks["en"].setChecked(True)
-        self.assertEqual(self.me.cfg_working["mix_languages"], ["hy", "en", "ru"])
+        self.assertEqual(self.me.cfg_working["mix_languages"], ["en", "hy", "ru"])
         self.me._refresh_dirty.assert_called()
         self.me.mix_checks["en"].setChecked(False)
         self.me.mix_checks["ru"].setChecked(False)             # one left: saved as is...

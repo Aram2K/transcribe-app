@@ -32,22 +32,12 @@ class TestEntitlements(unittest.TestCase):
         self.assertEqual(entitlements.tier(FakeAuth(True, False)), entitlements.TIER_FREE)
         self.assertEqual(entitlements.tier(FakeAuth(True, True)), entitlements.TIER_PRO)
 
-    def test_guest_meter_counts_down_and_blocks(self):
-        self.assertTrue(entitlements.can_record(None))
-        self.assertEqual(entitlements.guest_seconds_remaining(), 600)
-
-        entitlements.add_guest_seconds(300)
-        self.assertAlmostEqual(entitlements.guest_seconds_remaining(), 300, delta=1)
-        self.assertTrue(entitlements.can_record(None))
-
-        entitlements.add_guest_seconds(300)
-        self.assertFalse(entitlements.can_record(None))   # 10 min exhausted
-        self.assertEqual(entitlements.guest_seconds_remaining(), 0)
-
-    def test_free_and_pro_are_unlimited(self):
-        entitlements.add_guest_seconds(10_000)  # blow past the guest cap
-        self.assertTrue(entitlements.can_record(FakeAuth(True, False)))
-        self.assertTrue(entitlements.can_record(FakeAuth(True, True)))
+    def test_dictation_is_never_metered(self):
+        # Transcription runs on the user's computer: no recording cap or
+        # meter exists for any tier.
+        for name in ("can_record", "add_guest_seconds", "guest_minutes_remaining",
+                     "GUEST_FREE_SECONDS"):
+            self.assertFalse(hasattr(entitlements, name), name)
 
     def test_pro_features_require_pro_tier(self):
         for feat in (entitlements.FEATURE_MEETINGS,
@@ -56,10 +46,6 @@ class TestEntitlements(unittest.TestCase):
             self.assertFalse(entitlements.feature_allowed(None, feat))
             self.assertFalse(entitlements.feature_allowed(FakeAuth(True, False), feat))
             self.assertTrue(entitlements.feature_allowed(FakeAuth(True, True), feat))
-
-    def test_minutes_remaining_rounds_up(self):
-        entitlements.add_guest_seconds(539)  # 61s left -> 2 minutes (ceil)
-        self.assertEqual(entitlements.guest_minutes_remaining(), 2)
 
 
 class TestPerUserSmartTrial(unittest.TestCase):
@@ -161,15 +147,11 @@ class TestAdminTierPreview(unittest.TestCase):
             entitlements.add_smart_action_use()
         self.assertFalse(entitlements.can_use_smart_action(admin_pro, cfg))
 
-    def test_admin_force_guest_applies_recording_cap(self):
+    def test_admin_force_guest_previews_the_guest_tier(self):
         admin_pro = FakeAuth(True, True, admin=True)
         cfg = {"admin_tier_override": "guest"}
         self.assertEqual(entitlements.tier(admin_pro, cfg), entitlements.TIER_GUEST)
         self.assertFalse(entitlements.has_pro_access(admin_pro, cfg))
-        # Guest cap is honored even though the admin is signed in.
-        self.assertTrue(entitlements.can_record(admin_pro, cfg))
-        entitlements.add_guest_seconds(10_000)
-        self.assertFalse(entitlements.can_record(admin_pro, cfg))
 
     def test_admin_force_pro_or_auto_grants_pro(self):
         admin_pro = FakeAuth(True, True, admin=True)

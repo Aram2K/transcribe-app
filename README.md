@@ -8,12 +8,11 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue?style=flat-square)]()
 [![Python](https://img.shields.io/badge/python-3.9%2B-green?style=flat-square)]()
 [![Offline](https://img.shields.io/badge/works-offline-success?style=flat-square)]()
-[![Armenian](https://img.shields.io/badge/language-Armenian%20%7C%20English%20%7C%20Russian-orange?style=flat-square)]()
 
 <h3>Press a key. Speak. Your words appear - wherever your cursor is.</h3>
 
 <p>A lightweight, always-on speech-to-text tool that lives in your system tray.<br/>
-Works completely offline using Whisper AI, or connects to Google Cloud for best Armenian accuracy.</p>
+Works completely offline using Whisper AI, or in the cloud when you choose.</p>
 
 **[⬇ Download for Windows (Installer)](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Windows-Setup.exe)** &nbsp;·&nbsp;
 **[⬇ Download for macOS (.dmg)](https://github.com/Aram2K/transcribe-app/releases/latest/download/TranscribeApp-Mac.dmg)** &nbsp;·&nbsp;
@@ -29,7 +28,7 @@ Works completely offline using Whisper AI, or connects to Google Cloud for best 
 
 Transcribe is a hotkey-triggered dictation tool that runs silently in the background on your computer. Press your configured key, speak naturally, and when you stop - the transcription is automatically pasted wherever your cursor is: a chat window, a document, an email, a code editor, anything.
 
-It was built especially for **Armenian speakers** who need accurate, native-script transcription (not Latin transliteration), while also supporting English, Russian, French, German, Spanish, and Arabic.
+It writes each language in its own script (never Latin transliteration) - English, Spanish, French, German, Russian, Arabic, Armenian and more - even when you switch languages mid-sentence.
 
 ---
 
@@ -43,9 +42,8 @@ It was built especially for **Armenian speakers** who need accurate, native-scri
 | 📄 **Transcribe Files** | Drop any audio/video file → a Word document with speaker labels and timestamps |
 | 📋 **Smart paste** | Auto-pastes at your cursor; falls back to clipboard |
 | 🗣 **Mixed languages** | Switch languages mid-sentence - every word stays in the language and alphabet you spoke it in |
-| 🌐 **Armenian-first** | Optimized offline models with Armenian Flag Tricolor branding and native AIBUBEN Yerevan AI Community integration |
 | 🔒 **Fully offline** | Local Whisper AI and Qwen/Gemma action summaries offline |
-| ☁️ **Google Cloud option** | Best accuracy for Armenian via Speech-to-Text API |
+| ☁️ **Cloud option** | Pro cloud transcription with no setup, or your own Gemini or Mistral key |
 | ⚡ **Streaming results** | Background chunks transcribed while you speak |
 | 📊 **Dictation pill** | Liquid-glass pill with a live waveform - drag it anywhere, never steals focus |
 | 🕘 **History log** | Searchable list of all past transcriptions |
@@ -173,15 +171,15 @@ Meetings of any length work with local models too - long transcripts are summari
 | Backend | Best for | Speed | Cost | Internet |
 |---------|----------|-------|------|----------|
 | **Local (Whisper AI)** | Privacy, offline use | 0.5-15s | Free forever | ❌ No |
-| **Google Cloud** | Armenian accuracy | ~1s | 60 min/month free | ✅ Yes |
+| **Google Cloud** | Accuracy without a fast computer | ~1s | Your key's pricing | ✅ Yes |
 
-### Setting up Google Cloud (for best Armenian)
+### Setting up Google Cloud
 
 1. Go to [console.cloud.google.com](https://console.cloud.google.com)
 2. Create a project → enable **Cloud Speech-to-Text API**
 3. Go to **Credentials** → Create API Key
 4. Paste it in **Settings → Google API Key → Test Key** to verify
-5. Switch backend to **Google Cloud** and set Language to **Auto-detect** or **Armenian**
+5. Switch backend to **Google Cloud** and set Language to **Auto-detect** or your language
 
 ---
 
@@ -205,7 +203,7 @@ Open via **right-click tray icon → Settings**. The settings window is cleanly 
 
 ### General Tab
 *   **Dictation Hotkey:** Configure your custom keyboard shortcut or mouse button trigger.
-*   **Default Spoken Language:** Select auto-detect or a specific language (Armenian, English, Russian, etc.).
+*   **Default Spoken Language:** Select auto-detect or a specific language (English, Spanish, Armenian, etc.).
 *   **Custom Vocabulary:** Guide recognition by providing names or domain-specific terms.
 *   **Meeting Recording Mode:** Toggle standard microphone-only recording or dynamic system loopback mixing.
 *   **Privacy Mode:** Disable history and enforce local offline models.
@@ -281,8 +279,8 @@ GitHub Actions builds `TranscribeApp-Windows.zip` and `TranscribeApp-Mac.dmg` an
 ## Roadmap
 
 - [x] Local offline transcription (Whisper AI)
-- [x] Google Cloud backend for best Armenian accuracy
-- [x] Auto language detection (Armenian / English / Russian)
+- [x] Cloud transcription backends
+- [x] Auto language detection
 - [x] Smart paste at cursor
 - [x] Streaming / chunked transcription
 - [x] System tray, settings panel, history log
@@ -324,5 +322,5 @@ Created by **[Aram Adamyan](https://www.linkedin.com/in/aram-adamyan-2k/)**, Fou
 ---
 
 <div align="center">
-<sub>Made with ❤️ for Armenian speakers and anyone who types too slowly.</sub>
+<sub>Made with ❤️ for anyone who types too slowly.</sub>
 </div>

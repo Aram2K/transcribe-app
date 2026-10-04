@@ -562,7 +562,7 @@ def _messages_for(mode, text, source_lang, target_lang, vocab_block=""):
             "## Action items  (- [ ] task (Owner: name) - derive owner from "
             "'I'll'/'name should'/etc.)\n"
             "## Open questions  (bullets; skip if none)\n\n"
-            "Preserve names exactly (incl. Armenian/Russian). Don't invent facts. "
+            "Preserve names exactly, in any script. Don't invent facts. "
             "If `[speaker change]` markers appear, use them to attribute who said what."
         )
     elif mode == "live_recap":

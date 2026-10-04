@@ -21,24 +21,14 @@ class TestTierGate(unittest.TestCase):
         import ui.file_transcribe as ft
         self.ft = ft
 
-    def test_free_covers_a_full_hour(self):
-        # The product promise: free users can do 1-hour files.
-        self.assertEqual(self.ft.duration_error(60 * 60, False), "")
-
-    def test_free_blocks_over_an_hour_and_mentions_pro(self):
-        msg = self.ft.duration_error(61 * 60, False)
-        self.assertTrue(msg)
-        self.assertIn("Pro", msg)
-
-    def test_pro_covers_five_hours(self):
-        self.assertEqual(self.ft.duration_error(5 * 3600, True), "")
-        msg = self.ft.duration_error(6 * 3600, True)
-        self.assertTrue(msg)
-        self.assertNotIn("upgrade", msg.lower())   # don't upsell Pro to Pro
-
-    def test_max_seconds(self):
-        self.assertEqual(self.ft.max_seconds(False), 3600)
-        self.assertEqual(self.ft.max_seconds(True), 5 * 3600)
+    def test_five_hour_files_for_everyone_without_plan_talk(self):
+        # Transcription is local: no plan decides the length, only memory.
+        self.assertEqual(self.ft.duration_error(61 * 60), "")
+        self.assertEqual(self.ft.duration_error(5 * 3600), "")
+        msg = self.ft.duration_error(6 * 3600)
+        self.assertIn("up to 5 hours", msg)
+        self.assertNotIn("Pro", msg)
+        self.assertNotIn("upgrade", msg.lower())
 
     def test_duration_formatting(self):
         self.assertEqual(self.ft._fmt_dur(59), "59 s")

@@ -411,24 +411,24 @@ RAM_GB = psutil.virtual_memory().total / (1024 ** 3)
 # of a fixed "~Ns" that is meaningless across machines. min_ram is a realistic,
 # monotonic minimum-recommended system RAM for the int8 runtime.
 MODELS = {
-    "tiny":           {"min_ram": 2,  "speed_rank": 1, "quality": "Good",        "size": "75 MB",   "armenian": None},
-    "base":           {"min_ram": 2,  "speed_rank": 2, "quality": "Better",      "size": "140 MB",  "armenian": None},
-    "small":          {"min_ram": 4,  "speed_rank": 3, "quality": "Great",       "size": "460 MB",  "armenian": None},
-    "medium":         {"min_ram": 6,  "speed_rank": 5, "quality": "Excellent",   "size": "1.4 GB",  "armenian": None},
-    "large-v3-turbo": {"min_ram": 6,  "speed_rank": 4, "quality": "Best (fast)", "size": "1.6 GB",  "armenian": "Recommended for Armenian"},
-    "large-v3":       {"min_ram": 8,  "speed_rank": 6, "quality": "Best",        "size": "3 GB",    "armenian": None},
+    "tiny":           {"min_ram": 2,  "speed_rank": 1, "quality": "Good",        "size": "75 MB"},
+    "base":           {"min_ram": 2,  "speed_rank": 2, "quality": "Better",      "size": "140 MB"},
+    "small":          {"min_ram": 4,  "speed_rank": 3, "quality": "Great",       "size": "460 MB"},
+    "medium":         {"min_ram": 6,  "speed_rank": 5, "quality": "Excellent",   "size": "1.4 GB"},
+    "large-v3-turbo": {"min_ram": 6,  "speed_rank": 4, "quality": "Best (fast)", "size": "1.6 GB"},
+    "large-v3":       {"min_ram": 8,  "speed_rank": 6, "quality": "Best",        "size": "3 GB"},
 }
 
 LANG_NAMES = {
     "auto":  "Auto-detect",
     "multi": "Mixed languages",
-    "hy":    "Armenian",
     "en":    "English",
-    "ru":    "Russian",
+    "ar":    "Arabic",
+    "hy":    "Armenian",
     "fr":    "French",
     "de":    "German",
+    "ru":    "Russian",
     "es":    "Spanish",
-    "ar":    "Arabic",
 }
 
 # Languages Mistral Voxtral transcription accepts (ISO-639-1). Anything else -
@@ -581,7 +581,48 @@ def _missing_from_cache(e):
             or "local_files_only" in str(e))
 
 
+# The Hugging Face repos faster-whisper downloads the catalog models from
+# (faster_whisper.utils._MODELS). Kept here so checking what's on disk never
+# imports faster-whisper and Hugging Face's downloader: the Settings scan does
+# it for every model while the app starts, and that cost ~2.5 s.
+_WHISPER_REPOS = {
+    "tiny": "Systran/faster-whisper-tiny",
+    "base": "Systran/faster-whisper-base",
+    "small": "Systran/faster-whisper-small",
+    "medium": "Systran/faster-whisper-medium",
+    "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+    "large-v3": "Systran/faster-whisper-large-v3",
+}
+
+
+def _cached_model_bin(repo_id):
+    """Whether the Hugging Face cache holds a complete model.bin for repo_id -
+    a plain disk check. None when the cache location can't be read."""
+    try:
+        from huggingface_hub import constants
+        root = constants.HF_HUB_CACHE
+    except Exception:
+        return None
+    snaps = os.path.join(root, "models--" + repo_id.replace("/", "--"), "snapshots")
+    try:
+        names = os.listdir(snaps)
+    except OSError:
+        return False
+    for snap in names:
+        try:
+            if os.path.getsize(os.path.join(snaps, snap, "model.bin")) > 1024:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def model_downloaded(name):
+    repo = _WHISPER_REPOS.get(name)
+    if repo:
+        on_disk = _cached_model_bin(repo)
+        if on_disk is not None:
+            return on_disk
     try:
         from faster_whisper.utils import download_model
         path = Path(download_model(name, local_files_only=True))
@@ -707,14 +748,6 @@ def remove_whisper_model(name):
 
     shutil.rmtree(cache_dir, onerror=_onerror)
     return True
-
-# Detect CUDA GPU via ctranslate2
-HAS_GPU = False
-try:
-    import ctranslate2 as _ct2
-    HAS_GPU = _ct2.get_cuda_device_count() > 0
-except Exception:
-    pass
 
 # ── Audio Recorder ────────────────────────────────────────────────────────────
 SILENCE_TRIGGER_SEC = 0.8
@@ -2124,12 +2157,12 @@ class AudioRecorder:
                 timeout=30,
             )
             if resp.status_code == 429:
-                # Monthly cloud allowance used up - transparently fall back to the
-                # local model so the user keeps working. Flag it so the UI can
-                # notify once.
+                # The cloud declined (its quiet safety cap) - transparently fall
+                # back to the local model so the user keeps working. Flag it so
+                # the UI can say so once.
                 self._cloud_capped = True
                 return self._fallback_to_local_or_error(
-                    audio, "managed", "Cloud limit reached.")
+                    audio, "managed", "Cloud transcription wasn't available.")
             if resp.status_code == 403:
                 # Not entitled to managed cloud - fall back to local.
                 return self._fallback_to_local_or_error(
@@ -2305,7 +2338,6 @@ class AppController(QObject):
         from pynput.keyboard import Controller
         self.kbd = Controller()
         self.is_rec = False
-        self._rec_started_at = None  # wall-clock start of the current dictation
         self._mouse_listener = None
         self._kbd_listener = None
         self._registered_kbd_hotkey = None
@@ -2386,8 +2418,7 @@ class AppController(QObject):
         threading.Thread(target=self._background_check_updates, daemon=True).start()
 
         # Onboarding wizard trigger on first launch. Existing users (already
-        # onboarded before accounts existed) get a one-time account gate instead,
-        # so they aren't silently dropped to the 10-minute guest cap.
+        # onboarded before accounts existed) get a one-time account gate instead.
         if not self.cfg.get("onboarding_done", False):
             QTimer.singleShot(500, self.show_onboarding)
         elif not self.cfg.get("account_gate_seen", False):
@@ -2461,10 +2492,6 @@ class AppController(QObject):
             signout.triggered.connect(lambda: self.sign_out())
             menu.addAction(signout)
         else:
-            mins = entitlements.guest_minutes_remaining()
-            guest_lbl = QAction(f"Guest · ~{mins} min free recording left", self)
-            guest_lbl.setEnabled(False)
-            menu.addAction(guest_lbl)
             signin = QAction("Sign in / Sign up (free)…", self)
             signin.triggered.connect(lambda: self.show_auth_gate())
             menu.addAction(signin)
@@ -2883,31 +2910,6 @@ class AppController(QObject):
             return f"{base}{sep}{urlencode(params)}"
         except Exception:
             return base
-
-    def _account_recording_time(self):
-        """Add the just-finished recording's duration to the guest meter. Only
-        guests are metered; free/pro have unlimited local dictation."""
-        started = self._rec_started_at
-        self._rec_started_at = None
-        if started is None:
-            return
-        elapsed = max(0.0, time.time() - started)
-        if entitlements.tier(self.auth, self.cfg) == entitlements.TIER_GUEST:
-            entitlements.add_guest_seconds(elapsed)
-            self.sig_auth_changed.emit()  # refresh tray remaining-time line
-
-    def _guest_limit_reached(self):
-        try:
-            telemetry.track("guest_trial_exhausted", {}, self.cfg, APP_VERSION)
-        except Exception:
-            pass
-        # Pressing the hotkey when out of free minutes opens the sign in / sign up
-        # screen directly, so the user knows the next step is to create an account.
-        self.show_tray_hint(
-            "Free minutes used up",
-            "Sign in (free) to keep dictating - unlimited local transcription, no charge.",
-        )
-        self.show_auth_gate()
 
     def _on_tray_activated(self, reason):
         # Any direct click on the tray icon opens the panel - single, double,
@@ -3646,7 +3648,6 @@ class AppController(QObject):
         except Exception:
             pass
         self._busy = False                  # immediately ready for the next take
-        self._account_recording_time()
         self._unregister_transient_keys()
 
     def _idle_sweep(self):
@@ -3739,10 +3740,6 @@ class AppController(QObject):
                 "Wait for it to finish (or cancel it in Transcribe Files) "
                 "before dictating - they share the speech model.")
             return
-        # Guests get a 10-minute free recording trial; block once it's spent.
-        if not entitlements.can_record(self.auth, self.cfg):
-            self._guest_limit_reached()
-            return
         warn = self._cloud_preflight_warn()
         if warn:
             try:
@@ -3751,7 +3748,6 @@ class AppController(QObject):
                 pass
         try:
             self.is_rec = True
-            self._rec_started_at = time.time()
             self.overlay.set_partial("")
             from ui.overlay import RECORDING
             self.overlay.show_overlay(RECORDING)
@@ -3790,7 +3786,6 @@ class AppController(QObject):
     def _cancel(self):
         self.recorder.stop_recording()
         self.is_rec = False
-        self._account_recording_time()
         self._unregister_transient_keys()
         self.overlay.call_soon(self.overlay.hide_overlay)
 
@@ -3997,7 +3992,6 @@ class AppController(QObject):
         # transcription below is treated as "cancel processing", and a stale
         # is_rec can't make the next hotkey think we're still recording.
         self.is_rec = False
-        self._account_recording_time()
         # NOTE: the Esc/Enter listener is intentionally left running here so Esc
         # can abort the transcription below; it's torn down in _stop's finally.
         from ui.overlay import TRANSCRIBING
@@ -4029,14 +4023,20 @@ class AppController(QObject):
             self._note_local_wait(
                 "dictation", max(0.0, waited - getattr(self.recorder, "_last_load_wait", 0.0)))
 
-        # If managed cloud hit its monthly cap, we transparently used the local
-        # model - tell the user once so the switch isn't a mystery.
-        if getattr(self.recorder, "_cloud_capped", False):
-            self.recorder._cloud_capped = False
+        # If the managed cloud turned this one down, we transparently used the
+        # local model - tell the user once so the switch isn't a mystery. Only
+        # when the computer really produced the text: a failed fallback shows
+        # its own error.
+        capped = getattr(self.recorder, "_cloud_capped", False)
+        self.recorder._cloud_capped = False
+        if (capped and not t.is_alive() and "exc" not in _result
+                and (_result.get("text") or "").strip()
+                and not str(_result.get("lang") or "").startswith("!")):
             self.overlay.call_soon(
                 self.show_tray_hint,
-                "Cloud limit reached",
-                "You've used this month's fast-cloud minutes - switched to the local model (still unlimited).",
+                "Transcribed on this computer",
+                "Cloud transcription wasn't available, so your words were transcribed "
+                "on this computer.",
             )
 
         if t.is_alive():

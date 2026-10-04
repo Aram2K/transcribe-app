@@ -2,15 +2,14 @@
 Tier + entitlement logic for Transcribe.
 
 Three tiers:
-  * guest - not signed in. A 10-minute total recording trial (all models), so a
-            new user can experience the product before creating an account
-            (lower friction → higher activation; see onboarding research).
-  * free  - signed in, no active subscription. Unlimited local dictation; Pro
-            features (meetings, smart actions, managed cloud) are locked behind
-            contextual upgrade prompts.
+  * guest - not signed in. Dictation runs on this computer, so it is never
+            limited - for anyone. Pro features are locked.
+  * free  - signed in, no active subscription. Pro features (meetings, smart
+            actions, managed cloud) are locked behind contextual upgrade
+            prompts; Smart Actions have a few free tries.
   * pro   - signed in with an active subscription. Everything unlocked.
 
-Guest usage is metered locally (no account) in usage.json. Pro entitlement is
+The Smart Actions tries are counted locally in usage.json. Pro entitlement is
 always confirmed server-side by auth.AuthManager - this module only maps that
 state to tiers + feature gates. It never decides Pro on its own.
 """
@@ -23,7 +22,6 @@ import storage
 
 logger = logging.getLogger("transcribe.entitlements")
 
-GUEST_FREE_SECONDS = 600  # 10 minutes of recording for guests
 FREE_SMART_ACTION_TRIES = 5  # free/guest users get 5 Smart Actions to try, then it locks
 
 TIER_GUEST = "guest"
@@ -110,49 +108,6 @@ def has_pro_access(auth, cfg=None):
     if auth is not None and getattr(auth, "is_pro", False):
         return True
     return False
-
-
-def guest_seconds_used():
-    try:
-        return max(0.0, float(_load_usage().get("guest_seconds_used", 0.0)))
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def guest_seconds_remaining():
-    return max(0.0, GUEST_FREE_SECONDS - guest_seconds_used())
-
-
-def guest_minutes_remaining():
-    """Whole minutes remaining, rounded up, for display."""
-    import math
-    return int(math.ceil(guest_seconds_remaining() / 60.0))
-
-
-def add_guest_seconds(seconds):
-    """Accumulate guest recording time. Returns the new total used."""
-    if not seconds or seconds <= 0:
-        return guest_seconds_used()
-    data = _load_usage()
-    used = guest_seconds_used() + float(seconds)
-    data["guest_seconds_used"] = used
-    try:
-        storage.atomic_write_json(_USAGE_PATH, data)
-    except Exception:
-        logger.debug("Could not persist guest usage", exc_info=True)
-    return used
-
-
-def can_record(auth, cfg=None):
-    """The guest recording cap applies to users who are not signed in. Signed-in
-    free/pro users have unlimited local dictation. An admin can preview the guest
-    cap by forcing the guest tier (so the 10-minute limit is honored even though
-    they're signed in); forcing free/pro keeps dictation unlimited as expected."""
-    if _override_tier(auth, cfg) == TIER_GUEST:
-        return guest_seconds_remaining() > 0
-    if auth is not None and getattr(auth, "is_authenticated", False):
-        return True
-    return guest_seconds_remaining() > 0
 
 
 def feature_allowed(auth, feature, cfg=None):
