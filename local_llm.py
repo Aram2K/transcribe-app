@@ -1,5 +1,6 @@
 import gc
 import logging
+import re
 import shutil
 import threading
 import time
@@ -24,8 +25,9 @@ MODEL_CATALOG = {
         "label": "Gemma 2 2B Instruct",
         "description": "Google's state-of-the-art 2B model. Highly accurate for reasoning, translation, and summary on modern CPUs.",
         "repo": "bartowski/gemma-2-2b-it-GGUF",
+        "revision": "855f67caed130e1befc571b52bd181be2e858883",
         "filename": "gemma-2-2b-it-Q4_K_M.gguf",
-        "size": 1_600_000_000,
+        "size": 1_708_582_752,
         "min_ram": 8,
         "gpu_recommended": False,
     },
@@ -33,8 +35,9 @@ MODEL_CATALOG = {
         "label": "Qwen Tiny 1.5B",
         "description": "Small local LLM for 16 GB RAM computers. Good first download for email, todo, and short translations.",
         "repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+        "revision": "91cad51170dc346986eccefdc2dd33a9da36ead9",
         "filename": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
-        "size": 1_120_000_000,
+        "size": 1_117_320_736,
         "min_ram": 8,
         "gpu_recommended": False,
     },
@@ -43,17 +46,22 @@ MODEL_CATALOG = {
         "label": "Qwen 3B",
         "description": "Stronger local action model for better writing and translation on newer CPUs.",
         "repo": "Qwen/Qwen2.5-3B-Instruct-GGUF",
+        "revision": "7dabda4d13d513e3e842b20f0d435c732f172cbe",
         "filename": "qwen2.5-3b-instruct-q4_k_m.gguf",
-        "size": 2_300_000_000,
+        "size": 2_104_932_768,
         "min_ram": 12,
         "gpu_recommended": False,
     },
     QWEN_7B_ID: {
         "label": "Qwen 7B",
         "description": "Higher quality local action model for strong machines. GPU acceleration is recommended.",
-        "repo": "Qwen/Qwen2.5-7B-Instruct-GGUF",
-        "filename": "qwen2.5-7b-instruct-q4_k_m.gguf",
-        "size": 4_700_000_000,
+        # Qwen's own repo has this quantisation only as two split files, so
+        # the single-file URL used before was a 404 (the download never
+        # started); bartowski's build is the same model in one file.
+        "repo": "bartowski/Qwen2.5-7B-Instruct-GGUF",
+        "revision": "8911e8a47f92bac19d6f5c64a2e2095bd2f7d031",
+        "filename": "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+        "size": 4_683_074_240,
         "min_ram": 16,
         "gpu_recommended": True,
     },
@@ -76,6 +84,7 @@ _llm_lock = threading.Lock()
 _in_use = {}
 _last_used = {}
 _removing = set()           # being deleted from disk: no new load may start
+_downloading = set()        # being downloaded: one download per model at a time
 # A model that just failed to load: refused for a while instead of rebuilt
 # (GBs each time) by every 20 s live recap. forget_load_failures() = Retry.
 _load_failures = {}
@@ -118,8 +127,11 @@ def model_info(model_id):
 
 
 def model_url(model_id):
+    # A pinned commit, never "main": the bytes behind the URL can't change, so
+    # a resumed download never splices two versions of a file and "size" stays
+    # exact. (Re-pin, re-checking the size, when moving to a newer upload.)
     info = model_info(model_id)
-    return f"https://huggingface.co/{info['repo']}/resolve/main/{info['filename']}"
+    return f"https://huggingface.co/{info['repo']}/resolve/{info['revision']}/{info['filename']}"
 
 
 def model_dir(model_id=QWEN_TINY_ID):
@@ -127,8 +139,28 @@ def model_dir(model_id=QWEN_TINY_ID):
 
 
 def model_path(model_id=QWEN_TINY_ID):
-    info = model_info(model_id)
-    return model_dir(model_id) / info["filename"]
+    return model_dir(model_id) / model_info(model_id)["filename"]
+
+
+def download_error_message(err):
+    """A model download failure, worded for the user."""
+    status = getattr(getattr(err, "response", None), "status_code", None)
+    # Hugging Face answers a removed or private repo with 401, not 404.
+    if status in (401, 404):
+        return ("the file isn't at its download address any more. Update Transcribe, "
+                "or pick another model.")
+    if status == 403:
+        return "the download server refused the request - please try again later."
+    if status == 429 or (isinstance(status, int) and status >= 500):
+        return "the download server is busy right now - please try again in a few minutes."
+    if isinstance(err, LocalLLMError):
+        return str(err)
+    if getattr(err, "errno", None) == 28 or getattr(err, "winerror", None) in (39, 112):
+        return "there isn't enough free disk space."
+    if isinstance(err, PermissionError) or getattr(err, "winerror", None) in (5, 32, 33):
+        return ("the model file is in use or can't be written - close other programs "
+                "using it (or restart Transcribe) and try again.")
+    return "the download didn't finish - check your connection and try again (it resumes)."
 
 
 def partial_path(model_id=QWEN_TINY_ID):
@@ -146,6 +178,8 @@ def remove_model(model_id=QWEN_TINY_ID):
     with _llm_lock:
         if _in_use.get(model_id):
             raise LocalLLMError("The model is busy right now - try again when it finishes.")
+        if model_id in _downloading:
+            raise LocalLLMError("The model is downloading - try again when it finishes.")
         _removing.add(model_id)
         _llms.pop(model_id, None)
         _load_failures.pop(model_id, None)
@@ -230,11 +264,43 @@ def _lease(model_id):
             _last_used[model_id] = time.monotonic()
 
 
+def downloading(model_id):
+    """True while ``model_id`` is being downloaded (on any thread). No lock on
+    purpose: Settings asks on the GUI thread, and a model load holds _llm_lock
+    for seconds. A set lookup is atomic; writers still hold the lock."""
+    return normalize_model_id(model_id) in _downloading
+
+
 def download_model(model_id=QWEN_TINY_ID, on_progress=None):
+    """Download a model, resuming a stopped download. One at a time per model:
+    two threads appending to the same partial file would corrupt it."""
     model_id = normalize_model_id(model_id)
+    with _llm_lock:
+        if model_id in _downloading:
+            raise LocalLLMError("this model is already downloading.")
+        if model_id in _removing:
+            raise LocalLLMError("this model is being removed - try again in a moment.")
+        _downloading.add(model_id)
+    try:
+        return _download(model_id, on_progress)
+    finally:
+        with _llm_lock:
+            _downloading.discard(model_id)
+
+
+def _content_range(value):
+    """'bytes 100-199/200' -> (100, 200); the total is None for '*'; (None,
+    None) when there's no usable header."""
+    m = re.match(r"\s*bytes\s+(?:(\d+)-\d+|\*)/(\d+|\*)", value or "")
+    if not m:
+        return None, None
+    start = int(m.group(1)) if m.group(1) is not None else None
+    return start, (int(m.group(2)) if m.group(2) != "*" else None)
+
+
+def _download(model_id, on_progress):
     info = model_info(model_id)
-    directory = model_dir(model_id)
-    directory.mkdir(parents=True, exist_ok=True)
+    model_dir(model_id).mkdir(parents=True, exist_ok=True)
     dest = model_path(model_id)
     part = partial_path(model_id)
     got = part.stat().st_size if part.exists() else 0
@@ -242,16 +308,32 @@ def download_model(model_id=QWEN_TINY_ID, on_progress=None):
 
     with requests.get(model_url(model_id), stream=True, timeout=60, headers=headers, allow_redirects=True) as resp:
         if resp.status_code == 416:
-            part.replace(dest)
-            if on_progress:
-                on_progress(100, dest.stat().st_size, dest.stat().st_size)
-            return dest
+            # Nothing past what we have: finished - if it really is the whole
+            # file (a damaged, too-long partial also gets a 416).
+            _, total = _content_range(resp.headers.get("Content-Range"))
+            if got != (total or info["size"]):
+                part.unlink(missing_ok=True)
+                raise LocalLLMError("the partial download didn't match the file - try "
+                                    "again, it starts over.")
+            return _finish(part, dest, on_progress)
         resp.raise_for_status()
-        total = int(resp.headers.get("Content-Length", 0))
-        expected = got + total if total else info["size"]
-        mode = "ab" if got and resp.status_code == 206 else "wb"
-        if mode == "wb":
+        length = int(resp.headers.get("Content-Length") or 0)
+        if resp.status_code == 206:
+            # The rest of the file: it must start exactly where ours ends.
+            start, total = _content_range(resp.headers.get("Content-Range"))
+            if start != got:
+                part.unlink(missing_ok=True)
+                raise LocalLLMError("the download server sent the wrong part of the file - "
+                                    "try again, it starts over.")
+            if total is None and length:
+                total = got + length
+            mode = "ab"
+        else:
+            # The whole file (no partial yet, or the server ignored the Range).
+            total = length or None
+            mode = "wb"
             got = 0
+        expected = total or info["size"]
         with part.open(mode) as f:
             for chunk in resp.iter_content(chunk_size=1024 * 1024):
                 if not chunk:
@@ -262,6 +344,19 @@ def download_model(model_id=QWEN_TINY_ID, on_progress=None):
                     pct = int((got / expected) * 100) if expected else None
                     on_progress(min(pct, 99) if pct is not None else None, got, expected)
 
+    # What's on disk decides - never install a cut-off model (it would only
+    # fail to load later). Unknown size (no header): the transfer ended cleanly.
+    size = part.stat().st_size
+    if total and size < total:
+        raise LocalLLMError("the download didn't finish - try again, it picks up "
+                            "where it stopped.")
+    if total and size > total:
+        part.unlink(missing_ok=True)
+        raise LocalLLMError("the download came out damaged - try again, it starts over.")
+    return _finish(part, dest, on_progress)
+
+
+def _finish(part, dest, on_progress):
     part.replace(dest)
     if on_progress:
         size = dest.stat().st_size

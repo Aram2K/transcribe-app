@@ -75,6 +75,15 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--show-settings"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+; An in-app update runs this installer quietly (see updater.py). A per-user
+; update passes /relaunch=1: this entry reopens the app when the install
+; succeeds. The app also starts a small watcher as the user
+; (updater.spawn_relauncher) that reopens it once Setup's log closes - so it
+; also comes back after a FAILED install, and after an all-users install,
+; where this elevated Setup can't start anything as the original user. Two
+; launches are harmless: the single-instance lock keeps one. A plain silent
+; deployment (no /relaunch=1) doesn't start the app.
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--show-settings"; Flags: nowait runasoriginaluser; Check: RelaunchAfterUpdate
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
@@ -188,6 +197,12 @@ begin
     RegDeleteValue(HKEY_CURRENT_USER, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyAppName}');
     RegDeleteValue(HKEY_CURRENT_USER, 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run', '{#MyAppName}');
   end;
+end;
+
+// Started by the app's updater (updater.INSTALL_ARGS): reopen it afterwards.
+function RelaunchAfterUpdate(): Boolean;
+begin
+  Result := WizardSilent and (ExpandConstant('{param:relaunch|0}') = '1');
 end;
 
 function InitializeSetup(): Boolean;

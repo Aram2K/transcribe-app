@@ -51,6 +51,7 @@ import hotkeys
 import speech_langs
 import autostart
 import gpu_accel
+import updater
 
 # ── Version ───────────────────────────────────────────────────────────────────
 APP_VERSION = "1.9.4"
@@ -134,6 +135,9 @@ DEFAULT = {
     "admin_tier_override": "auto",  # super-admin only: auto|guest|free|pro
     "dismissed_update_version": "",
     "pending_update_version": "",
+    # The install handed to the installer last run: {"to": tag, "log": path}.
+    # Still an older version at the next start = it didn't install - say so.
+    "update_attempt": {},
     "pending_update_body": "",
     "previous_version": "",
     "tray_hint_shown": False,
@@ -2294,9 +2298,10 @@ class AppController(QObject):
     sig_enter = Signal()
     sig_escape = Signal()
     sig_update_available = Signal(str)  # tag of newer version
+    sig_update_progress = Signal(float, float)  # update download: done bytes, total bytes
+    sig_update_stage = Signal(str, str)  # update: "ready"/"failed"/"cancelled", path or message
     sig_auth_changed = Signal()         # auth/entitlement state changed (from worker threads)
     sig_ipc_action = Signal(str)        # a second launch handed us an action (socket thread)
-    sig_quit = Signal()                 # quit from a worker thread (after launching the installer)
     sig_gpu_progress = Signal(int, float, float)  # GPU download: percent, done bytes, total bytes
     sig_gpu_done = Signal(str, str)     # GPU download: state ("ok"/"gpu_failed"/"failed"/"cancelled"), message
     sig_gpu_wait = Signal(str, str, float)  # a local transcription made the user wait: context, model, seconds
@@ -2382,9 +2387,15 @@ class AppController(QObject):
         self.sig_enter.connect(self._on_enter, Qt.QueuedConnection)
         self.sig_escape.connect(self._on_escape, Qt.QueuedConnection)
         self.sig_update_available.connect(self._prompt_update, Qt.QueuedConnection)
+        # Installing an update: a visible window from download to restart.
+        self._update_thread = None
+        self._update_dialog = None
+        self._update_cancel = False
+        self._update_manual = False
+        self.sig_update_progress.connect(self._on_update_progress, Qt.QueuedConnection)
+        self.sig_update_stage.connect(self._on_update_stage, Qt.QueuedConnection)
         self.sig_auth_changed.connect(self._on_auth_changed, Qt.QueuedConnection)
         # A QTimer started on a plain thread never fires: the updater hops here.
-        self.sig_quit.connect(self.qapp.quit, Qt.QueuedConnection)
         self._update_prompt_open = False
 
         # Register the configured hotkey (keyboard combo or mouse button).
@@ -2393,6 +2404,7 @@ class AppController(QObject):
         # doesn't wait 1-2 s for it. (The idle sweep frees it again if it
         # isn't used for whisper_idle_unload_min.)
         QTimer.singleShot(2500, self._preload_speech_model)
+        self._after_restart_checks()
         # Optional NVIDIA GPU acceleration (gpu_accel): the download runs on a
         # worker; its progress/result and the "you just waited" hints arrive here.
         self._gpu_thread = None
@@ -3169,6 +3181,12 @@ class AppController(QObject):
         # Skip if user is mid-recording - don't interrupt them.
         if self.is_rec:
             return
+        if self._update_in_progress() or getattr(self, "_update_failed_notice", False):
+            return                          # already updating, or about to say it failed
+        dlg = self._update_dialog
+        if dlg is not None and dlg.isVisible():
+            self._bring_to_front(dlg)       # its Try again is the same question
+            return
         self._update_prompt_open = True
         try:
             reply = QMessageBox.question(
@@ -3179,11 +3197,7 @@ class AppController(QObject):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
             )
             if reply == QMessageBox.Yes:
-                self.track("update_install_started", {"manual": False, "to": tag})
-                threading.Thread(
-                    target=self._download_and_install_update,
-                    args=(tag,), daemon=True,
-                ).start()
+                self.start_update(tag, manual=False)
         finally:
             self._update_prompt_open = False
 
@@ -3192,32 +3206,303 @@ class AppController(QObject):
         """True when release ``tag`` is newer than the running version."""
         return _parse_version(tag) > _parse_version(APP_VERSION)
 
-    def _download_and_install_update(self, tag):
-        # Background-thread installer fetch. Identical to the Settings → About
-        # button flow, lifted here so the popup works without the user
-        # opening Settings first.
-        import urllib.request, tempfile, shutil, os
+    def _update_blocked(self):
+        """Something installing (= closing the app) would cut off: a dictation
+        (recording or still transcribing), a meeting, a file transcription."""
+        return bool(getattr(self, "is_rec", False) or getattr(self, "_busy", False)
+                    or getattr(self, "_file_job_running", False) or self._is_meeting_busy())
+
+    def _update_in_progress(self):
+        """Downloading, waiting to install or installing right now - or asking
+        about unsaved Settings on the way there."""
+        if getattr(self, "_update_running", False) or getattr(self, "_update_confirming", False):
+            return True
+        dlg = self._update_dialog
+        return bool(dlg is not None and dlg.isVisible()
+                    and getattr(dlg, "stage", "") in ("downloading", "waiting", "installing"))
+
+    def _update_stale(self, gen):
+        """Cancelled, or a timer left from an earlier attempt."""
+        return bool(self._update_cancel
+                    or (gen is not None and gen != getattr(self, "_update_gen", 0)))
+
+    def _update_dialog_for(self, tag):
+        from ui.update_dialog import UpdateDialog
+        if self._update_dialog is None or self._update_dialog.tag != tag:
+            dlg = UpdateDialog(tag, style=getattr(self, "style_content", None))
+            dlg.cancel_requested.connect(self._cancel_update)
+            dlg.retry_requested.connect(lambda t=tag: self.start_update(t, manual=True))
+            dlg.website_requested.connect(lambda: webbrowser.open(updater.releases_page()))
+            self._update_dialog = dlg
+        return self._update_dialog
+
+    def _ask_about_settings(self, win):
+        """Settings' "Unsaved changes" box, for an update. The update window
+        (always on top) steps aside meanwhile so the box is never hidden
+        under it, and no second update can start while it's open (it runs
+        its own event loop)."""
+        dlg = self._update_dialog
+        was_shown = dlg is not None and dlg.isVisible()
+        if was_shown:
+            dlg.hide()
+        self._update_confirming = True
         try:
-            setup_url = (
-                f"{PROJECT_GITHUB_URL}/releases/download/{tag}/"
-                "TranscribeApp-Windows-Setup.exe"
-            )
-            dest_path = os.path.join(tempfile.gettempdir(), "TranscribeApp-Windows-Setup.exe")
-            req = urllib.request.Request(setup_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req) as response:
-                with open(dest_path, "wb") as out_file:
-                    shutil.copyfileobj(response, out_file)
-            os.startfile(dest_path)
+            self._bring_to_front(win)
+            return bool(win._confirm_discard_or_save())
+        finally:
+            self._update_confirming = False
+            if was_shown and not self._update_cancel:
+                self._bring_to_front(dlg)
+
+    def start_update(self, tag, manual=False, _settings_done=False):
+        """Install update ``tag`` with a visible window from download to
+        restart (ui/update_dialog.py + updater.py): progress, a checksum check,
+        then a quiet install after which the app reopens - or what went wrong,
+        with Try again / the website. GUI thread. Both the update popup and
+        Settings > About come here."""
+        if sys.platform != "win32" or not updater.can_self_install():
+            # The Mac disk image, or the portable zip (it has no installer of
+            # its own to update): the download, in the browser.
+            webbrowser.open(updater.mac_url(tag) if sys.platform == "darwin"
+                            else updater.releases_page())
+            self.track("update_install_started", {"manual": bool(manual), "to": tag,
+                                                  "handoff": "browser"})
+            self.show_tray_hint("Transcribe update",
+                                f"Opening the {tag} download in your browser.")
+            return
+        if getattr(self, "_update_launched", False):
+            return                              # the installer runs; the app is closing
+        if self._update_blocked():
+            # Installing closes the app: never in the middle of a recording.
+            self.show_tray_hint("Update waits for your recording",
+                                "Finish the recording or transcription, then install "
+                                "the update.")
+            return
+        if self._update_in_progress():
+            dlg = self._update_dialog
+            if getattr(self, "_update_confirming", False):
+                win = getattr(self, "settings_win", None)
+                if win is not None:
+                    self._bring_to_front(win)   # the question that's already open
+                return
+            if getattr(self, "_update_running", False) and self._update_cancel and dlg is not None:
+                # A cancelled download still winding down (a stalled
+                # connection takes up to 30 s to notice): start again the
+                # moment it has.
+                self._update_queued = (tag, bool(manual))
+                dlg.show_downloading()
+            if dlg is not None:
+                self._bring_to_front(dlg)
+            return
+        # Installing closes every window: unsaved Settings changes first.
+        win = getattr(self, "settings_win", None)
+        if (not _settings_done and win is not None
+                and hasattr(win, "_confirm_discard_or_save") and win.isVisible()
+                and getattr(win, "_unsaved_keys", lambda: True)()):
+            if not self._ask_about_settings(win):
+                return
+            # The box ran its own event loop - all the checks again.
+            return self.start_update(tag, manual, _settings_done=True)
+        self.track("update_install_started", {"manual": bool(manual), "to": tag})
+        dlg = self._update_dialog_for(tag)
+        dlg.show_downloading()
+        self._bring_to_front(dlg)
+        self._update_cancel = False
+        self._update_queued = None
+        self._update_settings_asked = False
+        self._update_manual = bool(manual)
+        self._update_tag = tag
+        # Each attempt's own number: a timer left from a cancelled one never
+        # acts on a later one.
+        self._update_gen = getattr(self, "_update_gen", 0) + 1
+        self._update_running = True             # until its one stage signal arrives
+
+        def _run():
+            try:
+                path = updater.download(
+                    tag,
+                    on_progress=lambda d, t: self.sig_update_progress.emit(float(d), float(t)),
+                    should_cancel=lambda: self._update_cancel)
+            except updater.UpdateCancelled:
+                self.sig_update_stage.emit("cancelled", "")
+            except updater.UpdateError as e:
+                self.sig_update_stage.emit("failed", str(e))
+            except Exception as e:
+                logger.warning("Update failed: %s", e, exc_info=True)
+                self.sig_update_stage.emit("failed", "Something unexpected went wrong - "
+                                                     "please try again.")
+            else:
+                self.sig_update_stage.emit("ready", path)
+        self._update_thread = threading.Thread(target=_run, daemon=True)
+        self._update_thread.start()
+
+    def _cancel_update(self):
+        self._update_cancel = True
+        self._update_queued = None
+        if self._update_dialog is not None:
+            # Gone at once - a stalled download can take 30 s to notice.
+            self._update_dialog.hide()
+
+    def _on_update_progress(self, done, total):
+        if self._update_dialog is not None:
+            self._update_dialog.show_progress(done, total)
+
+    def _on_update_stage(self, stage, info):
+        self._update_running = False            # the worker's one and only stage
+        dlg = self._update_dialog
+        if self._update_cancel and stage in ("ready", "failed"):
+            stage = "cancelled"                 # they closed it: no error, no install
+        if stage == "ready":
             self.cfg["pending_update_version"] = ""
             self.save_config()
-            # Queued on disk, so it's delivered by the next run if not now.
-            self.track("update_install_result", {"manual": False, "ok": True})
-            # Give the installer a moment to launch before we exit.
-            time.sleep(1.5)
-            self.sig_quit.emit()
-        except Exception as e:
-            logger.warning("Update download failed: %s", e)
-            self.track("update_install_result", {"manual": False, "ok": False})
+            self._update_path = info
+            if dlg is not None:
+                dlg.show_installing()
+                self._bring_to_front(dlg)       # always seen before the app closes
+            # A moment to read "Installing", then hand over to the installer.
+            gen = getattr(self, "_update_gen", 0)
+            QTimer.singleShot(1200, lambda: self._launch_update_when_free(gen))
+        elif stage == "failed":
+            self.track("update_install_result", {"manual": self._update_manual, "ok": False})
+            if dlg is not None:
+                dlg.show_failed(info)
+                self._bring_to_front(dlg)
+            else:
+                self.show_tray_hint("The update didn't install", info)
+        elif stage == "cancelled":
+            if dlg is not None:
+                dlg.hide()
+            queued, self._update_queued = getattr(self, "_update_queued", None), None
+            if queued:                          # shows the window again if it starts
+                QTimer.singleShot(0, lambda: self.start_update(*queued))
+
+    def _launch_update_when_free(self, gen=None):
+        """Hand over to the installer - never while a recording or
+        transcription runs (one may have started during the download), and
+        not before Settings edits made meanwhile are saved or discarded: then
+        it waits, checking every 2 s, and the window says so."""
+        if self._update_stale(gen):
+            return
+        dlg = self._update_dialog
+        if not self._update_blocked():
+            if not self._settings_saved_for_update(gen):
+                if self._update_stale(gen):
+                    return
+                if dlg is not None:
+                    dlg.show_waiting("Ready to install. Save or discard your changes in "
+                                     "Settings first - Transcribe then closes and reopens "
+                                     "by itself.")
+                QTimer.singleShot(2000, lambda: self._launch_update_when_free(gen))
+                return
+            if self._update_stale(gen):         # the box ran its own event loop
+                return
+        if self._update_blocked():              # also one started while the box was open
+            if dlg is not None:
+                dlg.show_waiting()
+            QTimer.singleShot(2000, lambda: self._launch_update_when_free(gen))
+            return
+        if dlg is not None and getattr(dlg, "stage", "") == "waiting":
+            dlg.show_installing()
+        self._launch_update(self._update_path)
+
+    def _settings_saved_for_update(self, gen):
+        """Settings edits made during the download (closing for the installer
+        would drop them): asked about once; after a Cancel it waits quietly
+        until they're saved or discarded."""
+        win = getattr(self, "settings_win", None)
+        unsaved = getattr(win, "_unsaved_keys", None)
+        if win is None or unsaved is None or not win.isVisible() or not unsaved():
+            return True
+        if getattr(self, "_update_settings_asked", False):
+            return False
+        self._update_settings_asked = True
+        return self._ask_about_settings(win)   # the caller re-checks cancel/gen
+
+    def _launch_update(self, path):
+        if getattr(self, "_update_launched", False):
+            return                              # never a second installer
+        all_users = updater.is_all_users_install()
+        log = updater.new_log_path()
+        try:
+            # A per-user Setup reopens the app itself when it succeeds; an
+            # elevated one can't do that as this user.
+            updater.launch_installer(path, all_users=all_users, log_path=log,
+                                     relaunch=not all_users)
+        except updater.UpdateError as e:
+            self._on_update_stage("failed", str(e))
+            return
+        # ...and this watcher, as THIS user, reopens it in every other case:
+        # an all-users install, or one that failed - it never just vanishes.
+        watcher = updater.spawn_relauncher(sys.executable, log)
+        self._update_launched = True
+        # No new dictation now: the app closes in a moment.
+        try:
+            self._unregister_transient_keys()
+            self._unregister_kbd_hotkey()
+            self._unregister_mouse_listener()
+        except Exception:
+            logger.debug("Releasing hotkeys for the update", exc_info=True)
+        self.cfg["update_attempt"] = {"to": getattr(self, "_update_tag", ""), "log": log}
+        self.save_config()
+        self.track("update_install_result", {"manual": self._update_manual, "ok": True})
+        delay = 1500
+        if watcher is None and all_users:
+            # Nothing can reopen it as this user: say so, and long enough to read.
+            if self._update_dialog is not None:
+                self._update_dialog.show_installing(reopens=False)
+            delay = 5000
+        # The installer can't replace files the running app holds: close now.
+        QTimer.singleShot(delay, self._quit_for_update)
+
+    def _quit_for_update(self):
+        """Close for the installer. QCoreApplication.exit can't be vetoed by a
+        window's close handler (unsaved Settings were asked about before the
+        install), so the app never ends up half shut down."""
+        try:
+            self._unregister_transient_keys()
+            self._unregister_kbd_hotkey()
+            self._unregister_mouse_listener()
+            self.recorder.shutdown()
+        except Exception:
+            logger.debug("Cleanup before the update", exc_info=True)
+        self.qapp.exit(0)
+
+    def _after_restart_checks(self):
+        """At start: just updated? Say so (the quiet install reopens the app
+        without a word) and tidy up. Reopened by the relauncher but still the
+        old version? The install stopped - say that, never nothing."""
+        previous = self.cfg.get("last_run_version")
+        attempt = self.cfg.get("update_attempt") or {}
+        if previous == APP_VERSION and not attempt:
+            return
+        if previous and _parse_version(APP_VERSION) > _parse_version(previous):
+            QTimer.singleShot(2500, lambda: self.show_tray_hint(
+                "Transcribe is up to date", f"Updated to version {APP_VERSION}."))
+            # The ~90 MB installer that did it - once it has surely exited.
+            QTimer.singleShot(60_000, updater.clean_old)
+        elif isinstance(attempt, dict) and self._is_newer(attempt.get("to") or ""):
+            # Until it's shown, the "Install now?" popup holds back - the
+            # failure window has Try again.
+            self._update_failed_notice = True
+            QTimer.singleShot(3000, lambda: self._show_update_failed_after_restart(
+                attempt.get("to"), attempt.get("log")))
+        self.cfg["last_run_version"] = APP_VERSION
+        self.cfg["update_attempt"] = {}
+        save_config(self.cfg)
+
+    def _show_update_failed_after_restart(self, tag, log=None):
+        """The relauncher reopened the app, but the install hadn't finished.
+        Not over an update the user has started since."""
+        self._update_failed_notice = False
+        if not tag or getattr(self, "_update_gen", 0) or self._update_in_progress():
+            return
+        detail = (f"The installer stopped before it finished, so you still have "
+                  f"version {APP_VERSION}.")
+        if log and os.path.exists(log):
+            detail += f" Details: {log}"
+        dlg = self._update_dialog_for(tag)
+        dlg.show_failed(detail)
+        self._bring_to_front(dlg)
 
     # ── Modular Window Surface Triggers (Main thread-safe wrappers) ──
     @staticmethod
@@ -3730,6 +4015,11 @@ class AppController(QObject):
 
     def _start(self):
         if self.is_rec:
+            return
+        if getattr(self, "_update_launched", False):
+            # The installer is running and the app closes in a moment.
+            self.show_tray_hint("Transcribe is updating",
+                                "It closes and reopens by itself in a moment.")
             return
         # A file transcription owns the shared Whisper model right now -
         # starting a dictation would just hang on the inference lock until the

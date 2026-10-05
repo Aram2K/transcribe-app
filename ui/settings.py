@@ -1,5 +1,6 @@
 # Modern Tabbed Settings Panel in PySide6
 
+import logging
 import os
 import sys
 import threading
@@ -107,7 +108,6 @@ class Settings(QDialog):
     account_delete_finished = Signal(bool, str)
     specs_ready = Signal(str)  # GPU name detected on a worker thread
     gpu_state_ready = Signal(str)  # gpu_accel.status(), computed on a worker thread
-    update_install_finished = Signal(bool, str)  # installer launched / download error
 
     def __init__(self, parent=None, main_app=None):
         super().__init__(parent)
@@ -151,7 +151,6 @@ class Settings(QDialog):
         self.feedback_finished.connect(self._on_feedback_finished)
         self.account_delete_finished.connect(self._on_account_delete_finished)
         self.specs_ready.connect(self._on_specs_ready)
-        self.update_install_finished.connect(self._on_update_install_finished)
         # Optional NVIDIA GPU acceleration: its state, and the app's download.
         self._gpu_state = None
         self.gpu_state_ready.connect(self._refresh_gpu_ui)
@@ -587,10 +586,15 @@ class Settings(QDialog):
         # Scan whisper models
         from main import model_downloaded, MODELS
         for name in MODELS:
+            if self._model_states.get(name) == "downloading":
+                continue                    # still running: re-opening Settings mustn't reset it
             self._model_states[name] = "downloaded" if model_downloaded(name) else "missing"
-            
+
         # Scan local LLMs
         for name in local_llm.MODEL_CATALOG:
+            if self._local_llm_states.get(name) == "downloading" or local_llm.downloading(name):
+                self._local_llm_states[name] = "downloading"
+                continue
             self._local_llm_states[name] = "downloaded" if local_llm.model_downloaded(name) else "missing"
 
     def _build_ui(self):
@@ -1165,24 +1169,6 @@ class Settings(QDialog):
             return gap.join(parts)
         except Exception:
             return "System information unavailable."
-
-    def _on_update_install_finished(self, ok, err):
-        if self.app:
-            self.app.track("update_install_result", {"manual": True, "ok": bool(ok)})
-        if ok:
-            if self.app:
-                self.app.cfg["pending_update_version"] = ""
-                self.app.save_config()
-                self.app.qapp.quit()
-            return
-        from main import PROJECT_GITHUB_URL
-        self.btn_update.setText("Check for Updates")
-        self.btn_update.setEnabled(True)
-        QMessageBox.critical(
-            self, "Update Error",
-            f"Failed to download the update automatically:\n{err}\n\n"
-            f"Please update manually from:\n{PROJECT_GITHUB_URL}/releases"
-        )
 
     def _on_specs_ready(self, gpu):
         if hasattr(self, "_specs_label"):
@@ -2895,13 +2881,16 @@ class Settings(QDialog):
             card.progress_bar.setVisible(True)
             card.progress_bar.setValue(progress.get("percent", 0))
         else: # missing or failed
+            # A stopped download leaves its partial file: resume it (the
+            # download picks up where it stopped) or throw it away.
+            partial = local_llm.partial_path(name).exists()
             card.setObjectName("cardFrame")
-            card.lbl_state.setText("Not Downloaded")
+            card.lbl_state.setText("Partly downloaded" if partial else "Not Downloaded")
             card.lbl_state.setStyleSheet("color: #64748b;")
-            card.btn_action.setText("Download")
+            card.btn_action.setText("Resume Download" if partial else "Download")
             card.btn_action.setEnabled(True)
             card.btn_action.setObjectName("")
-            card.btn_remove.setVisible(False)
+            card.btn_remove.setVisible(partial)
             card.progress_bar.setVisible(False)
 
         # Repolish
@@ -4757,7 +4746,9 @@ class Settings(QDialog):
                 download_whisper_model(name, on_progress=_on_prog)
                 self.downloader_signals.finished.emit(name, "downloaded")
             except Exception as e:
-                self.downloader_signals.finished.emit(name, "failed")
+                logging.getLogger("transcribe").warning("Whisper %s download failed: %s", name, e)
+                self.downloader_signals.finished.emit(
+                    name, "failed:" + local_llm.download_error_message(e))
                 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -4804,8 +4795,10 @@ class Settings(QDialog):
             try:
                 local_llm.download_model(name, on_progress=_on_prog)
                 self.downloader_signals.finished.emit(f"llm:{name}", "downloaded")
-            except Exception:
-                self.downloader_signals.finished.emit(f"llm:{name}", "failed")
+            except Exception as e:
+                logging.getLogger("transcribe").warning("Local model %s download failed: %r", name, e)
+                self.downloader_signals.finished.emit(
+                    f"llm:{name}", "failed:" + local_llm.download_error_message(e))
                 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -4840,7 +4833,6 @@ class Settings(QDialog):
             self._update_whisper_card_ui(model_name)
 
     def _on_download_finished(self, model_name, state):
-        from main import PROJECT_GITHUB_URL
         if model_name == "update":
             self.btn_update.setEnabled(True)
             self.btn_update.setText("Check for Updates")
@@ -4858,55 +4850,20 @@ class Settings(QDialog):
                     "Would you like to automatically download and apply the update now?",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
                 )
-                if reply == QMessageBox.Yes:
-                    self.btn_update.setText("Downloading Update...")
-                    self.btn_update.setEnabled(False)
-                    if self.app:
-                        self.app.track("update_install_started", {"manual": True, "to": tag})
-
-                    def _download_and_install():
-                        import urllib.request
-                        import tempfile
-                        import shutil
-                        import os
-                        import logging
-                        
-                        try:
-                            # Construct the setup url
-                            setup_url = f"{PROJECT_GITHUB_URL}/releases/download/{tag}/TranscribeApp-Windows-Setup.exe"
-                            
-                            # Create a temporary directory in the workspace or standard temp
-                            temp_dir = tempfile.gettempdir()
-                            dest_path = os.path.join(temp_dir, "TranscribeApp-Windows-Setup.exe")
-                            
-                            # Fetch the installer
-                            req = urllib.request.Request(
-                                setup_url,
-                                headers={'User-Agent': 'Mozilla/5.0'}
-                            )
-                            with urllib.request.urlopen(req) as response:
-                                with open(dest_path, 'wb') as out_file:
-                                    shutil.copyfileobj(response, out_file)
-                            
-                            # Execute the setup.exe natively
-                            os.startfile(dest_path)
-                            
-                            # Back on the GUI thread (a QTimer started from this
-                            # worker thread never fires): clear the pending
-                            # update and quit so the installer can replace files.
-                            self.update_install_finished.emit(True, "")
-
-                        except Exception as e:
-                            logging.error("Failed to download and execute update installer: %s", e)
-                            self.update_install_finished.emit(False, str(e))
-                            
-                    threading.Thread(target=_download_and_install, daemon=True).start()
+                if reply == QMessageBox.Yes and self.app and hasattr(self.app, "start_update"):
+                    # The update window takes it from here: progress, then a
+                    # quiet install that reopens the app (AppController.start_update).
+                    self.app.start_update(tag, manual=True)
             elif state == "latest":
                 QMessageBox.information(self, "No Updates", "You are running the latest version of Transcribe.")
             else:
                 QMessageBox.warning(self, "Error", "Could not reach GitHub updates API. Try again later.")
             return
 
+        failure = ""
+        if state.startswith("failed"):
+            failure = state.partition(":")[2].strip()
+            state = "failed"
         if self.app:
             is_llm = model_name.startswith("llm:")
             self.app.track(
@@ -4918,6 +4875,11 @@ class Settings(QDialog):
             name = model_name.replace("llm:", "")
             self._local_llm_states[name] = state
             self._update_llm_card_ui(name)
+            if state == "failed":
+                QMessageBox.warning(
+                    self, "Download failed",
+                    f"Couldn't download {local_llm.MODEL_CATALOG[name]['label']}: "
+                    f"{failure or 'please try again.'}")
             if state == "downloaded":
                 if self.app:
                     self.cfg_working["action_model"] = name
@@ -4925,6 +4887,11 @@ class Settings(QDialog):
         else:
             self._model_states[model_name] = state
             self._update_whisper_card_ui(model_name)
+            if state == "failed":
+                QMessageBox.warning(
+                    self, "Download failed",
+                    f"Couldn't download the Whisper {model_name} model: "
+                    f"{failure or 'check your connection and try again.'}")
             if state == "downloaded":
                 if self.app:
                     self.cfg_working["whisper_model"] = model_name
